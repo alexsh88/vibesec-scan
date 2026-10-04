@@ -8,6 +8,8 @@ describe('parseRepoUrl', () => {
     ['https://github.com/acme/app', { owner: 'acme', name: 'app' }],
     ['https://github.com/acme/app.git', { owner: 'acme', name: 'app' }],
     ['https://github.com/acme/my.app-2/', { owner: 'acme', name: 'my.app-2' }],
+    ['https://github.com/acme/.github', { owner: 'acme', name: '.github' }],
+    ['https://github.com/acme-inc/app', { owner: 'acme-inc', name: 'app' }],
   ])('accepts %s', (url, expected) => {
     expect(parseRepoUrl(url)).toEqual(expected);
   });
@@ -20,6 +22,10 @@ describe('parseRepoUrl', () => {
     'https://github.com/acme/app/tree/main',
     'https://user:pass@github.com/acme/app',
     'file:///etc/passwd',
+    'https://github.com/-acme/app',
+    'https://github.com/acme-/app',
+    'https://github.com/acme/.',
+    'https://github.com/acme/..',
   ])('rejects %s', (url) => {
     expect(parseRepoUrl(url)).toBeNull();
   });
@@ -44,6 +50,31 @@ describe('CreateScanRequestSchema', () => {
       repoUrl: 'https://github.com/acme/app', auth: { type: 'pat', token: 'github_pat_abc' },
     });
     expect(r.auth?.token).toBe('github_pat_abc');
+  });
+
+  it.each([
+    'main',
+    'feature/x-1',
+    'v1.2.3',
+    'release/2026.10',
+    'da39a3ee5e6b4b0d3255bfef95601890afd80709',
+  ])('accepts ref %s', (ref) => {
+    expect(CreateScanRequestSchema.safeParse({ repoUrl: 'https://github.com/acme/app', ref }).success).toBe(true);
+  });
+
+  it.each([
+    '-u./evil.sh',
+    'main..evil',
+    'foo//bar',
+    'HEAD@{1}',
+    'foo\\bar',
+    'foo bar',
+    'foo\u0007bar',
+    'foo/',
+    'foo.lock',
+    '@',
+  ])('rejects ref %s', (ref) => {
+    expect(CreateScanRequestSchema.safeParse({ repoUrl: 'https://github.com/acme/app', ref }).success).toBe(false);
   });
 });
 

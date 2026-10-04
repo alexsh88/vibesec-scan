@@ -4,6 +4,7 @@ import rateLimit from '@fastify/rate-limit';
 import Fastify, { type FastifyInstance, type FastifyServerOptions } from 'fastify';
 import type { Container } from '../container';
 import { errorHandler } from './errorHandler';
+import { serializeError } from './logSerializers';
 import { auditRoutes } from './routes/audit';
 import { eventRoutes } from './routes/events';
 import { healthRoutes } from './routes/health';
@@ -14,6 +15,7 @@ export async function buildApp(c: Container, opts: { logger?: FastifyServerOptio
     logger: opts.logger ?? {
       level: 'info',
       redact: { paths: ['req.headers.authorization', 'req.body.auth.token', '*.token'], censor: '[REDACTED]' },
+      serializers: { err: serializeError },
     },
     genReqId: () => randomUUID(),
     requestIdHeader: 'x-request-id',

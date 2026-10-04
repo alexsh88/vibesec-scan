@@ -1,12 +1,33 @@
 import { z } from 'zod';
 import { CATEGORIES, CategorySchema, ScanStateSchema } from './enums';
 
-const REPO_URL_RE = /^https:\/\/github\.com\/([A-Za-z0-9-]{1,39})\/([A-Za-z0-9._-]{1,100}?)(?:\.git)?\/?$/;
+// Owner: alphanumeric, may contain interior hyphens, but can't start/end with one (GitHub rule).
+const REPO_URL_RE = /^https:\/\/github\.com\/([A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?)\/([A-Za-z0-9._-]{1,100}?)(?:\.git)?\/?$/;
 
 export function parseRepoUrl(url: string): { owner: string; name: string } | null {
   const m = url.match(REPO_URL_RE);
   if (!m || !m[1] || !m[2]) return null;
-  return { owner: m[1], name: m[2] };
+  const owner = m[1];
+  const name = m[2];
+  if (name === '.' || name === '..') return null;
+  return { owner, name };
+}
+
+// Mirrors the subset of `git check-ref-format` rules relevant to option-injection and
+// path-escape safety, since P2 passes `ref` straight to git. A leading `-` could be
+// parsed as a CLI flag (e.g. `-u./evil.sh`); `..`, `//`, `@{`, backslashes, whitespace/
+// control chars, and a trailing `/`/`.lock` are all invalid or dangerous ref components.
+const REF_CHAR_RE = /^[\w./-]+$/;
+
+export function isValidRef(ref: string): boolean {
+  if (!REF_CHAR_RE.test(ref)) return false;
+  if (ref.startsWith('-')) return false;
+  if (ref.includes('..')) return false;
+  if (ref.includes('//')) return false;
+  if (ref.includes('@{')) return false;
+  if (ref.endsWith('/') || ref.endsWith('.lock')) return false;
+  if (ref === '@') return false;
+  return true;
 }
 
 export const ScanOptionsSchema = z.object({
@@ -18,7 +39,7 @@ export type ScanOptions = z.infer<typeof ScanOptionsSchema>;
 
 export const CreateScanRequestSchema = z.object({
   repoUrl: z.string().refine((u) => parseRepoUrl(u) !== null, 'Must be https://github.com/<owner>/<repo>'),
-  ref: z.string().min(1).max(255).regex(/^[\w./-]+$/).optional(),
+  ref: z.string().min(1).max(255).refine(isValidRef, 'Invalid git ref').optional(),
   auth: z.object({ type: z.literal('pat'), token: z.string().min(10).max(255) }).optional(),
   options: ScanOptionsSchema.default(() => ScanOptionsSchema.parse({})),
 });
