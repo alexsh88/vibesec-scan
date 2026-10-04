@@ -65,6 +65,16 @@ describe('ScanRepo', () => {
     expect(row?.heartbeat_at).not.toBeNull();
   });
 
+  it('error fields track state: set on FAILED, cleared on transition to non-FAILED state', () => {
+    const { scans, scan } = seed();
+    scans.updateState(scan.id, 'FAILED', { errorCode: 'AUTH_INVALID', errorMessage: 'bad token' });
+    expect(scans.getDto(scan.id)?.errorCode).toBe('AUTH_INVALID');
+    expect(scans.getDto(scan.id)?.errorMessage).toBe('bad token');
+    scans.updateState(scan.id, 'RESOLVING');
+    expect(scans.getDto(scan.id)?.errorCode).toBeNull();
+    expect(scans.getDto(scan.id)?.errorMessage).toBeNull();
+  });
+
   it('lists non-terminal scans for recovery', () => {
     const { scans, scan } = seed();
     expect(scans.listNonTerminal().map((s) => s.id)).toEqual([scan.id]);

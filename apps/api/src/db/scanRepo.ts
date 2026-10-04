@@ -91,11 +91,11 @@ export class ScanRepo {
   updateState(id: string, state: ScanState, err: { errorCode?: string; errorMessage?: string } = {}): void {
     const now = this.now();
     this.db.prepare(
-      `UPDATE scans SET state = ?, error_code = COALESCE(?, error_code), error_message = COALESCE(?, error_message),
+      `UPDATE scans SET state = ?, error_code = CASE WHEN ? = 'FAILED' THEN ? ELSE NULL END, error_message = CASE WHEN ? = 'FAILED' THEN ? ELSE NULL END,
          started_at = CASE WHEN started_at IS NULL AND ? <> 'QUEUED' THEN ? ELSE started_at END,
          finished_at = CASE WHEN ? = 1 THEN ? ELSE finished_at END
        WHERE id = ?`,
-    ).run(state, err.errorCode ?? null, err.errorMessage ?? null, state, now, isTerminalState(state) ? 1 : 0, now, id);
+    ).run(state, state, err.errorCode ?? null, state, err.errorMessage ?? null, state, now, isTerminalState(state) ? 1 : 0, now, id);
   }
 
   setCommitSha(id: string, sha: string): void {
@@ -121,11 +121,11 @@ export class ScanRepo {
   }
 
   listNonTerminal(): ScanRow[] {
-    return this.db.prepare(`SELECT * FROM scans WHERE state NOT IN ${TERMINAL_SQL} ORDER BY created_at`).all() as ScanRow[];
+    return this.db.prepare(`SELECT * FROM scans WHERE state NOT IN ${TERMINAL_SQL} ORDER BY created_at, id`).all() as ScanRow[];
   }
 
   listByRepo(repoId: string, limit = 50): ScanDto[] {
-    const ids = this.db.prepare(`SELECT id FROM scans WHERE repo_id = ? ORDER BY created_at DESC LIMIT ?`)
+    const ids = this.db.prepare(`SELECT id FROM scans WHERE repo_id = ? ORDER BY created_at DESC, id DESC LIMIT ?`)
       .all(repoId, limit) as { id: string }[];
     return ids.map((r) => this.getDto(r.id)!);
   }

@@ -7,14 +7,13 @@ export class EventRepo {
   constructor(private readonly db: Db, private readonly now: () => string = () => new Date().toISOString()) {}
 
   append(scanId: string, event: ScanEvent): StoredScanEvent {
-    return this.db.transaction((): StoredScanEvent => {
-      const { next } = this.db.prepare(`SELECT COALESCE(MAX(seq), 0) + 1 AS next FROM scan_events WHERE scan_id = ?`)
-        .get(scanId) as { next: number };
-      const at = this.now();
-      this.db.prepare(`INSERT INTO scan_events (scan_id, seq, type, payload_json, at) VALUES (?, ?, ?, ?, ?)`)
-        .run(scanId, next, event.type, JSON.stringify(event), at);
-      return { scanId, seq: next, at, event };
-    })();
+    const at = this.now();
+    const row = this.db.prepare(
+      `INSERT INTO scan_events (scan_id, seq, type, payload_json, at)
+       SELECT ?, COALESCE(MAX(seq), 0) + 1, ?, ?, ? FROM scan_events WHERE scan_id = ?
+       RETURNING seq`,
+    ).get(scanId, event.type, JSON.stringify(event), at, scanId) as { seq: number };
+    return { scanId, seq: row.seq, at, event };
   }
 
   listAfter(scanId: string, afterSeq: number): StoredScanEvent[] {

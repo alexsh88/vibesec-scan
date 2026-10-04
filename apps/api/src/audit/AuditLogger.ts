@@ -102,7 +102,7 @@ export class AuditLogger {
     if (f.targetId) { where.push('target_id = ?'); args.push(f.targetId); }
     if (f.from) { where.push('at >= ?'); args.push(f.from); }
     if (f.to) { where.push('at <= ?'); args.push(f.to); }
-    if (f.beforeSeq) { where.push('seq < ?'); args.push(f.beforeSeq); }
+    if (f.beforeSeq != null) { where.push('seq < ?'); args.push(f.beforeSeq); }
     const limit = Math.min(Math.max(f.limit ?? 50, 1), 200);
     const sql = `SELECT * FROM audit_log ${where.length ? `WHERE ${where.join(' AND ')}` : ''} ORDER BY seq DESC LIMIT ?`;
     const rows = this.db.prepare(sql).all(...args, limit + 1) as AuditRow[];
