@@ -23,12 +23,13 @@ function setup(stages: StageSpec[], cfg: Partial<JobRunnerConfig> = {}, now?: ()
   const scans = new ScanRepo(db);
   const events = new EventRepo(db);
   const bus = new EventBus(events);
-  const lifecycle = new ScanLifecycle(scans, bus, db);
   const audit = new AuditLogger(db);
+  const lifecycle = new ScanLifecycle(scans, bus, db, audit);
   const runner = new JobRunner({
     scans, lifecycle, bus, audit, pipeline: { stages }, now,
     config: {
-      maxConcurrentScans: 2, scanDeadlineMs: 5_000, heartbeatMs: 1_000, stuckAfterMs: 60_000, staleHeartbeatMs: 30_000, ...cfg,
+      maxConcurrentScans: 2, queueCapacity: 50, scanDeadlineMs: 5_000, heartbeatMs: 1_000, stuckAfterMs: 60_000,
+      staleHeartbeatMs: 30_000, ...cfg,
     },
   });
   const repo = scans.upsertRepo({ owner: 'acme', name: 'app', isPrivate: false });
@@ -144,7 +145,10 @@ describe('JobRunner', () => {
     expect(runner.recover()).toEqual({ resumed: [publicScan], failed: [privateScan] });
     await runner.whenIdle();
     expect(scans.getDto(publicScan)!.state).toBe('COMPLETED');
-    expect(scans.getDto(privateScan)).toMatchObject({ state: 'FAILED', errorCode: 'AUTH_REQUIRED' });
+    expect(scans.getDto(privateScan)).toMatchObject({
+      state: 'FAILED', errorCode: 'AUTH_REQUIRED',
+      errorMessage: 'The server restarted and private-repo tokens are never stored. Start a new scan with your token.',
+    });
     expect(audit.list({ action: 'scan.resumed' }).items).toHaveLength(1);
   });
 
@@ -199,7 +203,7 @@ const resolveOnAbort = (ctx: PipelineContext) =>
   new Promise<void>((resolve) => ctx.signal.addEventListener('abort', () => resolve(), { once: true }));
 
 describe('JobRunner regressions (code review)', () => {
-  it('C-1: a failure after the terminal transition does not produce a second terminal state', async () => {
+  it('#6: an audit failure on completion rolls back the terminal transition; the scan stays resumable', async () => {
     const { runner, newScan, scans, states, audit, allEvents } = setup([stage('ANALYZING')]);
     const original = audit.append.bind(audit);
     let thrown = false;
@@ -211,10 +215,12 @@ describe('JobRunner regressions (code review)', () => {
     const id = newScan();
     runner.enqueue(id, {});
     await runner.whenIdle();
+    expect(errSpy).toHaveBeenCalled();
     errSpy.mockRestore();
-    expect(states(id)).toEqual(['ANALYZING', 'COMPLETED']);
-    expect(allEvents(id).filter((e) => e.type === 'done')).toHaveLength(1);
-    expect(scans.getDto(id)!.state).toBe('COMPLETED');
+    expect(states(id)).toEqual(['ANALYZING']);
+    expect(allEvents(id).filter((e) => e.type === 'done')).toHaveLength(0);
+    expect(scans.getDto(id)!.state).toBe('ANALYZING');
+    expect(audit.list({ action: 'scan.completed' }).items).toHaveLength(0);
   });
 
   it('C-1: a throwing finalizer never rejects job.done and leaves the scan resumable', async () => {
@@ -222,9 +228,9 @@ describe('JobRunner regressions (code review)', () => {
       stage('CLONING', { fatal: true, run: async () => { throw new AppError('AUTH_INVALID', 'permanent', 'bad token'); } }),
     ]);
     const original = lifecycle.transition.bind(lifecycle);
-    vi.spyOn(lifecycle, 'transition').mockImplementation((scanId, state, err) => {
+    vi.spyOn(lifecycle, 'transition').mockImplementation((scanId, state, err, a) => {
       if (state === 'FAILED') throw new Error('db locked');
-      return original(scanId, state, err);
+      return original(scanId, state, err, a);
     });
     const unhandled = vi.fn();
     process.on('unhandledRejection', unhandled);
@@ -448,23 +454,140 @@ describe('JobRunner regressions (code review)', () => {
     await runner.whenIdle();
     expect(scans.getDto(orphan)!.state).toBe('COMPLETED');
   });
+
+  it('#3: a scan that keeps crashing outside a stage is resumed at most 3 times, then FAILED', async () => {
+    const base = Date.parse('2026-10-05T12:00:00.000Z');
+    const { runner, newScan, scans, lifecycle, audit, advance } = setupWithClock(base);
+    const original = lifecycle.transition.bind(lifecycle);
+    vi.spyOn(lifecycle, 'transition').mockImplementation((scanId, state, err, a) => {
+      if (state === 'COMPLETED') throw new Error('finalize crashed');
+      return original(scanId, state, err, a);
+    });
+    const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      const id = newScan();
+      for (let i = 0; i < 5; i++) {
+        advance(31_000);
+        runner.sweep();
+        await runner.whenIdle();
+      }
+      expect(scans.getDto(id)).toMatchObject({
+        state: 'FAILED', errorCode: 'INTERNAL', errorMessage: 'The scan could not be resumed after repeated failures',
+      });
+      expect(audit.list({ action: 'scan.resumed' }).items).toHaveLength(3);
+      expect(audit.list({ action: 'scan.failed' }).items).toHaveLength(1);
+    } finally {
+      errSpy.mockRestore();
+    }
+  });
+
+  it('#4: a queued scan gets a heartbeat at enqueue and on every sweep, so a second process skips it', async () => {
+    const base = Date.parse('2026-10-05T12:00:00.000Z');
+    const { runner, newScan, scans, makeRunner, advance, now } = setupWithClock(
+      base, [stage('ANALYZING', { run: blockUntilAborted })], { maxConcurrentScans: 1, heartbeatMs: 5 },
+    );
+    const running = newScan();
+    const queued = newScan();
+    runner.enqueue(running, {});
+    runner.enqueue(queued, {});
+    await waitFor(() => scans.getDto(running)!.state === 'ANALYZING');
+    expect(scans.getDto(queued)!.state).toBe('QUEUED');
+    expect(Date.parse(scans.getRow(queued)!.heartbeat_at!)).toBeGreaterThanOrEqual(base);
+    const other = makeRunner().runner;
+    expect(other.recover()).toEqual({ resumed: [], failed: [] });
+
+    advance(20_000);
+    runner.sweep();
+    expect(Date.parse(scans.getRow(queued)!.heartbeat_at!)).toBeGreaterThanOrEqual(now());
+    advance(20_000);
+    await new Promise((r) => setTimeout(r, 30)); // let the running scan's own heartbeat interval fire
+    expect(other.recover()).toEqual({ resumed: [], failed: [] });
+    await runner.shutdown(0);
+  });
+
+  it('#6: a user cancel of a running scan is audited by the runner, with the request meta, in the CANCELLED transition', async () => {
+    const { runner, newScan, scans, audit } = setup([stage('ANALYZING', { run: blockUntilAborted })]);
+    const id = newScan();
+    runner.enqueue(id, {});
+    await waitFor(() => scans.getDto(id)!.state === 'ANALYZING');
+    expect(runner.cancel(id, {
+      action: 'scan.cancelled', targetType: 'scan', targetId: id, scanId: id, actorIp: '10.0.0.1', userAgent: 'ua',
+    })).toBe('aborted');
+    await runner.whenIdle();
+    expect(scans.getDto(id)!.state).toBe('CANCELLED');
+    expect(audit.list({ action: 'scan.cancelled' }).items).toEqual([expect.objectContaining({ targetId: id, actorIp: '10.0.0.1' })]);
+  });
+
+  it('#7: a throwing heartbeat inside the interval is logged, never thrown', async () => {
+    const { runner, newScan, scans } = setup([stage('ANALYZING', { run: blockUntilAborted })], { heartbeatMs: 5 });
+    const id = newScan();
+    runner.enqueue(id, {});
+    await waitFor(() => scans.getDto(id)!.state === 'ANALYZING');
+    const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const hb = vi.spyOn(scans, 'heartbeat').mockImplementation(() => { throw new Error('SQLITE_BUSY'); });
+    try {
+      await new Promise((r) => setTimeout(r, 40));
+      expect(errSpy).toHaveBeenCalledWith(expect.stringContaining('heartbeat'));
+    } finally {
+      hb.mockRestore();
+      errSpy.mockRestore();
+    }
+    runner.cancel(id);
+    await runner.whenIdle();
+  });
+
+  it('#7: sweep() logs instead of throwing when the database fails', () => {
+    const { runner, scans } = setup([stage('ANALYZING')]);
+    const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    vi.spyOn(scans, 'listNonTerminal').mockImplementation(() => { throw new Error('SQLITE_IOERR'); });
+    try {
+      expect(() => runner.sweep()).not.toThrow();
+      expect(errSpy).toHaveBeenCalledWith(expect.stringContaining('sweep'));
+    } finally {
+      errSpy.mockRestore();
+    }
+  });
+
+  it('#8: recover() stops enqueuing at queueCapacity; a later sweep picks up the rest', async () => {
+    const base = Date.parse('2026-10-05T12:00:00.000Z');
+    const { runner, newScan, scans } = setupWithClock(base, [stage('ANALYZING')], { maxConcurrentScans: 1, queueCapacity: 2 });
+    const ids = [newScan(), newScan(), newScan()];
+    expect(runner.recover().resumed).toEqual(ids.slice(0, 2));
+    await runner.whenIdle();
+    expect(scans.getDto(ids[2]!)!.state).toBe('QUEUED');
+    runner.sweep();
+    await runner.whenIdle();
+    expect(ids.map((id) => scans.getDto(id)!.state)).toEqual(['COMPLETED', 'COMPLETED', 'COMPLETED']);
+  });
 });
 
-function setupWithClock(nowMs: number) {
+function setupWithClock(nowMs: number, stages: StageSpec[] = [stage('ANALYZING')], cfg: Partial<JobRunnerConfig> = {}) {
   let clock = nowMs;
   const db = memoryDb();
-  // Insert rows with distinct, ordered created_at so listNonTerminal order is deterministic.
+  // Timestamps follow the test clock; the tick keeps created_at distinct and ordered so listNonTerminal is deterministic.
   let tick = 0;
-  const scans = new ScanRepo(db, () => new Date(nowMs - 100_000 + tick++).toISOString());
-  const bus = new EventBus(new EventRepo(db));
-  const lifecycle = new ScanLifecycle(scans, bus, db);
-  const runner = new JobRunner({
-    scans, lifecycle, bus, audit: new AuditLogger(db), pipeline: { stages: [stage('ANALYZING')] }, now: () => clock,
-    config: { maxConcurrentScans: 4, scanDeadlineMs: 5_000, heartbeatMs: 1_000, stuckAfterMs: 60_000, staleHeartbeatMs: 30_000 },
-  });
+  const audit = new AuditLogger(db);
+  /** A runner with its own repo/lifecycle over the shared DB: calling it again simulates a second process. */
+  const makeRunner = () => {
+    const scans = new ScanRepo(db, () => new Date(clock + tick++).toISOString());
+    const bus = new EventBus(new EventRepo(db));
+    const lifecycle = new ScanLifecycle(scans, bus, db, audit);
+    const runner = new JobRunner({
+      scans, lifecycle, bus, audit, pipeline: { stages }, now: () => clock,
+      config: {
+        maxConcurrentScans: 4, queueCapacity: 50, scanDeadlineMs: 5_000, heartbeatMs: 1_000, stuckAfterMs: 60_000,
+        staleHeartbeatMs: 30_000, ...cfg,
+      },
+    });
+    return { scans, lifecycle, runner };
+  };
+  const { scans, lifecycle, runner } = makeRunner();
   const repo = scans.upsertRepo({ owner: 'acme', name: 'app', isPrivate: false });
   const newScan = (hasAuth = false) => scans.insertScan({
     repoId: repo.id, ref: null, options: ScanOptionsSchema.parse({}), optionsHash: randomUUID(), idempotencyKey: null, hasAuth,
   }).id;
-  return { db, scans, runner, newScan, advance: (ms: number) => { clock += ms; } };
+  return {
+    db, scans, lifecycle, audit, runner, newScan, makeRunner,
+    now: () => clock, advance: (ms: number) => { clock += ms; },
+  };
 }

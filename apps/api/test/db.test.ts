@@ -27,6 +27,13 @@ describe('ScanRepo', () => {
     expect(scans.getRepo(repo.id)?.isPrivate).toBe(true);
   });
 
+  it('findRepo looks a repo up without creating or updating it', () => {
+    const { scans, repo } = seed();
+    expect(scans.findRepo('acme', 'app')).toEqual(repo);
+    expect(scans.findRepo('acme', 'missing')).toBeUndefined();
+    expect(scans.listRepos()).toHaveLength(1);
+  });
+
   it('inserts a QUEUED scan and maps it to a DTO', () => {
     const { scans, scan } = seed();
     const dto = scans.getDto(scan.id);

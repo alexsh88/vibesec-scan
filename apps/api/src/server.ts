@@ -9,11 +9,13 @@ async function main(): Promise<void> {
   const c = createContainer(config);
   const app = await buildApp(c);
 
+  // Listen first: if the port is taken (e.g. a second instance), we exit here before touching any scan,
+  // instead of adopting / failing the other instance's work.
+  await app.listen({ port: config.port, host: config.host });
+
   const { resumed, failed } = c.runner.recover();
   if (resumed.length || failed.length) app.log.info({ resumed, failed }, 'recovered scans from previous run');
   c.runner.startWatchdog();
-
-  await app.listen({ port: config.port, host: config.host });
   app.log.info({ scanMode: config.scanMode }, 'vibesec api ready');
 
   let shuttingDown = false;

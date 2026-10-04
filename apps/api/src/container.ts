@@ -20,8 +20,8 @@ export function createContainer(config: Config, overrides: { pipeline?: Pipeline
   const db = openDatabase(config.dbPath);
   const scans = new ScanRepo(db);
   const bus = new EventBus(new EventRepo(db));
-  const lifecycle = new ScanLifecycle(scans, bus, db);
   const audit = new AuditLogger(db);
+  const lifecycle = new ScanLifecycle(scans, bus, db, audit);
   const runner = new JobRunner({
     scans, lifecycle, bus, audit,
     pipeline: overrides.pipeline ?? createStubPipeline(),

@@ -33,6 +33,12 @@ export class ScanRepo {
     return toRepo(row);
   }
 
+  /** Pure lookup: never creates the repo or touches is_private (for dedupe/reject paths). */
+  findRepo(owner: string, name: string): RepoRecord | undefined {
+    const row = this.db.prepare(`SELECT * FROM repos WHERE owner = ? AND name = ?`).get(owner, name) as RepoRow | undefined;
+    return row ? toRepo(row) : undefined;
+  }
+
   getRepo(id: string): RepoRecord | undefined {
     const row = this.db.prepare(`SELECT * FROM repos WHERE id = ?`).get(id) as RepoRow | undefined;
     return row ? toRepo(row) : undefined;

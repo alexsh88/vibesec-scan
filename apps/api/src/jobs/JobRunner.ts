@@ -1,5 +1,5 @@
 import { setTimeout as sleep } from 'node:timers/promises';
-import type { AuditLogger } from '../audit/AuditLogger';
+import type { AuditInput, AuditLogger } from '../audit/AuditLogger';
 import type { Config } from '../config';
 import type { Checkpoint, ScanRepo } from '../db/scanRepo';
 import { AppError, toAppError } from '../errors/AppError';
@@ -12,19 +12,32 @@ export type CancelResult = 'aborted' | 'dequeued' | 'unknown';
 
 export interface ScanQueue {
   enqueue(scanId: string, secrets: ScanSecrets): void;
-  cancel(scanId: string): CancelResult;
+  /**
+   * Dequeues or aborts the scan. `audit` is the `scan.cancelled` entry to record if an aborted running scan
+   * ends CANCELLED (it is written in that transition); for 'dequeued'/'unknown' the caller transitions.
+   */
+  cancel(scanId: string, audit?: AuditInput): CancelResult;
   pendingCount(): number;
+  /** False once the queue stops taking work (shutdown): callers must reject before writing anything. */
+  accepting(): boolean;
 }
 
 export type JobRunnerConfig = Pick<
-  Config, 'maxConcurrentScans' | 'scanDeadlineMs' | 'heartbeatMs' | 'stuckAfterMs' | 'staleHeartbeatMs'
+  Config, 'maxConcurrentScans' | 'queueCapacity' | 'scanDeadlineMs' | 'heartbeatMs' | 'stuckAfterMs' | 'staleHeartbeatMs'
 >;
 
 /** A resumed scan gets whatever is left of its whole-scan deadline (spec §14.2), but never less than this. */
 const MIN_RESUME_DEADLINE_MS = 60_000;
+/** A scan that keeps dying outside any stage (e.g. finalization fails) is failed instead of resumed forever. */
+export const MAX_RESUMES = 3;
+export const AUTH_REQUIRED_MESSAGE =
+  'The server restarted and private-repo tokens are never stored. Start a new scan with your token.';
 
 type AbortKind = 'user' | 'shutdown' | 'stuck';
-type RunningJob = { controller: AbortController; abortKind: AbortKind | null; lastActivity: number; done: Promise<void> };
+type RunningJob = {
+  controller: AbortController; abortKind: AbortKind | null; lastActivity: number; done: Promise<void>;
+  cancelAudit: AuditInput | null;
+};
 type Outcome = { ok: true } | { ok: false; raw: unknown };
 
 export type JobRunnerDeps = {
@@ -33,10 +46,15 @@ export type JobRunnerDeps = {
 };
 
 /** Last-resort logging for failures that have no scan to report to. Scrubbed: errors may echo secrets. */
-function logInternal(message: string, scanId: string, err: unknown): void {
+function logInternal(message: string, scanId: string | null, err: unknown): void {
   const detail = err instanceof Error ? `${err.name}: ${err.message}\n${err.stack ?? ''}` : String(err);
-  console.error(scrubSecrets(`[JobRunner] ${message} (scan ${scanId}): ${detail}`));
+  const where = scanId ? ` (scan ${scanId})` : '';
+  console.error(scrubSecrets(`[JobRunner] ${message}${where}: ${detail}`));
 }
+
+const scanAudit = (action: AuditInput['action'], scanId: string, details?: Record<string, unknown>): AuditInput => ({
+  action, targetType: 'scan', targetId: scanId, scanId, ...(details ? { details } : {}),
+});
 
 export class JobRunner implements ScanQueue {
   private readonly queue: { scanId: string; secrets: ScanSecrets }[] = [];
@@ -49,6 +67,9 @@ export class JobRunner implements ScanQueue {
   enqueue(scanId: string, secrets: ScanSecrets): void {
     if (this.isActive(scanId)) return; // already queued or running: never run a scan twice
     if (this.stopping) throw new AppError('QUEUE_FULL', 'transient', 'Server is shutting down; try again shortly');
+    // Claim the scan now, not when it starts: another process's recover() must not adopt a scan that is
+    // merely waiting in this queue. sweep() keeps queued claims fresh.
+    this.deps.scans.heartbeat(scanId);
     this.queue.push({ scanId, secrets });
     this.pump();
   }
@@ -57,11 +78,15 @@ export class JobRunner implements ScanQueue {
     return this.queue.length + this.running.size;
   }
 
+  accepting(): boolean {
+    return !this.stopping;
+  }
+
   isActive(scanId: string): boolean {
     return this.running.has(scanId) || this.queue.some((j) => j.scanId === scanId);
   }
 
-  cancel(scanId: string): CancelResult {
+  cancel(scanId: string, audit?: AuditInput): CancelResult {
     const idx = this.queue.findIndex((j) => j.scanId === scanId);
     if (idx >= 0) {
       this.queue.splice(idx, 1);
@@ -70,30 +95,47 @@ export class JobRunner implements ScanQueue {
     const job = this.running.get(scanId);
     if (!job) return 'unknown';
     job.abortKind ??= 'user';
+    job.cancelAudit ??= audit ?? null;
     job.controller.abort();
     return 'aborted';
   }
 
   recover(): { resumed: string[]; failed: string[] } {
+    const { scans, lifecycle, audit, config } = this.deps;
     const resumed: string[] = [];
     const failed: string[] = [];
     const now = this.now();
-    for (const row of this.deps.scans.listNonTerminal()) {
+    for (const row of scans.listNonTerminal()) {
       if (this.isActive(row.id)) continue;
       // A recent heartbeat means another live process may still own this scan: leave it alone.
       const beat = row.heartbeat_at ? Date.parse(row.heartbeat_at) : NaN;
-      if (!Number.isNaN(beat) && now - beat < this.deps.config.staleHeartbeatMs) continue;
+      if (!Number.isNaN(beat) && now - beat < config.staleHeartbeatMs) continue;
       if (row.has_auth === 1) {
-        this.deps.lifecycle.transition(row.id, 'FAILED', {
-          code: 'AUTH_REQUIRED',
-          message: 'The server restarted. Re-enter your token to resume this private-repo scan.',
-        });
-        failed.push(row.id);
+        if (lifecycle.transition(row.id, 'FAILED', { code: 'AUTH_REQUIRED', message: AUTH_REQUIRED_MESSAGE },
+          scanAudit('scan.failed', row.id, { code: 'AUTH_REQUIRED' }))) failed.push(row.id);
         continue;
       }
       if (this.stopping) continue; // still non-terminal in the DB; the next boot picks it up
-      this.enqueue(row.id, {});
-      this.deps.audit.append({ action: 'scan.resumed', targetType: 'scan', targetId: row.id, scanId: row.id });
+
+      const checkpoint: Checkpoint = scans.getCheckpoint(row.id) ?? { completedStages: [], data: {} };
+      const prior = checkpoint.data.resumeCount;
+      const resumeCount = typeof prior === 'number' && Number.isFinite(prior) ? prior : 0;
+      if (resumeCount >= MAX_RESUMES) {
+        const message = 'The scan could not be resumed after repeated failures';
+        if (lifecycle.transition(row.id, 'FAILED', { code: 'INTERNAL', message },
+          scanAudit('scan.failed', row.id, { code: 'INTERNAL', resumeCount }))) failed.push(row.id);
+        continue;
+      }
+      // Leave the rest for a later sweep rather than overfilling the queue.
+      if (this.pendingCount() >= config.queueCapacity) continue;
+
+      // Counter + audit + enqueue in one transaction. enqueue starts the scan synchronously, so the audit
+      // entry is appended first; the scan's own events are notified once this commits.
+      lifecycle.atomically(() => {
+        scans.setCheckpoint(row.id, { ...checkpoint, data: { ...checkpoint.data, resumeCount: resumeCount + 1 } });
+        audit.append(scanAudit('scan.resumed', row.id, { resumeCount: resumeCount + 1 }));
+        this.enqueue(row.id, {});
+      });
       resumed.push(row.id);
     }
     return { resumed, failed };
@@ -105,12 +147,18 @@ export class JobRunner implements ScanQueue {
   }
 
   /**
-   * Periodic maintenance: stop stuck scans, and adopt orphans whose heartbeat has gone stale
-   * (e.g. this process crashed and restarted within staleHeartbeatMs, so boot-time recover() skipped them).
+   * Periodic maintenance: stop stuck scans, keep this process's claim on its queued scans fresh, and adopt
+   * orphans whose heartbeat has gone stale (e.g. this process crashed and restarted within
+   * staleHeartbeatMs, so boot-time recover() skipped them). Never throws: it runs from a timer.
    */
   sweep(): void {
-    this.checkStuck();
-    if (!this.stopping) this.recover();
+    try {
+      this.checkStuck();
+      for (const { scanId } of this.queue) this.deps.scans.heartbeat(scanId);
+      if (!this.stopping) this.recover();
+    } catch (err) {
+      logInternal('watchdog sweep failed', null, err);
+    }
   }
 
   checkStuck(): void {
@@ -152,7 +200,9 @@ export class JobRunner implements ScanQueue {
   private pump(): void {
     while (!this.stopping && this.running.size < this.deps.config.maxConcurrentScans && this.queue.length > 0) {
       const { scanId, secrets } = this.queue.shift()!;
-      const job: RunningJob = { controller: new AbortController(), abortKind: null, lastActivity: this.now(), done: Promise.resolve() };
+      const job: RunningJob = {
+        controller: new AbortController(), abortKind: null, lastActivity: this.now(), done: Promise.resolve(), cancelAudit: null,
+      };
       this.running.set(scanId, job);
       // `done` must never reject: an unhandled rejection would take the whole process down.
       job.done = this.execute(scanId, secrets, job)
@@ -165,7 +215,7 @@ export class JobRunner implements ScanQueue {
   }
 
   private async execute(scanId: string, secrets: ScanSecrets, job: RunningJob): Promise<void> {
-    const { scans, lifecycle, pipeline, config, bus } = this.deps;
+    const { scans, lifecycle, pipeline, config } = this.deps;
     const touch = () => { job.lastActivity = this.now(); };
 
     const checkpoint: Checkpoint = scans.getCheckpoint(scanId) ?? { completedStages: [], data: {} };
@@ -186,7 +236,13 @@ export class JobRunner implements ScanQueue {
     deadlineTimer.unref();
     const signal = AbortSignal.any([job.controller.signal, deadline.signal]);
 
-    const heartbeat = setInterval(() => scans.heartbeat(scanId), config.heartbeatMs);
+    const heartbeat = setInterval(() => {
+      try {
+        scans.heartbeat(scanId);
+      } catch (err) {
+        logInternal('heartbeat write failed', scanId, err); // a timer callback must never throw
+      }
+    }, config.heartbeatMs);
     heartbeat.unref();
 
     try {
@@ -205,7 +261,7 @@ export class JobRunner implements ScanQueue {
         secrets,
         signal,
         checkpointData: checkpoint.data,
-        emit: (event) => { touch(); bus.publish(scanId, event); },
+        emit: (event) => { touch(); lifecycle.emit(scanId, event); },
         warn: (w) => { touch(); warned = true; lifecycle.warn(scanId, w); },
         touch,
       };
@@ -255,17 +311,16 @@ export class JobRunner implements ScanQueue {
 
   private complete(scanId: string, warned: boolean): void {
     const state = warned ? 'COMPLETED_WITH_WARNINGS' : 'COMPLETED';
-    if (!this.deps.lifecycle.transition(scanId, state)) return;
-    this.deps.audit.append({ action: 'scan.completed', targetType: 'scan', targetId: scanId, scanId, details: { state } });
+    this.deps.lifecycle.transition(scanId, state, undefined, scanAudit('scan.completed', scanId, { state }));
   }
 
   private finishWithError(
     scanId: string, raw: unknown, job: RunningJob, deadline: AbortSignal, checkpoint: Checkpoint, currentStage: StageName | undefined,
   ): void {
-    const { lifecycle, audit } = this.deps;
+    const { lifecycle } = this.deps;
     if (job.abortKind === 'shutdown') return;
     if (job.abortKind === 'user') {
-      lifecycle.transition(scanId, 'CANCELLED');
+      lifecycle.transition(scanId, 'CANCELLED', undefined, job.cancelAudit ?? scanAudit('scan.cancelled', scanId));
       return;
     }
     let err: AppError;
@@ -283,7 +338,6 @@ export class JobRunner implements ScanQueue {
     } else {
       err = toAppError(raw);
     }
-    if (!lifecycle.transition(scanId, 'FAILED', { code: err.code, message: err.userMessage })) return;
-    audit.append({ action: 'scan.failed', targetType: 'scan', targetId: scanId, scanId, details: { code: err.code } });
+    lifecycle.transition(scanId, 'FAILED', { code: err.code, message: err.userMessage }, scanAudit('scan.failed', scanId, { code: err.code }));
   }
 }

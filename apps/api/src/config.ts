@@ -26,6 +26,17 @@ export type Config = {
 
 export function loadConfig(env: Record<string, string | undefined> = process.env): Config {
   const e = EnvSchema.parse(env);
+  if (e.HEARTBEAT_MS >= e.STALE_HEARTBEAT_MS) {
+    throw new Error(
+      `Invalid config: HEARTBEAT_MS (${e.HEARTBEAT_MS}) must be less than STALE_HEARTBEAT_MS (${e.STALE_HEARTBEAT_MS}), `
+      + 'otherwise live scans look orphaned and get resumed by another process',
+    );
+  }
+  if (e.STUCK_AFTER_MS <= e.HEARTBEAT_MS) {
+    throw new Error(
+      `Invalid config: STUCK_AFTER_MS (${e.STUCK_AFTER_MS}) must be greater than HEARTBEAT_MS (${e.HEARTBEAT_MS})`,
+    );
+  }
   return {
     port: e.PORT, host: e.HOST, dbPath: e.DB_PATH,
     anthropicApiKey: e.ANTHROPIC_API_KEY,

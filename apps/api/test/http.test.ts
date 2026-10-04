@@ -105,6 +105,16 @@ describe('HTTP API', () => {
     expect(verify.json()).toMatchObject({ ok: true });
   });
 
+  it('#1: answers 503 during shutdown without persisting a scan', async () => {
+    await start();
+    await c.runner.shutdown(0);
+    const res = await createScan({ 'idempotency-key': 'k-shutdown' });
+    expect(res.statusCode).toBe(503);
+    expect(res.json().error.code).toBe('QUEUE_FULL');
+    expect(c.scans.findByIdempotencyKey('k-shutdown')).toBeUndefined();
+    expect(c.scans.listNonTerminal()).toEqual([]);
+  });
+
   it('reports health', async () => {
     await start();
     const res = await app.inject({ method: 'GET', url: '/api/health' });

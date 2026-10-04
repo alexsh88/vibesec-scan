@@ -23,3 +23,17 @@ describe('loadConfig', () => {
     expect(() => loadConfig({ PORT: 'abc' })).toThrow();
   });
 });
+
+describe('loadConfig timing invariants (#10)', () => {
+  it('rejects HEARTBEAT_MS >= STALE_HEARTBEAT_MS', () => {
+    expect(() => loadConfig({ HEARTBEAT_MS: '60000', STALE_HEARTBEAT_MS: '60000' })).toThrow(/HEARTBEAT_MS.*STALE_HEARTBEAT_MS/);
+  });
+
+  it('rejects STUCK_AFTER_MS <= HEARTBEAT_MS', () => {
+    expect(() => loadConfig({ HEARTBEAT_MS: '10000', STUCK_AFTER_MS: '10000' })).toThrow(/STUCK_AFTER_MS.*HEARTBEAT_MS/);
+  });
+
+  it('accepts a consistent configuration', () => {
+    expect(loadConfig({ HEARTBEAT_MS: '1000', STALE_HEARTBEAT_MS: '5000', STUCK_AFTER_MS: '2000' }).heartbeatMs).toBe(1000);
+  });
+});
