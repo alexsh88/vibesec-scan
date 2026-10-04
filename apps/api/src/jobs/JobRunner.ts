@@ -100,8 +100,17 @@ export class JobRunner implements ScanQueue {
   }
 
   startWatchdog(intervalMs = 5_000): void {
-    this.watchdog = setInterval(() => this.checkStuck(), intervalMs);
+    this.watchdog = setInterval(() => this.sweep(), intervalMs);
     this.watchdog.unref();
+  }
+
+  /**
+   * Periodic maintenance: stop stuck scans, and adopt orphans whose heartbeat has gone stale
+   * (e.g. this process crashed and restarted within staleHeartbeatMs, so boot-time recover() skipped them).
+   */
+  sweep(): void {
+    this.checkStuck();
+    if (!this.stopping) this.recover();
   }
 
   checkStuck(): void {

@@ -436,9 +436,22 @@ describe('JobRunner regressions (code review)', () => {
     expect(scans.getDto(fresh)!.state).toBe('QUEUED');
     expect(scans.getDto(freshPrivate)!.state).toBe('QUEUED');
   });
+
+  it('sweep() resumes a crashed scan once its heartbeat goes stale (fast restart case)', async () => {
+    const base = Date.parse('2026-10-05T12:00:00.000Z');
+    const { runner, newScan, scans, db, advance } = setupWithClock(base);
+    const orphan = newScan();
+    db.prepare(`UPDATE scans SET state = 'ANALYZING', heartbeat_at = ? WHERE id = ?`).run(new Date(base - 5_000).toISOString(), orphan);
+    expect(runner.recover().resumed).toEqual([]);
+    advance(30_000);
+    runner.sweep();
+    await runner.whenIdle();
+    expect(scans.getDto(orphan)!.state).toBe('COMPLETED');
+  });
 });
 
 function setupWithClock(nowMs: number) {
+  let clock = nowMs;
   const db = memoryDb();
   // Insert rows with distinct, ordered created_at so listNonTerminal order is deterministic.
   let tick = 0;
@@ -446,12 +459,12 @@ function setupWithClock(nowMs: number) {
   const bus = new EventBus(new EventRepo(db));
   const lifecycle = new ScanLifecycle(scans, bus, db);
   const runner = new JobRunner({
-    scans, lifecycle, bus, audit: new AuditLogger(db), pipeline: { stages: [stage('ANALYZING')] }, now: () => nowMs,
+    scans, lifecycle, bus, audit: new AuditLogger(db), pipeline: { stages: [stage('ANALYZING')] }, now: () => clock,
     config: { maxConcurrentScans: 4, scanDeadlineMs: 5_000, heartbeatMs: 1_000, stuckAfterMs: 60_000, staleHeartbeatMs: 30_000 },
   });
   const repo = scans.upsertRepo({ owner: 'acme', name: 'app', isPrivate: false });
   const newScan = (hasAuth = false) => scans.insertScan({
     repoId: repo.id, ref: null, options: ScanOptionsSchema.parse({}), optionsHash: randomUUID(), idempotencyKey: null, hasAuth,
   }).id;
-  return { db, scans, runner, newScan };
+  return { db, scans, runner, newScan, advance: (ms: number) => { clock += ms; } };
 }
