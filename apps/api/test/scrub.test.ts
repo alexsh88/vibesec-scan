@@ -25,9 +25,18 @@ describe('scrubSecrets', () => {
   });
 
   it('stops redacting an authorization value at the end of a JSON string or line', () => {
-    expect(scrubSecrets('{"authorization":"abc123", "other":"x"}')).toBe('{"authorization":"[REDACTED]", "other":"x"}');
-    expect(scrubSecrets('Authorization: abc123\nnext line')).toBe('Authorization: [REDACTED]\nnext line');
-    expect(scrubSecrets("authorization='abc123', foo=bar")).toBe("authorization='[REDACTED]', foo=bar");
+    expect(scrubSecrets('{"authorization":"abc123SuperSecretOpaque", "other":"x"}')).toBe('{"authorization":"[REDACTED]", "other":"x"}');
+    expect(scrubSecrets('Authorization: abc123SuperSecretOpaque\nnext line')).toBe('Authorization: [REDACTED]\nnext line');
+    expect(scrubSecrets("authorization='abc123SuperSecretOpaque', foo=bar")).toBe("authorization='[REDACTED]', foo=bar");
+  });
+
+  it('does not redact prose that merely mentions "authorization"', () => {
+    const prose = 'Broken authorization: any user can delete posts, including admins';
+    expect(scrubSecrets(prose)).toBe(prose);
+  });
+
+  it('leaves short non-credential authorization values alone', () => {
+    expect(scrubSecrets('authorization: required')).toBe('authorization: required');
   });
 
   it('leaves normal text alone', () => {
@@ -43,6 +52,15 @@ describe('scrubSecrets', () => {
     const out = scrubSecrets('-----BEGIN RSA PRIVATE KEY-----\nMIIEvQIBADANBg (never closed)');
     expect(out).not.toContain('-----BEGIN RSA PRIVATE KEY-----');
     expect(out.startsWith('[REDACTED]')).toBe(true);
+  });
+
+  it('redacts the base64 body lines that follow an unterminated BEGIN marker, but keeps trailing prose', () => {
+    const input = '-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEA1234567890abcdef\nABCDEFGHIJKLMNOPQRSTUVWX\nzyxwvutsrqponmlk==\nend of snippet';
+    const out = scrubSecrets(input);
+    expect(out).not.toContain('MIIEowIBAAKCAQEA1234567890abcdef');
+    expect(out).not.toContain('ABCDEFGHIJKLMNOPQRSTUVWX');
+    expect(out).not.toContain('zyxwvutsrqponmlk==');
+    expect(out).toContain('end of snippet');
   });
 
   it('scrubs 2 MB of repeated unterminated BEGIN markers in well under 500ms', () => {
@@ -72,6 +90,11 @@ describe('scrubDeep', () => {
     const o: any = { a: 1 };
     o.list = [o];
     expect(scrubDeep(o)).toEqual({ a: 1, list: ['[Circular]'] });
+  });
+
+  it('treats a shared (non-cyclic) reference as two independent copies, not [Circular]', () => {
+    const o = { a: 1 };
+    expect(scrubDeep({ x: o, y: o })).toEqual({ x: { a: 1 }, y: { a: 1 } });
   });
 
   it('converts Date instances to their ISO string instead of {}', () => {

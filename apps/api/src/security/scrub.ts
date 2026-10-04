@@ -11,10 +11,14 @@ const PATTERNS: RegExp[] = [
   /\bSG\.[A-Za-z0-9_-]{16,}\.[A-Za-z0-9_-]{16,}\b/g,
 ];
 
-// Anything after `authorization: ` (with or without a scheme keyword) up to end of
-// line or end of a JSON string value is opaque and must be redacted — opaque
-// (schemeless) tokens leak otherwise.
-const AUTH_HEADER = /(authorization\s*["']?\s*[:=]\s*["']?)(?:(?:basic|bearer|token)\s+)?[^\n\r"',]*/gi;
+// Only redact credential-looking authorization values, not prose that merely
+// mentions the word. With a scheme keyword, the scheme + following token is
+// opaque and always redacted. Without one, require a single unbroken run of
+// >=16 base64/token-alphabet chars ending at EOS/whitespace/quote/comma — long
+// enough to rule out ordinary words like "required" or a sentence of prose.
+const AUTH_PREFIX = 'authorization\\s*["\']?\\s*[:=]\\s*["\']?';
+const AUTH_SCHEME = new RegExp(`(${AUTH_PREFIX})(?:basic|bearer|token)\\s+[^\\s"',]+`, 'gi');
+const AUTH_OPAQUE = new RegExp(`(${AUTH_PREFIX})[A-Za-z0-9._~+/=-]{16,}(?=$|[\\s"',])`, 'gi');
 
 const SENSITIVE_KEY = /token|secret|password|passwd|api[_-]?key|authorization|credential|private[_-]?key/i;
 const SENSITIVE_KEY_EXEMPT_SUFFIX = /(?:type|fingerprint|count|id)$/i;
@@ -40,6 +44,10 @@ const PEM_MAX_LABEL_CHARS = 32;
 const PEM_WINDOW_BYTES = 16 * 1024;
 
 type PemMarker = { start: number; end: number };
+
+// A line made up entirely of base64 alphabet chars (len >=16) is almost certainly
+// PEM body content rather than prose, so it's safe to redact it too.
+const PEM_BASE64_LINE = /^[A-Za-z0-9+/=]{16,}[ \t\r]*$/;
 
 function isUpperOrSpace(code: number): boolean {
   return (code >= 65 && code <= 90) || code === 32;
@@ -73,6 +81,33 @@ function findPemMarkers(text: string, prefix: string): PemMarker[] {
   return markers;
 }
 
+/**
+ * When a BEGIN marker has no END nearby, extend the redaction past the marker's
+ * own line to cover the consecutive base64-looking lines that follow (bounded by
+ * PEM_WINDOW_BYTES from the marker), so the key body doesn't leak. Returns
+ * markerEnd unchanged when the marker isn't followed by a line break or by any
+ * matching line, so the existing "no body" behavior is untouched.
+ */
+function consumePemBody(text: string, markerEnd: number): number {
+  let pos = markerEnd;
+  if (text[pos] === '\r' && text[pos + 1] === '\n') pos += 2;
+  else if (text[pos] === '\n') pos += 1;
+  else return markerEnd;
+
+  const windowEnd = Math.min(text.length, markerEnd + PEM_WINDOW_BYTES);
+  let cursor = pos;
+  let consumedAny = false;
+  while (cursor < windowEnd) {
+    let lineEnd = text.indexOf('\n', cursor);
+    if (lineEnd === -1 || lineEnd > windowEnd) lineEnd = windowEnd;
+    const line = text.slice(cursor, lineEnd);
+    if (!PEM_BASE64_LINE.test(line)) break;
+    consumedAny = true;
+    cursor = lineEnd < text.length && text[lineEnd] === '\n' ? lineEnd + 1 : lineEnd;
+  }
+  return consumedAny ? cursor : markerEnd;
+}
+
 function scrubPemBlocks(text: string): string {
   const begins = findPemMarkers(text, PEM_BEGIN_PREFIX);
   if (begins.length === 0) return text;
@@ -91,9 +126,10 @@ function scrubPemBlocks(text: string): string {
       cursor = candidate.end;
       endIdx++;
     } else {
-      // No END marker nearby: redact just the exposed BEGIN line, not the whole tail.
+      // No END marker nearby: redact the exposed BEGIN line plus any base64-looking
+      // body lines right after it, not the whole tail.
       out += REDACTED;
-      cursor = begin.end;
+      cursor = consumePemBody(text, begin.end);
     }
   }
   out += text.slice(cursor);
@@ -101,7 +137,8 @@ function scrubPemBlocks(text: string): string {
 }
 
 export function scrubSecrets(text: string): string {
-  let out = text.replace(AUTH_HEADER, `$1${REDACTED}`);
+  let out = text.replace(AUTH_SCHEME, `$1${REDACTED}`);
+  out = out.replace(AUTH_OPAQUE, `$1${REDACTED}`);
   for (const re of PATTERNS) out = out.replace(re, REDACTED);
   out = scrubPemBlocks(out);
   return out;
@@ -118,14 +155,24 @@ function scrubDeepInner(value: unknown, seen: WeakSet<object>): unknown {
   if (ArrayBuffer.isView(value)) return `[binary ${(value as ArrayBufferView).byteLength} bytes]`;
   if (value instanceof ArrayBuffer) return `[binary ${value.byteLength} bytes]`;
 
+  // Track the ancestor path, not every object ever visited: add before recursing
+  // into children and remove once this node's subtree is done, so a shared
+  // (non-cyclic) reference reached twice via different parents is scrubbed twice
+  // instead of being flagged as circular.
   seen.add(value);
 
-  if (Array.isArray(value)) return value.map((v) => scrubDeepInner(v, seen));
-
-  const out: Record<string, unknown> = {};
-  for (const [k, v] of Object.entries(value)) {
-    out[k] = isSensitiveKey(k) && typeof v === 'string' ? REDACTED : scrubDeepInner(v, seen);
+  let out: unknown;
+  if (Array.isArray(value)) {
+    out = value.map((v) => scrubDeepInner(v, seen));
+  } else {
+    const obj: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(value)) {
+      obj[k] = isSensitiveKey(k) && typeof v === 'string' ? REDACTED : scrubDeepInner(v, seen);
+    }
+    out = obj;
   }
+
+  seen.delete(value);
   return out;
 }
 
