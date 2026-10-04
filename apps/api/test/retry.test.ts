@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import { AppError } from '../src/errors/AppError';
-import { computeBackoff, withRetry, type RetryPolicy } from '../src/resilience/retry';
+import { computeBackoff, withRetry, MAX_RETRY_AFTER_MS, type RetryPolicy } from '../src/resilience/retry';
 
 const policy: RetryPolicy = { retries: 3, baseMs: 100, capMs: 1_000 };
 const transient = () => new AppError('INTERNAL', 'transient', 'flaky');
@@ -52,6 +52,41 @@ describe('withRetry', () => {
       return 1;
     }, policy, undefined, { sleep: async (ms) => { delays.push(ms); } });
     expect(delays).toEqual([4_000]);
+  });
+
+  it('still sleeps when retryAfterMs is at the maxRetryAfterMs ceiling', async () => {
+    const delays: number[] = [];
+    let n = 0;
+    const result = await withRetry(async () => {
+      if (n++ === 0) throw new AppError('GITHUB_RATE_LIMITED', 'transient', 'rl', { retryAfterMs: MAX_RETRY_AFTER_MS });
+      return 'ok';
+    }, policy, undefined, { sleep: async (ms) => { delays.push(ms); } });
+    expect(result).toBe('ok');
+    expect(delays).toEqual([MAX_RETRY_AFTER_MS]);
+  });
+
+  it('throws immediately without sleeping when retryAfterMs exceeds maxRetryAfterMs', async () => {
+    const sleep = vi.fn(async () => {});
+    const fn = vi.fn(async () => {
+      throw new AppError('GITHUB_RATE_LIMITED', 'transient', 'rl', { retryAfterMs: MAX_RETRY_AFTER_MS + 1 });
+    });
+    await expect(withRetry(fn, policy, undefined, { sleep })).rejects.toMatchObject({
+      code: 'GITHUB_RATE_LIMITED',
+      retryAfterMs: MAX_RETRY_AFTER_MS + 1,
+    });
+    expect(sleep).not.toHaveBeenCalled();
+    expect(fn).toHaveBeenCalledTimes(1);
+  });
+
+  it('honors a caller-supplied maxRetryAfterMs override', async () => {
+    const sleep = vi.fn(async () => {});
+    const fn = vi.fn(async () => {
+      throw new AppError('GITHUB_RATE_LIMITED', 'transient', 'rl', { retryAfterMs: 5_000 });
+    });
+    await expect(withRetry(fn, policy, undefined, { sleep, maxRetryAfterMs: 1_000 })).rejects.toMatchObject({
+      code: 'GITHUB_RATE_LIMITED',
+    });
+    expect(sleep).not.toHaveBeenCalled();
   });
 
   it('reports retries through onRetry', async () => {

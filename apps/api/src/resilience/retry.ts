@@ -16,10 +16,15 @@ export const RETRY_POLICIES = {
 
 export type RetryInfo = { attempt: number; delayMs: number; error: AppError };
 
+/** Default ceiling for a server-supplied retryAfterMs; see RetryDeps.maxRetryAfterMs. */
+export const MAX_RETRY_AFTER_MS = 60_000;
+
 export type RetryDeps = {
   sleep?: (ms: number, signal?: AbortSignal) => Promise<void>;
   random?: () => number;
   onRetry?: (info: RetryInfo) => void;
+  /** Ceiling for err.retryAfterMs; beyond this we fail fast instead of sleeping. Defaults to MAX_RETRY_AFTER_MS. */
+  maxRetryAfterMs?: number;
 };
 
 export function computeBackoff(attempt: number, policy: RetryPolicy, random: () => number = Math.random): number {
@@ -41,6 +46,7 @@ export async function withRetry<T>(
 ): Promise<T> {
   const sleep = deps.sleep ?? defaultSleep;
   const random = deps.random ?? Math.random;
+  const maxRetryAfterMs = deps.maxRetryAfterMs ?? MAX_RETRY_AFTER_MS;
 
   for (let attempt = 0; ; attempt++) {
     if (signal?.aborted) throw cancelled();
@@ -49,7 +55,11 @@ export async function withRetry<T>(
     } catch (raw) {
       const err = toAppError(raw);
       if (signal?.aborted) throw cancelled();
-      if (!err.retryable || attempt >= policy.retries) throw err;
+      if (!err.retryable) throw err;
+      // A rate limiter asking us to wait longer than we're willing to sleep is not
+      // something a retry loop should honor — surface it to the caller immediately.
+      if (err.retryAfterMs !== undefined && err.retryAfterMs > maxRetryAfterMs) throw err;
+      if (attempt >= policy.retries) throw err;
       const delayMs = err.retryAfterMs ?? computeBackoff(attempt, policy, random);
       deps.onRetry?.({ attempt: attempt + 1, delayMs, error: err });
       try {

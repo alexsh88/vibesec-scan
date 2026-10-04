@@ -40,15 +40,17 @@ export class CircuitBreaker {
       this.state = 'closed';
       return result;
     } catch (err) {
-      this.recordFailure(err, isProbe);
-      throw err;
+      // Normalize before rethrowing so callers always get an AppError, never a raw Error.
+      const appErr = toAppError(err);
+      this.recordFailure(appErr, isProbe);
+      throw appErr;
     } finally {
       if (isProbe) this.probeInFlight = false;
     }
   }
 
-  private recordFailure(err: unknown, isProbe: boolean): void {
-    if (toAppError(err).kind !== 'transient') return;
+  private recordFailure(err: AppError, isProbe: boolean): void {
+    if (err.kind !== 'transient') return;
     if (isProbe) {
       this.open();
       return;

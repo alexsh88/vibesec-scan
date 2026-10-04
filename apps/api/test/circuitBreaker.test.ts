@@ -55,6 +55,13 @@ describe('CircuitBreaker', () => {
     expect(b.getState()).toBe('open');
   });
 
+  it('normalizes a raw Error into an AppError (code INTERNAL) instead of rethrowing it as-is', async () => {
+    const { b } = makeBreaker();
+    const result = b.run(async () => { throw new Error('x'); });
+    await expect(result).rejects.toBeInstanceOf(AppError);
+    await expect(result).rejects.toMatchObject({ code: 'INTERNAL' });
+  });
+
   it('allows only one probe while half-open', async () => {
     const { b, advance } = makeBreaker();
     for (let i = 0; i < 3; i++) await expect(b.run(transient)).rejects.toBeDefined();
