@@ -15,11 +15,23 @@ export type PipelineContext = {
   checkpointData: Record<string, unknown>;
   emit(event: ScanEvent): void;
   warn(warning: ScanWarning & { file?: string }): void;
+  /**
+   * Reports liveness to the stuck-scan watchdog without emitting an event (`emit`/`warn` also count).
+   * Any long, quiet operation (LLM calls, git clone/fetch, sandboxed analyzers…) MUST call `ctx.touch()`
+   * at least every `stuckAfterMs / 2`, or the watchdog will abort the scan as stuck.
+   */
+  touch(): void;
 };
 
 export type StageSpec = {
   name: StageName;
-  /** Fatal stages fail the scan; degradable stages turn errors into warnings (spec §14.6). */
+  /**
+   * Fatal stages fail the scan; degradable stages turn errors into warnings (spec §14.6).
+   * Note: ANALYZING is degradable per analyzer, but when EVERY analyzer fails the real ANALYZING stage
+   * must throw a fatal AppError so the scan ends FAILED — "all analyzers failed ⇒ FAILED". TODO (later milestone):
+   * today the runner downgrades every degradable-stage error to a warning, so it must learn to honour that signal.
+   * A stage must honour `ctx.signal`: if it resolves after an abort, the runner treats it as aborted (not completed).
+   */
   fatal: boolean;
   run(ctx: PipelineContext): Promise<void>;
 };

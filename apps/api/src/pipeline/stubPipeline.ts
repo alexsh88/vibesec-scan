@@ -20,6 +20,8 @@ export function createStubPipeline(stepMs = 400): Pipeline {
       simple('CLONING', true),
       simple('INDEXING', true),
       {
+        // The real ANALYZING stage must throw a fatal AppError when EVERY analyzer fails (spec §14.6:
+        // "all analyzers failed ⇒ FAILED"); see StageSpec in ./types. The stub never fails.
         name: 'ANALYZING', fatal: false,
         run: async (ctx) => {
           for (const [i, analyzer] of ANALYZERS.entries()) {

@@ -4,8 +4,9 @@ import type { Config } from '../config';
 import type { Checkpoint, ScanRepo } from '../db/scanRepo';
 import { AppError, toAppError } from '../errors/AppError';
 import type { EventBus } from '../events/EventBus';
-import type { Pipeline, PipelineContext, ScanSecrets } from '../pipeline/types';
+import type { Pipeline, PipelineContext, ScanSecrets, StageName } from '../pipeline/types';
 import type { ScanLifecycle } from '../scans/ScanLifecycle';
+import { scrubSecrets } from '../security/scrub';
 
 export type CancelResult = 'aborted' | 'dequeued' | 'unknown';
 
@@ -15,15 +16,27 @@ export interface ScanQueue {
   pendingCount(): number;
 }
 
-export type JobRunnerConfig = Pick<Config, 'maxConcurrentScans' | 'scanDeadlineMs' | 'heartbeatMs' | 'stuckAfterMs'>;
+export type JobRunnerConfig = Pick<
+  Config, 'maxConcurrentScans' | 'scanDeadlineMs' | 'heartbeatMs' | 'stuckAfterMs' | 'staleHeartbeatMs'
+>;
+
+/** A resumed scan gets whatever is left of its whole-scan deadline (spec §14.2), but never less than this. */
+const MIN_RESUME_DEADLINE_MS = 60_000;
 
 type AbortKind = 'user' | 'shutdown' | 'stuck';
 type RunningJob = { controller: AbortController; abortKind: AbortKind | null; lastActivity: number; done: Promise<void> };
+type Outcome = { ok: true } | { ok: false; raw: unknown };
 
 export type JobRunnerDeps = {
   scans: ScanRepo; lifecycle: ScanLifecycle; bus: EventBus; audit: AuditLogger;
   pipeline: Pipeline; config: JobRunnerConfig; now?: () => number;
 };
+
+/** Last-resort logging for failures that have no scan to report to. Scrubbed: errors may echo secrets. */
+function logInternal(message: string, scanId: string, err: unknown): void {
+  const detail = err instanceof Error ? `${err.name}: ${err.message}\n${err.stack ?? ''}` : String(err);
+  console.error(scrubSecrets(`[JobRunner] ${message} (scan ${scanId}): ${detail}`));
+}
 
 export class JobRunner implements ScanQueue {
   private readonly queue: { scanId: string; secrets: ScanSecrets }[] = [];
@@ -34,6 +47,7 @@ export class JobRunner implements ScanQueue {
   constructor(private readonly deps: JobRunnerDeps) {}
 
   enqueue(scanId: string, secrets: ScanSecrets): void {
+    if (this.isActive(scanId)) return; // already queued or running: never run a scan twice
     if (this.stopping) throw new AppError('QUEUE_FULL', 'transient', 'Server is shutting down; try again shortly');
     this.queue.push({ scanId, secrets });
     this.pump();
@@ -63,8 +77,12 @@ export class JobRunner implements ScanQueue {
   recover(): { resumed: string[]; failed: string[] } {
     const resumed: string[] = [];
     const failed: string[] = [];
+    const now = this.now();
     for (const row of this.deps.scans.listNonTerminal()) {
       if (this.isActive(row.id)) continue;
+      // A recent heartbeat means another live process may still own this scan: leave it alone.
+      const beat = row.heartbeat_at ? Date.parse(row.heartbeat_at) : NaN;
+      if (!Number.isNaN(beat) && now - beat < this.deps.config.staleHeartbeatMs) continue;
       if (row.has_auth === 1) {
         this.deps.lifecycle.transition(row.id, 'FAILED', {
           code: 'AUTH_REQUIRED',
@@ -73,8 +91,9 @@ export class JobRunner implements ScanQueue {
         failed.push(row.id);
         continue;
       }
-      this.deps.audit.append({ action: 'scan.resumed', targetType: 'scan', targetId: row.id, scanId: row.id });
+      if (this.stopping) continue; // still non-terminal in the DB; the next boot picks it up
       this.enqueue(row.id, {});
+      this.deps.audit.append({ action: 'scan.resumed', targetType: 'scan', targetId: row.id, scanId: row.id });
       resumed.push(row.id);
     }
     return { resumed, failed };
@@ -110,7 +129,7 @@ export class JobRunner implements ScanQueue {
     const finished = await Promise.race([allDone, sleep(graceMs, false, { ref: false })]);
     if (!finished) {
       for (const job of this.running.values()) {
-        job.abortKind = 'shutdown';
+        job.abortKind ??= 'shutdown'; // a user cancel / stuck verdict already in flight wins
         job.controller.abort();
       }
       await this.whenIdle();
@@ -126,66 +145,114 @@ export class JobRunner implements ScanQueue {
       const { scanId, secrets } = this.queue.shift()!;
       const job: RunningJob = { controller: new AbortController(), abortKind: null, lastActivity: this.now(), done: Promise.resolve() };
       this.running.set(scanId, job);
-      job.done = this.execute(scanId, secrets, job).finally(() => {
-        this.running.delete(scanId);
-        this.pump();
-      });
+      // `done` must never reject: an unhandled rejection would take the whole process down.
+      job.done = this.execute(scanId, secrets, job)
+        .catch((err: unknown) => logInternal('scan execution crashed', scanId, err))
+        .finally(() => {
+          this.running.delete(scanId);
+          this.pump();
+        });
     }
   }
 
   private async execute(scanId: string, secrets: ScanSecrets, job: RunningJob): Promise<void> {
     const { scans, lifecycle, pipeline, config, bus } = this.deps;
-    const deadline = AbortSignal.timeout(config.scanDeadlineMs);
-    const signal = AbortSignal.any([job.controller.signal, deadline]);
     const touch = () => { job.lastActivity = this.now(); };
 
-    scans.heartbeat(scanId);
+    const checkpoint: Checkpoint = scans.getCheckpoint(scanId) ?? { completedStages: [], data: {} };
+
+    // Whole-scan deadline (spec §14.2): fixed on the first run and persisted, so a resume continues the
+    // same budget instead of starting a fresh one.
+    let deadlineMs: number;
+    const storedDeadline = checkpoint.data.deadlineAt;
+    if (typeof storedDeadline === 'number' && Number.isFinite(storedDeadline)) {
+      deadlineMs = Math.max(storedDeadline - this.now(), MIN_RESUME_DEADLINE_MS);
+    } else {
+      deadlineMs = config.scanDeadlineMs;
+      checkpoint.data.deadlineAt = this.now() + config.scanDeadlineMs;
+      scans.setCheckpoint(scanId, checkpoint);
+    }
+    const deadline = new AbortController();
+    const deadlineTimer = setTimeout(() => deadline.abort(), deadlineMs);
+    deadlineTimer.unref();
+    const signal = AbortSignal.any([job.controller.signal, deadline.signal]);
+
     const heartbeat = setInterval(() => scans.heartbeat(scanId), config.heartbeatMs);
     heartbeat.unref();
 
-    const checkpoint: Checkpoint = scans.getCheckpoint(scanId) ?? { completedStages: [], data: {} };
-    let warned = (scans.getDto(scanId)?.warnings.length ?? 0) > 0;
-    const ctx: PipelineContext = {
-      scanId,
-      scan: scans.getDto(scanId)!,
-      secrets,
-      signal,
-      checkpointData: checkpoint.data,
-      emit: (event) => { touch(); bus.publish(scanId, event); },
-      warn: (w) => { touch(); warned = true; lifecycle.warn(scanId, w); },
-    };
-
     try {
-      for (const stage of pipeline.stages) {
-        if (checkpoint.completedStages.includes(stage.name)) continue;
-        if (signal.aborted) throw new AppError('CANCELLED', 'cancelled', 'Scan aborted');
-        touch();
-        lifecycle.transition(scanId, stage.name);
-        try {
-          await stage.run(ctx);
-        } catch (raw) {
-          const err = toAppError(raw);
-          if (signal.aborted || stage.fatal || err.kind === 'cancelled') throw raw;
-          ctx.warn({ code: err.code, message: err.userMessage, stage: stage.name });
+      scans.heartbeat(scanId);
+      // Stages that did not complete will re-run: drop their persisted warnings so they are not duplicated.
+      // Note: their `progress`/`finding` events are re-published on resume; that is acceptable for now
+      // because the UI dedupes findings by id and progress is idempotent.
+      const pending = pipeline.stages.map((s) => s.name).filter((n) => !checkpoint.completedStages.includes(n));
+      scans.removeWarningsForStages(scanId, pending);
+
+      let warned = (scans.getDto(scanId)?.warnings.length ?? 0) > 0;
+      let currentStage: StageName | undefined;
+      const ctx: PipelineContext = {
+        scanId,
+        scan: scans.getDto(scanId)!,
+        secrets,
+        signal,
+        checkpointData: checkpoint.data,
+        emit: (event) => { touch(); bus.publish(scanId, event); },
+        warn: (w) => { touch(); warned = true; lifecycle.warn(scanId, w); },
+        touch,
+      };
+
+      // Phase 1: run stages. This only decides the outcome; nothing here writes a terminal state.
+      let outcome: Outcome;
+      try {
+        for (const stage of pipeline.stages) {
+          if (checkpoint.completedStages.includes(stage.name)) continue;
+          if (signal.aborted) throw new AppError('CANCELLED', 'cancelled', 'Scan aborted');
+          touch();
+          currentStage = stage.name;
+          if (!lifecycle.transition(scanId, stage.name)) {
+            // Already terminal (e.g. finalized elsewhere): nothing left to do; finalization will no-op.
+            throw new AppError('CANCELLED', 'cancelled', 'Scan is already finished');
+          }
+          try {
+            await stage.run(ctx);
+          } catch (raw) {
+            const err = toAppError(raw);
+            if (signal.aborted || stage.fatal || err.kind === 'cancelled') throw raw;
+            ctx.warn({ code: err.code, message: err.userMessage, stage: stage.name });
+          }
+          // A stage that swallowed the abort did not really finish: never checkpoint it as complete.
+          if (signal.aborted) throw new AppError('CANCELLED', 'cancelled', 'Scan aborted');
+          checkpoint.completedStages.push(stage.name);
+          scans.setCheckpoint(scanId, checkpoint);
         }
-        checkpoint.completedStages.push(stage.name);
-        scans.setCheckpoint(scanId, checkpoint);
+        outcome = { ok: true };
+      } catch (raw) {
+        outcome = { ok: false, raw };
       }
-      this.complete(scanId, warned);
-    } catch (raw) {
-      this.finishWithError(scanId, raw, job, deadline, checkpoint);
+
+      // Phase 2: finalize exactly once. If finalizing itself fails, log it and leave the scan
+      // non-terminal so recover() can resume it; the lifecycle is terminal-once either way.
+      try {
+        if (outcome.ok) this.complete(scanId, warned);
+        else this.finishWithError(scanId, outcome.raw, job, deadline.signal, checkpoint, currentStage);
+      } catch (err) {
+        logInternal('failed to finalize scan; it stays resumable', scanId, err);
+      }
     } finally {
       clearInterval(heartbeat);
+      clearTimeout(deadlineTimer);
     }
   }
 
   private complete(scanId: string, warned: boolean): void {
     const state = warned ? 'COMPLETED_WITH_WARNINGS' : 'COMPLETED';
-    this.deps.lifecycle.transition(scanId, state);
+    if (!this.deps.lifecycle.transition(scanId, state)) return;
     this.deps.audit.append({ action: 'scan.completed', targetType: 'scan', targetId: scanId, scanId, details: { state } });
   }
 
-  private finishWithError(scanId: string, raw: unknown, job: RunningJob, deadline: AbortSignal, checkpoint: Checkpoint): void {
+  private finishWithError(
+    scanId: string, raw: unknown, job: RunningJob, deadline: AbortSignal, checkpoint: Checkpoint, currentStage: StageName | undefined,
+  ): void {
     const { lifecycle, audit } = this.deps;
     if (job.abortKind === 'shutdown') return;
     if (job.abortKind === 'user') {
@@ -197,7 +264,9 @@ export class JobRunner implements ScanQueue {
       err = new AppError('INTERNAL', 'permanent', 'The scan stopped making progress and was stopped');
     } else if (deadline.aborted) {
       if (checkpoint.completedStages.includes('ANALYZING')) {
-        lifecycle.warn(scanId, { code: 'SCAN_DEADLINE', message: 'Time limit reached; results are partial' });
+        lifecycle.warn(scanId, {
+          code: 'SCAN_DEADLINE', message: 'Time limit reached; results are partial', ...(currentStage ? { stage: currentStage } : {}),
+        });
         this.complete(scanId, true);
         return;
       }
@@ -205,7 +274,7 @@ export class JobRunner implements ScanQueue {
     } else {
       err = toAppError(raw);
     }
-    lifecycle.transition(scanId, 'FAILED', { code: err.code, message: err.userMessage });
+    if (!lifecycle.transition(scanId, 'FAILED', { code: err.code, message: err.userMessage })) return;
     audit.append({ action: 'scan.failed', targetType: 'scan', targetId: scanId, scanId, details: { code: err.code } });
   }
 }

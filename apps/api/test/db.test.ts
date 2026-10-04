@@ -75,6 +75,30 @@ describe('ScanRepo', () => {
     expect(scans.getDto(scan.id)?.errorMessage).toBeNull();
   });
 
+  it('transitionState is terminal-once and reports whether the row changed', () => {
+    const { scans, scan } = seed();
+    expect(scans.transitionState(scan.id, 'RESOLVING')).toBe(true);
+    expect(scans.transitionState(scan.id, 'COMPLETED')).toBe(true);
+    const finishedAt = scans.getDto(scan.id)?.finishedAt;
+    expect(scans.transitionState(scan.id, 'FAILED', { errorCode: 'INTERNAL', errorMessage: 'x' })).toBe(false);
+    expect(scans.transitionState(scan.id, 'ANALYZING')).toBe(false);
+    expect(scans.getDto(scan.id)).toMatchObject({ state: 'COMPLETED', errorCode: null, finishedAt });
+    expect(scans.transitionState('missing', 'RESOLVING')).toBe(false);
+  });
+
+  it('removes warnings for the given stages, keeping order and stage-less warnings', () => {
+    const { scans, scan } = seed();
+    scans.addWarning(scan.id, { code: 'A', message: 'a', stage: 'ANALYZING' });
+    scans.addWarning(scan.id, { code: 'B', message: 'b', stage: 'VERIFYING' });
+    scans.addWarning(scan.id, { code: 'C', message: 'c' });
+    scans.addWarning(scan.id, { code: 'D', message: 'd', stage: 'SYNTHESIZING' });
+    scans.removeWarningsForStages(scan.id, ['VERIFYING', 'SYNTHESIZING']);
+    expect(scans.getDto(scan.id)?.warnings).toEqual([
+      { code: 'A', message: 'a', stage: 'ANALYZING' },
+      { code: 'C', message: 'c' },
+    ]);
+  });
+
   it('lists non-terminal scans for recovery', () => {
     const { scans, scan } = seed();
     expect(scans.listNonTerminal().map((s) => s.id)).toEqual([scan.id]);

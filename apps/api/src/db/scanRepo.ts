@@ -98,6 +98,23 @@ export class ScanRepo {
     ).run(state, state, err.errorCode ?? null, state, err.errorMessage ?? null, state, now, isTerminalState(state) ? 1 : 0, now, id);
   }
 
+  /**
+   * Terminal-once state change: only applies while the scan is still non-terminal, so a scan can never
+   * leave (or re-enter) a terminal state. Returns whether the row changed.
+   */
+  transitionState(id: string, state: ScanState, err: { errorCode?: string; errorMessage?: string } = {}): boolean {
+    const now = this.now();
+    const failed = state === 'FAILED';
+    const result = this.db.prepare(
+      `UPDATE scans SET state = ?, error_code = ?, error_message = ?,
+         started_at = CASE WHEN started_at IS NULL AND ? <> 'QUEUED' THEN ? ELSE started_at END,
+         finished_at = CASE WHEN ? = 1 THEN ? ELSE finished_at END
+       WHERE id = ? AND state NOT IN ${TERMINAL_SQL}`,
+    ).run(state, failed ? err.errorCode ?? null : null, failed ? err.errorMessage ?? null : null,
+      state, now, isTerminalState(state) ? 1 : 0, now, id);
+    return result.changes > 0;
+  }
+
   setCommitSha(id: string, sha: string): void {
     this.db.prepare(`UPDATE scans SET commit_sha = ? WHERE id = ?`).run(sha, id);
   }
@@ -105,6 +122,19 @@ export class ScanRepo {
   addWarning(id: string, warning: ScanWarning): void {
     this.db.prepare(`UPDATE scans SET warnings_json = json_insert(warnings_json, '$[#]', json(?)) WHERE id = ?`)
       .run(JSON.stringify(warning), id);
+  }
+
+  /** Drops warnings attributed to any of `stages` (order preserved; warnings without a stage are kept). */
+  removeWarningsForStages(id: string, stages: readonly string[]): void {
+    if (stages.length === 0) return;
+    const row = this.db.prepare(`SELECT warnings_json FROM scans WHERE id = ?`).get(id) as { warnings_json: string } | undefined;
+    if (!row) return;
+    const drop = new Set(stages);
+    const warnings = JSON.parse(row.warnings_json) as ScanWarning[];
+    const kept = warnings.filter((w) => w.stage === undefined || !drop.has(w.stage));
+    if (kept.length !== warnings.length) {
+      this.db.prepare(`UPDATE scans SET warnings_json = ? WHERE id = ?`).run(JSON.stringify(kept), id);
+    }
   }
 
   setCheckpoint(id: string, checkpoint: Checkpoint): void {

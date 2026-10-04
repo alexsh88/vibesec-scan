@@ -25,7 +25,7 @@ const req = (body: unknown) => CreateScanRequestSchema.parse(body);
 function setup(queueCapacity = 10) {
   const db = memoryDb();
   const scans = new ScanRepo(db);
-  const lifecycle = new ScanLifecycle(scans, new EventBus(new EventRepo(db)));
+  const lifecycle = new ScanLifecycle(scans, new EventBus(new EventRepo(db)), db);
   const audit = new AuditLogger(db);
   const queue = new FakeQueue();
   const service = new ScanService({ db, scans, lifecycle, audit, queue, queueCapacity });

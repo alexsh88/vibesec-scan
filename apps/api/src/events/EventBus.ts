@@ -29,7 +29,9 @@ export class EventBus {
     set.add(listener);
     return () => {
       set.delete(listener);
-      if (set.size === 0) this.listeners.delete(scanId);
+      // Only drop the map entry if it is still *this* set: a repeated unsubscribe must not remove a
+      // newer set created by a later subscriber.
+      if (set.size === 0 && this.listeners.get(scanId) === set) this.listeners.delete(scanId);
     };
   }
 

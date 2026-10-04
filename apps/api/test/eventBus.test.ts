@@ -10,7 +10,7 @@ function setup() {
   const db = memoryDb();
   const scans = new ScanRepo(db);
   const bus = new EventBus(new EventRepo(db));
-  const lifecycle = new ScanLifecycle(scans, bus);
+  const lifecycle = new ScanLifecycle(scans, bus, db);
   const repo = scans.upsertRepo({ owner: 'acme', name: 'app', isPrivate: false });
   const id = scans.insertScan({
     repoId: repo.id, ref: null, options: ScanOptionsSchema.parse({}), optionsHash: 'h', idempotencyKey: null, hasAuth: false,
@@ -49,6 +49,18 @@ describe('EventBus', () => {
     bus.publish(id, { type: 'progress', analyzer: 'a', done: 1, total: 2 });
     expect(good).toHaveBeenCalledOnce();
   });
+
+  it('I-6: a repeated unsubscribe does not remove a later subscriber', () => {
+    const { bus, id } = setup();
+    const off = bus.subscribe(id, vi.fn());
+    off();
+    const later = vi.fn();
+    bus.subscribe(id, later);
+    off();
+    bus.publish(id, { type: 'progress', analyzer: 'a', done: 1, total: 2 });
+    expect(later).toHaveBeenCalledOnce();
+    expect(bus.listenerCount(id)).toBe(1);
+  });
 });
 
 describe('ScanLifecycle', () => {
@@ -62,6 +74,30 @@ describe('ScanLifecycle', () => {
       { type: 'state', state: 'FAILED', errorCode: 'AUTH_INVALID', message: 'bad token' },
       { type: 'done', state: 'FAILED' },
     ]);
+  });
+
+  it('C-1: is terminal-once — a second terminal transition is a no-op and publishes nothing', () => {
+    const { scans, bus, lifecycle, id } = setup();
+    expect(lifecycle.transition(id, 'COMPLETED')).toBe(true);
+    expect(lifecycle.transition(id, 'FAILED', { code: 'INTERNAL', message: 'x' })).toBe(false);
+    expect(lifecycle.transition(id, 'ANALYZING')).toBe(false);
+    expect(scans.getDto(id)).toMatchObject({ state: 'COMPLETED', errorCode: null });
+    expect(bus.replay(id, 0).map((e) => e.event)).toEqual([
+      { type: 'state', state: 'COMPLETED' },
+      { type: 'done', state: 'COMPLETED' },
+    ]);
+  });
+
+  it('C-1: the row update and the published events commit atomically', () => {
+    const { scans, bus, lifecycle, id } = setup();
+    const original = bus.publish.bind(bus);
+    vi.spyOn(bus, 'publish').mockImplementation((scanId, event) => {
+      if (event.type === 'done') throw new Error('event store down');
+      return original(scanId, event);
+    });
+    expect(() => lifecycle.transition(id, 'COMPLETED')).toThrow('event store down');
+    expect(scans.getDto(id)!.state).toBe('QUEUED');
+    expect(bus.replay(id, 0)).toEqual([]);
   });
 
   it('records and publishes warnings', () => {
