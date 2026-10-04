@@ -20,7 +20,7 @@ export const CreateScanRequestSchema = z.object({
   repoUrl: z.string().refine((u) => parseRepoUrl(u) !== null, 'Must be https://github.com/<owner>/<repo>'),
   ref: z.string().min(1).max(255).regex(/^[\w./-]+$/).optional(),
   auth: z.object({ type: z.literal('pat'), token: z.string().min(10).max(255) }).optional(),
-  options: ScanOptionsSchema.default(ScanOptionsSchema.parse({})),
+  options: ScanOptionsSchema.default(() => ScanOptionsSchema.parse({})),
 });
 export type CreateScanRequest = z.infer<typeof CreateScanRequestSchema>;
 
