@@ -6,10 +6,11 @@ import { CATEGORIES, SEVERITIES, type Category, type Finding, type FixPlan, type
 import { z } from 'zod';
 import type { CoverageStatus } from '../analyzers/types';
 import type { MockResponder } from '../llm/mockTransport';
+import { detectSecrets } from '../analyzers/credentials/rules';
 import { untrustedText } from '../llm/prompt';
 import type { LlmRequest } from '../llm/transport';
 
-export const SYNTHESIS_PROMPT_VERSION = 'synthesis-v1';
+export const SYNTHESIS_PROMPT_VERSION = 'synthesis-v2'; // v2: ruleId/file scrubbed, short key ids and detected credentials masked
 /** Appears verbatim in the system prompt; `synthesisMockResponder` keys on it. */
 export const SYNTHESIS_TASK_MARKER = 'Task: scan-synthesis';
 /** Findings sent in full (by riskScore); the rest are summarized as counts. */
@@ -65,16 +66,45 @@ export type Digest = {
 const INLINE_CODE_RE = /`{1,3}[^`]*`{1,3}/g;
 /** Anything token-shaped (keys, hashes, base64 blobs) is scrubbed: no credential value ever reaches the prompt. */
 const TOKEN_LIKE_RE = /[A-Za-z0-9_\-+/=.]{24,}/g;
+/**
+ * Shorter key ids (AWS AKIA… = 20, many API key ids 16–20): a 16+ run of word characters mixing letters
+ * and digits. Plain words ("authentication-bypass") have no digits and stay readable.
+ */
+const SHORT_TOKEN_RE = /[A-Za-z0-9_\-+=]{16,}/g;
+const RULE_ID_MAX = 120;
+const FILE_MAX = 200;
+const REDACTED = '[redacted]';
+
+/** Every value the credential rules recognize (the same detector the credentials analyzer uses) is masked. */
+function maskDetected(text: string): string {
+  let out = text;
+  for (const m of detectSecrets(text, { includeRedactOnly: true })) {
+    if (m.value.length > 0) out = out.split(m.value).join(REDACTED);
+  }
+  return out;
+}
+
+function scrubTokens(text: string): string {
+  return maskDetected(text)
+    .replace(TOKEN_LIKE_RE, REDACTED)
+    .replace(SHORT_TOKEN_RE, (m) => (/\d/.test(m) && /[A-Za-z]/.test(m) ? REDACTED : m));
+}
+
+const clipTo = (s: string, max: number) => (s.length > max ? `${s.slice(0, max - 1)}…` : s);
 
 export function scrubText(text: string, max: number): string {
-  const clean = text.replace(INLINE_CODE_RE, '[code]').replace(TOKEN_LIKE_RE, '[redacted]').replace(/\s+/g, ' ').trim();
-  return clean.length > max ? `${clean.slice(0, max - 1)}…` : clean;
+  return clipTo(scrubTokens(text.replace(INLINE_CODE_RE, '[code]')).replace(/\s+/g, ' ').trim(), max);
+}
+
+/** A repo path, scrubbed per segment (a whole path is legitimately long; a segment that is a key is not). */
+export function scrubPath(path: string, max = FILE_MAX): string {
+  return clipTo(path.split('/').map((seg) => (seg.length >= 24 ? REDACTED : scrubTokens(seg))).join('/'), max);
 }
 
 export function toDigestEntry(f: Finding): DigestEntry {
   const e: DigestEntry = {
-    id: f.id, category: f.category, ruleId: f.ruleId, title: scrubText(f.title, 160), severity: f.severity,
-    riskScore: f.riskScore, confidence: f.confidence, file: f.location.file,
+    id: f.id, category: f.category, ruleId: scrubText(f.ruleId, RULE_ID_MAX), title: scrubText(f.title, 160), severity: f.severity,
+    riskScore: f.riskScore, confidence: f.confidence, file: scrubPath(f.location.file),
     riskFactors: f.riskFactors.map((r) => r.factor), explanation: scrubText(f.explanation, EXPLANATION_MAX),
   };
   if (f.cwe) e.cwe = f.cwe;

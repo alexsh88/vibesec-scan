@@ -17,6 +17,7 @@ import { fallbackSummary, synthesizeSummary, validateReferences } from '../src/s
 import {
   buildDigest, DIGEST_MAX_FINDINGS, gradeFor, SYNTHESIS_TASK_MARKER, synthesisMockResponder, type SynthesisInput, type SynthesisOutput,
 } from '../src/synthesis/synthesisPrompt';
+import { fake } from './fakeCredentials';
 import { memoryDb } from './helpers';
 
 let n = 0;
@@ -94,6 +95,22 @@ describe('synthesis digest (findings-only input)', () => {
     expect(call.prompt).not.toContain(`"id":"${findings[2]!.id}"`); // info is counted, not listed
     expect(call.prompt).toContain('Info-level findings excluded from the digest: 1');
     expect(call.prompt).toContain('"liveness":"live"');
+  });
+
+  it('scrubs ruleId and file too, and short (16–20 char) key ids anywhere in the digest', async () => {
+    const key = fake.awsAccessKey(); // AKIA + 16
+    const f = finding({
+      ruleId: `sast/${key}`, title: `Key ${key} exposed`, explanation: 'Uses client id 9f8e7d6c5b4a3f2e1d0c in the call.',
+      location: { file: `config/${key}/creds.ts`, startLine: 1, endLine: 1, snippet: 'x', permalink: 'p' },
+    });
+    const { llm, calls } = stubLlm(() => okOutput());
+    await synthesizeSummary({ llm }, { scanId: 's1', findings: [f, finding({ ruleId: 'x'.repeat(500), location: { ...f.location, file: `${'d/'.repeat(300)}a.ts` } })] }, { signal });
+    const prompt = String(calls[0]!.prompt);
+    expect(prompt).not.toContain(key);
+    expect(prompt).not.toContain('9f8e7d6c5b4a3f2e1d0c');
+    expect(prompt).toContain('config/[redacted]/creds.ts');
+    expect(prompt).not.toContain('x'.repeat(200)); // ruleId capped
+    expect(prompt).not.toContain('d/'.repeat(200)); // file capped
   });
 
   it(`caps the digest at ${DIGEST_MAX_FINDINGS} findings by riskScore and summarizes the rest as counts`, () => {

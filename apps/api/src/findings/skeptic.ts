@@ -10,7 +10,9 @@
  *   refuted  → severity 'info', confidence 'low', riskFactor 'ai_refuted' (effect = −severity steps),
  *              explanation sentence, producedBy += 'skeptic:refuted'. The finding STAYS (hidden by the
  *              UI's default severity filter, never deleted).
- * A degraded reply (served by a lower model tier) may not refute: 'refuted' is applied as 'weakened'.
+ * A degraded reply (served by a lower model tier) may not refute, and neither may a refutation that does
+ * not cite evidenceLines inside the code window it was shown (at least one of them code, not a comment):
+ * either is applied as 'weakened'.
  *
  * Findings already carrying a 'skeptic:*' producedBy marker are never re-reviewed (idempotent re-runs).
  * Fail-open: a failed call leaves its findings unchanged and is counted by safe reason category; a
@@ -140,8 +142,19 @@ function findingBlock(f: Finding, index: number): string {
   return `FINDING findingIndex=${index}\n${untrustedText(`finding-${index}`, lines.join('\n'))}`;
 }
 
+/** The numbered code lines a prompt showed the model, per file (what a refutation may cite). */
+export type ShownCode = ReadonlyMap<string, ReadonlyMap<number, string>>;
+
 /** Builds the per-batch prompt; returns null when none of the code could be read. */
 export async function buildSkepticPrompt(batch: readonly Finding[], readFile: SkepticDeps['readFile']): Promise<string | null> {
+  return (await buildSkepticPromptWithCode(batch, readFile))?.prompt ?? null;
+}
+
+/** buildSkepticPrompt, plus the code lines it showed (for validating cited evidence). */
+export async function buildSkepticPromptWithCode(
+  batch: readonly Finding[], readFile: SkepticDeps['readFile'],
+): Promise<{ prompt: string; shown: ShownCode } | null> {
+  const shown = new Map<string, Map<number, string>>();
   const wanted = new Map<string, Range[]>();
   const add = (file: string, r: Range) => {
     const list = wanted.get(file);
@@ -168,7 +181,11 @@ export async function buildSkepticPrompt(batch: readonly Finding[], readFile: Sk
       const end = Math.min(lines.length, r.end, start + budget - 1);
       if (end < start) continue;
       if (parts.length > 0) parts.push('…');
-      for (let ln = start; ln <= end; ln++) parts.push(`${ln}: ${clip(lines[ln - 1] ?? '', MAX_LINE_CHARS)}`);
+      const fileShown = shown.get(file) ?? shown.set(file, new Map()).get(file)!;
+      for (let ln = start; ln <= end; ln++) {
+        parts.push(`${ln}: ${clip(lines[ln - 1] ?? '', MAX_LINE_CHARS)}`);
+        fileShown.set(ln, lines[ln - 1] ?? '');
+      }
       budget -= end - start + 1;
       if (budget <= 0) break;
     }
@@ -176,7 +193,7 @@ export async function buildSkepticPrompt(batch: readonly Finding[], readFile: Sk
   }
   if (!primaryRead) return null;
 
-  return [
+  const prompt = [
     `Review ${batch.length} finding(s) reported in ${JSON.stringify(batch[0]!.location.file)}. Argue against each one using the code below, then give your verdicts.`,
     '',
     ...batch.map((f, i) => findingBlock(f, i)),
@@ -184,6 +201,23 @@ export async function buildSkepticPrompt(batch: readonly Finding[], readFile: Sk
     'CODE (numbered lines from the repository at the scanned commit):',
     ...blocks,
   ].join('\n');
+  return { prompt, shown };
+}
+
+const COMMENT_ONLY_RE = /^\s*(?:$|\/\/|\/\*|\*|#|<!--|--)/;
+
+/**
+ * A refutation must rest on code the model was actually shown: every cited line lies in the shown
+ * window of one of the finding's files (its location or a trace step), and at least one of them is code,
+ * not a blank/comment-only line (a comment claiming "validated upstream" proves nothing).
+ */
+export function refutationEvidenced(f: Finding, v: SkepticVerdict, shown: ShownCode): boolean {
+  const cited = v.evidenceLines ?? [];
+  if (cited.length === 0) return false;
+  const files = [...new Set([f.location.file, ...(f.taintTrace ?? []).map((s) => s.file)])];
+  const textOf = (ln: number): string | undefined => files.map((file) => shown.get(file)?.get(ln)).find((t) => t !== undefined);
+  if (cited.some((ln) => textOf(ln) === undefined)) return false;
+  return cited.some((ln) => !COMMENT_ONLY_RE.test(textOf(ln)!));
 }
 
 // --- verdicts -------------------------------------------------------------------------------------
@@ -197,9 +231,14 @@ function reasonText(v: SkepticVerdict): string {
   return v.evidenceLines?.length ? `${reason} (evidence: line ${v.evidenceLines.slice(0, 10).join(', ')})` : reason;
 }
 
-export function applyVerdict(f: Finding, v: SkepticVerdict, degraded = false): Finding {
-  const verdict = degraded && v.verdict === 'refuted' ? 'weakened' : v.verdict;
-  const reason = reasonText(v);
+/**
+ * `shown` (the code the prompt showed): when given, a refutation that does not cite shown code
+ * (refutationEvidenced) is applied as 'weakened', like a degraded reply's.
+ */
+export function applyVerdict(f: Finding, v: SkepticVerdict, degraded = false, shown?: ShownCode): Finding {
+  const unevidenced = v.verdict === 'refuted' && shown !== undefined && !refutationEvidenced(f, v, shown);
+  const verdict = (degraded || unevidenced) && v.verdict === 'refuted' ? 'weakened' : v.verdict;
+  const reason = unevidenced ? clip(`${reasonText(v)} [refutation not applied: it cited no code shown to the reviewer]`, SKEPTIC_REASON_MAX + 120) : reasonText(v);
   if (verdict === 'upheld') return { ...f, producedBy: withMarker(f, 'skeptic:upheld') };
   if (verdict === 'weakened') {
     return {
@@ -266,8 +305,9 @@ export async function runSkeptic(findings: readonly Finding[], ctx: SkepticRunCo
     checkAbort();
     try {
       if (exhausted) { result.budgetSkipped += batch.length; return; }
-      const prompt = await buildSkepticPrompt(batch, readFile);
-      if (prompt === null) { result.codeUnavailable += batch.length; return; }
+      const built = await buildSkepticPromptWithCode(batch, readFile);
+      if (built === null) { result.codeUnavailable += batch.length; return; }
+      const { prompt, shown } = built;
       const call: StructuredCall<SkepticOutput> = {
         scanId: ctx.scanId, analyzer: 'verify', purpose: 'skeptic', promptVersion: SKEPTIC_PROMPT_VERSION,
         role: 'deep', tier: 1, system: SKEPTIC_SYSTEM_PROMPT, prompt, schema: SkepticOutputSchema,
@@ -293,7 +333,7 @@ export async function runSkeptic(findings: readonly Finding[], ctx: SkepticRunCo
       batch.forEach((f, i) => {
         const v = byIndex.get(i);
         if (!v) { fail('validation', 1); return; }
-        result.changed.push(applyVerdict(f, v, degraded));
+        result.changed.push(applyVerdict(f, v, degraded, shown));
         result.reviewed++;
       });
     } finally {
@@ -325,8 +365,12 @@ const FINDING_BLOCK_RE = /<untrusted_text source="finding-(\d+)">\n([\s\S]*?)\n<
 const FILE_BLOCK_RE = /<untrusted_file path="([^"]*)">\n([\s\S]*?)\n<\/untrusted_file>/g;
 /** Lines above the sink (and the sink itself) the mock inspects for a sanitizer. */
 const MOCK_NEAR_LINES = 6;
-const MOCK_SANITIZERS: ReadonlyArray<{ re: RegExp; why: string }> = [
-  { re: /\.startsWith\(\s*['"`]\/['"`]\s*\)/, why: 'the redirect target is restricted to a same-site path (startsWith("/") check)' },
+/** `alsoNeeds`: a second check that must appear near the sink too (startsWith('/') alone lets '//evil.com' through). */
+const MOCK_SANITIZERS: ReadonlyArray<{ re: RegExp; why: string; alsoNeeds?: RegExp }> = [
+  {
+    re: /\.startsWith\(\s*['"`]\/['"`]\s*\)/, alsoNeeds: /['"`]\/\/['"`]/,
+    why: 'the redirect target is restricted to a same-site path (startsWith("/") and a "//" check)',
+  },
   { re: /\bpath\.basename\s*\(/, why: 'the path is reduced to its basename before use' },
   { re: /['"`][^'"`]*(?:\?|\$\d+)[^'"`]*['"`]\s*,\s*\[/, why: 'the query uses bound parameters (placeholders), not string building' },
   { re: /\b(?:escape\w*|\w*[sS]anitize\w*)\s*\(/, why: 'the value passes through an escaping/sanitizing function before the sink' },
@@ -371,9 +415,12 @@ export const skepticMockResponder: MockResponder = (req: LlmRequest) => {
     const end = Number(loc[3]);
     const lines = code.get(file);
     let refuted: { why: string; line: number } | undefined;
+    const near: string[] = [];
+    for (let ln = Math.max(1, start - MOCK_NEAR_LINES); ln <= end; ln++) near.push(lines?.get(ln) ?? '');
     for (let ln = Math.max(1, start - MOCK_NEAR_LINES); ln <= end && !refuted; ln++) {
       const text = lines?.get(ln);
-      const hit = text === undefined ? undefined : MOCK_SANITIZERS.find((s) => s.re.test(text));
+      const hit = text === undefined ? undefined
+        : MOCK_SANITIZERS.find((s) => s.re.test(text) && (!s.alsoNeeds || near.some((t) => s.alsoNeeds!.test(t))));
       if (hit) refuted = { why: hit.why, line: ln };
     }
     if (refuted) {

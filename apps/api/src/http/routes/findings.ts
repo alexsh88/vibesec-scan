@@ -20,7 +20,10 @@ const FindingQuerySchema = z.object({
 const TriageBodySchema = z.object({
   status: TriageStatusSchema,
   reason: z.string().min(1).max(1000),
-  expiresAt: z.iso.datetime().optional(),
+  /** Must be in the future: a decision that is already expired would never suppress anything. */
+  expiresAt: z.iso.datetime()
+    .refine((v) => Date.parse(v) > Date.now(), 'expiresAt must be in the future')
+    .optional(),
 });
 
 type IdParams = { Params: { id: string } };

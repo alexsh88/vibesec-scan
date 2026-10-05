@@ -362,6 +362,7 @@ function toSharedAdvisory(eco: Ecosystem, version: string, a: OsvAdvisory): Advi
   return {
     id: a.id, aliases: a.aliases, summary: truncate(a.summary || a.details.split('\n')[0] || a.id, MAX_SUMMARY),
     severity: a.severity, cvss: a.cvss, fixedIn: safeUpgradeVersion(eco, version, [a])?.version ?? null, url: a.url,
+    ...(a.cvssVector ? { cvssVector: a.cvssVector } : {}),
   };
 }
 
@@ -411,7 +412,7 @@ const evidenceOf = (v: ReachabilityVerdict) => v.evidence.slice(0, MAX_EVIDENCE)
 export function createDependenciesAnalyzer(deps: DependenciesAnalyzerDeps): Analyzer {
   return {
     id: 'dependencies',
-    version: '1',
+    version: '2', // 2: advisories carry their CVSS vector
     category: 'dependency',
 
     async run(ctx: AnalyzerContext): Promise<Finding[]> {

@@ -16,14 +16,18 @@ export type ScoreStageDeps = {
 };
 
 /**
- * Factors an analyzer already recorded, overlaid with this stage's own factors (dedupe by `factor`
- * name; on a collision the scoring factor wins, since it is the more current judgement). Order is
- * otherwise preserved: analyzer factors first, then any scoring factor that didn't collide.
+ * Factors an analyzer (or the skeptic) already recorded, overlaid with this stage's own factors (dedupe
+ * by `factor` name). On a collision the scoring EFFECT wins (it is the current score movement) but the
+ * analyzer's REASON is kept: it is specific ("admin-only setting, line 4"), the scoring one is generic.
+ * Order is otherwise preserved: analyzer factors first, then any scoring factor that didn't collide.
  */
 function mergeRiskFactors(analyzerFactors: readonly ScoredFactor[], scoringFactors: readonly ScoredFactor[]): ScoredFactor[] {
   const byName = new Map<string, ScoredFactor>();
   for (const f of analyzerFactors) byName.set(f.factor, f);
-  for (const f of scoringFactors) byName.set(f.factor, f);
+  for (const f of scoringFactors) {
+    const prior = byName.get(f.factor);
+    byName.set(f.factor, prior ? { ...f, reason: prior.reason } : f);
+  }
   return [...byName.values()];
 }
 

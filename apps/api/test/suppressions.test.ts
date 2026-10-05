@@ -150,10 +150,8 @@ describe('Finding triage / suppression', () => {
     const fp = 'expiring-fp';
     const f1 = finding(scan1.scanId, { fingerprint: fp });
     c.findings.replaceForAnalyzer(scan1.scanId, 'secrets', [f1]);
-    await app.inject({
-      method: 'PUT', url: `/api/scans/${scan1.scanId}/findings/${f1.id}/triage`,
-      payload: { status: 'accepted_risk', reason: 'temporary', expiresAt: '2000-01-01T00:00:00.000Z' },
-    });
+    // A decision that has since lapsed (the API rejects a past expiresAt, so set it via the service).
+    c.suppressions.setTriage(scan1.scanId, f1.id, { status: 'accepted_risk', reason: 'temporary', expiresAt: '2000-01-01T00:00:00.000Z' }, { ip: null, userAgent: null });
 
     const scan2 = (await createScan()).json();
     await c.runner.whenIdle();
@@ -200,6 +198,31 @@ describe('Finding triage / suppression', () => {
     });
     expect(resFinding.statusCode).toBe(404);
     expect((await app.inject({ method: 'DELETE', url: `/api/scans/${scanId}/findings/nope/triage` })).statusCode).toBe(404);
+  });
+
+  it('rejects an expiresAt in the past (400)', async () => {
+    await start();
+    const { scanId } = (await createScan()).json();
+    await c.runner.whenIdle();
+    const f = finding(scanId);
+    c.findings.replaceForAnalyzer(scanId, 'secrets', [f]);
+    const res = await app.inject({
+      method: 'PUT', url: `/api/scans/${scanId}/findings/${f.id}/triage`,
+      payload: { status: 'accepted_risk', reason: 'temporary', expiresAt: '2000-01-01T00:00:00.000Z' },
+    });
+    expect(res.statusCode).toBe(400);
+  });
+
+  it('lists a finding whose triage expired as open, not suppressed', async () => {
+    await start();
+    const { scanId } = (await createScan()).json();
+    await c.runner.whenIdle();
+    const lapsed = finding(scanId, { triage: { status: 'wont_fix', reason: 'until the migration', at: '2000-01-01T00:00:00.000Z', expiresAt: '2001-01-01T00:00:00.000Z' } });
+    const active = finding(scanId, { triage: { status: 'wont_fix', reason: 'forever', at: '2000-01-01T00:00:00.000Z' } });
+    c.findings.replaceForAnalyzer(scanId, 'secrets', [lapsed, active]);
+    const ids = async (q: string) => (await app.inject({ method: 'GET', url: `/api/scans/${scanId}/findings?triage=${q}` })).json().items.map((x: Finding) => x.id);
+    expect(await ids('open')).toEqual([lapsed.id]);
+    expect(await ids('suppressed')).toEqual([active.id]);
   });
 
   it('rejects a too-long reason and an invalid status (400)', async () => {

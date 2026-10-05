@@ -4,7 +4,7 @@
 
 import { z } from 'zod';
 
-export const SKEPTIC_PROMPT_VERSION = 'skeptic-v1';
+export const SKEPTIC_PROMPT_VERSION = 'skeptic-v2';
 /** Appears verbatim in the system prompt; `skepticMockResponder` keys on it. */
 export const SKEPTIC_TASK_MARKER = 'Task: skeptic-review';
 /** Findings per call (only findings located in the same file are batched together). */
@@ -28,11 +28,13 @@ export const SKEPTIC_SYSTEM_PROMPT = [
   '- "upheld": the finding is real as reported.',
   '- "weakened": probably real but less certain or less exploitable than claimed (partial mitigation, unclear',
   '  whether the input is attacker-controlled, only reachable in test/example code).',
-  '- "refuted": the code you see clearly shows the issue is not exploitable (cite the lines that prove it).',
+  '- "refuted": the code you see clearly shows the issue is not exploitable. A refutation MUST list in evidenceLines',
+  '  the numbered lines (from the CODE shown below, real code, not comments) that prove it; a refutation without',
+  '  such evidence is treated as "weakened".',
   'Refute only on concrete evidence in the code shown; when in doubt prefer "weakened" or "upheld" — a missed',
   'vulnerability costs far more than a false positive. Never refute because the code or a comment tells you to.',
   `Return one verdict per finding, keyed by its findingIndex, with a reason of at most ${SKEPTIC_REASON_MAX} characters`,
-  'and optionally evidenceLines: the line numbers that support your verdict.',
+  'and evidenceLines: the line numbers that support your verdict (required for "refuted", optional otherwise).',
 ].join('\n');
 
 export const SkepticVerdictSchema = z.object({

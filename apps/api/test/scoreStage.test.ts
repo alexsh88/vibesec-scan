@@ -116,6 +116,36 @@ describe('scoreStage', () => {
     expect(refuted).toMatchObject({ reason: 'AI judged this a false positive' });
   });
 
+  it('on a factor-name collision keeps the analyzer/skeptic reason with the scoring effect', async () => {
+    const { ctx, findings, indexRepo } = setup();
+    indexRepo.replace(ctx.scanId, emptyIndex());
+    const finding = makeFinding({
+      scanId: ctx.scanId, confidence: 'medium',
+      riskFactors: [{ factor: 'medium_confidence', effect: 0, reason: 'Analyzer: only partial evidence in the diff' }],
+    });
+    findings.replaceForAnalyzer(ctx.scanId, 'config', [finding]);
+    await scoreStage({ findings, indexRepo }).run(ctx);
+    const merged = findings.get(ctx.scanId, finding.id)!.riskFactors.filter((f) => f.factor === 'medium_confidence');
+    expect(merged).toHaveLength(1);
+    expect(merged[0]!.reason).toBe('Analyzer: only partial evidence in the diff');
+    expect(merged[0]!.effect).toBeLessThan(0);
+  });
+
+  it('keeps the skeptic reason and does not penalize a weakened finding twice (confidence step only)', async () => {
+    const { ctx, findings, indexRepo } = setup();
+    indexRepo.replace(ctx.scanId, emptyIndex());
+    const weakened = makeFinding({
+      scanId: ctx.scanId, confidence: 'medium',
+      riskFactors: [{ factor: 'skeptic_weakened', effect: 0, reason: 'input is an admin-only setting (evidence: line 4)' }],
+    });
+    const plain = makeFinding({ scanId: ctx.scanId, confidence: 'medium' });
+    findings.replaceForAnalyzer(ctx.scanId, 'config', [weakened, plain]);
+    await scoreStage({ findings, indexRepo }).run(ctx);
+    const w = findings.get(ctx.scanId, weakened.id)!;
+    expect(w.riskScore).toBe(findings.get(ctx.scanId, plain.id)!.riskScore);
+    expect(w.riskFactors.find((f) => f.factor === 'skeptic_weakened')).toMatchObject({ reason: 'input is an admin-only setting (evidence: line 4)' });
+  });
+
   it('never leaves a malicious-package finding scored below critical (policy guard, not the weighting)', async () => {
     const { ctx, findings, indexRepo } = setup();
     indexRepo.replace(ctx.scanId, emptyIndex());

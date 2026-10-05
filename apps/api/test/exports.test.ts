@@ -1,9 +1,10 @@
 import { afterEach, describe, expect, it } from 'vitest';
 import type { FastifyInstance } from 'fastify';
-import type { Finding, Severity } from '@vibesec/shared';
+import type { Finding, ScanDto, Severity } from '@vibesec/shared';
 import { loadConfig } from '../src/config';
 import { createContainer, type Container } from '../src/container';
-import { purlFor } from '../src/export/cyclonedx';
+import { buildCycloneDx, purlFor } from '../src/export/cyclonedx';
+import { buildSarif } from '../src/export/sarif';
 import { buildApp } from '../src/http/app';
 import { createStubPipeline } from '../src/pipeline/stubPipeline';
 
@@ -239,6 +240,52 @@ describe('CycloneDX export', () => {
     const res = await app.inject({ method: 'GET', url: `/api/scans/${scanId}/export/cyclonedx` });
     const [vuln] = res.json().vulnerabilities;
     expect(vuln.source).toEqual({ name: 'OSV', url: 'https://osv.dev/vulnerability/GHSA-1' });
-    expect(vuln.ratings[0]).toEqual({ severity: 'high', method: 'CVSSv31', score: 7.5 });
+    expect(vuln.ratings[0]).toEqual({ severity: 'high' }); // a score without a known v3.1 vector carries no CVSS method
+  });
+});
+
+describe('export validity', () => {
+  const scan = {
+    id: 's1', repo: { id: 'r', owner: 'acme', name: 'app', isPrivate: false }, ref: null, commitSha: '0'.repeat(40), state: 'COMPLETED',
+    errorCode: null, errorMessage: null, cacheHit: 'none', options: { verifySecrets: false, historyDepth: 0, categories: ['dependency'] },
+    costUsd: 0, createdAt: '2026-01-01T00:00:00.000Z', startedAt: null, finishedAt: null, warnings: [], reuse: null,
+  } as ScanDto;
+  const vuln = (f: Finding) => buildCycloneDx(scan, [f]).vulnerabilities;
+
+  it('SARIF: percent-encodes each artifact URI path segment', () => {
+    const f = sastFinding('s1', { location: { file: 'src/my dir/a#b%.ts', startLine: 1, endLine: 1, snippet: 'x', permalink: '' }, taintTrace: undefined });
+    expect(buildSarif(scan, [f]).runs[0]!.results[0]!.locations[0]!.physicalLocation.artifactLocation.uri).toBe('src/my%20dir/a%23b%25.ts');
+  });
+
+  it('SARIF: an expired triage is not a suppression', () => {
+    const f = sastFinding('s1', { triage: { status: 'wont_fix', reason: 'until Q2', at: '2020-01-01T00:00:00.000Z', expiresAt: '2020-06-01T00:00:00.000Z' } });
+    expect(buildSarif(scan, [f]).runs[0]!.results[0]!.suppressions).toBeUndefined();
+  });
+
+  it('CycloneDX: a CVSS method/score only for a CVSS v3.1 vector; otherwise severity alone', () => {
+    const adv = { id: 'GHSA-1', aliases: [], summary: 's', severity: 'high' as const, cvss: 7.5, fixedIn: null, url: null };
+    const v31 = depFinding('s1', { dependency: { ...depFinding('s1').dependency!, advisories: [{ ...adv, cvssVector: 'CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:N' }] } });
+    expect(vuln(v31)[0]!.ratings).toEqual([{ severity: 'high', method: 'CVSSv31', score: 7.5, vector: 'CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:N' }]);
+    const v4 = depFinding('s1', { dependency: { ...depFinding('s1').dependency!, advisories: [{ ...adv, cvssVector: 'CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:H/VI:N/VA:N/SC:N/SI:N/SA:N' }] } });
+    expect(vuln(v4)[0]!.ratings).toEqual([{ severity: 'high' }]);
+  });
+
+  it('CycloneDX: VEX false_positive for a finding triaged false_positive', () => {
+    const f = depFinding('s1', { triage: { status: 'false_positive', reason: 'Only used in a build script', at: '2026-01-01T00:00:00.000Z' } });
+    expect(vuln(f)[0]!.analysis).toEqual({ state: 'false_positive', detail: 'Only used in a build script' });
+    const wontFix = depFinding('s1', { triage: { status: 'wont_fix', reason: 'Vendor EOL', at: '2026-01-01T00:00:00.000Z' } });
+    expect(vuln(wontFix)[0]!.analysis).toEqual({ state: 'exploitable', response: ['will_not_fix'], detail: 'Vendor EOL' });
+  });
+
+  it('CycloneDX: a supply-chain finding without advisories becomes a VibeSec vulnerability entry', () => {
+    const f = depFinding('s1', {
+      ruleId: 'supply-chain/typosquat', title: 'lodahs looks like a typosquat of lodash', severity: 'medium',
+      dependency: { ...depFinding('s1').dependency!, name: 'lodahs', advisories: [], reachability: 'imported' },
+    });
+    const [v] = vuln(f);
+    expect(v).toMatchObject({
+      id: 'VIBESEC-SUPPLY-CHAIN-TYPOSQUAT', source: { name: 'VibeSec' }, ratings: [{ severity: 'medium' }],
+      affects: [{ ref: 'pkg:npm/lodahs@4.17.20' }], description: 'lodahs looks like a typosquat of lodash',
+    });
   });
 });

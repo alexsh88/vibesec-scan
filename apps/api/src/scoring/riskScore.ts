@@ -73,7 +73,8 @@ export function riskScore(s: RiskSignals): RiskResult {
   // Confidence and AI review
   if (s.confidence === 'medium') apply('medium_confidence', 0.9, 'Medium confidence');
   if (s.confidence === 'low') apply('low_confidence', 0.7, 'Low confidence');
-  if (s.skepticWeakened) apply('skeptic_weakened', 0.85, 'Independent AI review found mitigating context');
+  // skeptic_weakened: no multiplier here — the skeptic already lowered the confidence one step, and that
+  // confidence is applied just above; a second ×0.85 would penalize the same verdict twice.
   if (s.aiUnreviewed) apply('ai_unreviewed', 0.95, 'AI review returned no verdict');
 
   return { score: Math.round(score), factors };

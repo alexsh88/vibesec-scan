@@ -111,7 +111,7 @@ describe('runSkeptic', () => {
     expect(c.tier).toBe(1);
     expect(c.purpose).toBe('skeptic');
     expect(c.system).toContain(SKEPTIC_TASK_MARKER);
-    expect(c.promptVersion).toBe('skeptic-v1');
+    expect(c.promptVersion).toBe('skeptic-v2');
     expect(partialSummary(r)).toBeNull();
   });
 
@@ -151,7 +151,7 @@ describe('runSkeptic', () => {
 
   it('counts missing verdicts as validation failures and ignores duplicate indexes', async () => {
     const fs = [mkFinding({ line: 1 }), mkFinding({ line: 2 })];
-    const { llm } = stubLlm(async () => ok({ verdicts: [{ findingIndex: 0, verdict: 'refuted', reason: 'a' }, { findingIndex: 0, verdict: 'upheld', reason: 'b' }] }));
+    const { llm } = stubLlm(async () => ok({ verdicts: [{ findingIndex: 0, verdict: 'refuted', reason: 'a', evidenceLines: [1] }, { findingIndex: 0, verdict: 'upheld', reason: 'b' }] }));
     const r = await runSkeptic(fs, ctx(), { llm, readFile: files({ 'src/a.ts': fileOf(5) }) });
     expect(r.changed).toHaveLength(1);
     expect(r.changed[0]!.severity).toBe('info');
@@ -211,7 +211,7 @@ describe('skepticMockResponder', () => {
     '',
     "redirectRouter.get('/go-safe', (req, res) => {",
     '  const target = req.query.to as string;',
-    "  if (!target.startsWith('/')) return res.status(400).end();",
+    "  if (!target.startsWith('/') || target.startsWith('//')) return res.status(400).end();",
     '  res.redirect(target);',
     '});',
   ].join('\n');
@@ -264,3 +264,46 @@ describe('skepticMockResponder', () => {
   });
 });
 
+
+describe('skeptic refutations need cited code evidence', () => {
+  const f = mkFinding({ file: 'src/a.ts', line: 10, severity: 'high' });
+  const shown = new Map([['src/a.ts', new Map([[8, '  // validated upstream, trust me'], [9, "  if (!isSafe(x)) return;"], [10, '  db.query(x);']])]]);
+  const refute = (evidenceLines?: number[]) => applyVerdict(f, { findingIndex: 0, verdict: 'refuted', reason: 'safe', ...(evidenceLines ? { evidenceLines } : {}) }, false, shown);
+
+  it('applies a refutation citing shown, non-comment code', () => {
+    expect(refute([9]).severity).toBe('info');
+  });
+
+  it('applies it as weakened without evidence, with lines outside the shown window, or citing only comments', () => {
+    for (const r of [refute(), refute([42]), refute([8]), refute([9, 400])]) {
+      expect(r.severity).toBe('high');
+      expect(r.riskFactors[0]).toMatchObject({ factor: 'skeptic_weakened' });
+      expect(r.producedBy).toContain('skeptic:weakened');
+    }
+  });
+
+  it('runSkeptic validates against the code it actually sent', async () => {
+    const target = mkFinding({ file: 'src/a.ts', line: 10, severity: 'high' });
+    const { llm } = stubLlm(async () => ok({ verdicts: [{ findingIndex: 0, verdict: 'refuted', reason: 'safe', evidenceLines: [500] }] }));
+    const r = await runSkeptic([target], ctx(), { llm, readFile: files({ 'src/a.ts': fileOf(20) }) });
+    expect(r.changed[0]!.severity).toBe('high');
+    expect(r.changed[0]!.producedBy).toContain('skeptic:weakened');
+  });
+});
+
+describe('skepticMockResponder redirect rule', () => {
+  it('does not refute a startsWith("/") check alone (it does not stop "//evil.com")', async () => {
+    const code = [
+      "router.get('/go', (req, res) => {",
+      '  const target = req.query.to as string;',
+      "  if (!target.startsWith('/')) return res.status(400).end();",
+      '  res.redirect(target);',
+      '});',
+    ].join('\n');
+    const finding = mkFinding({ file: 'r.ts', line: 4, ruleId: 'sast/open-redirect', cwe: 'CWE-601' });
+    const { llm } = responderLlm();
+    const r = await runSkeptic([finding], ctx(), { llm, readFile: files({ 'r.ts': code }) });
+    expect(r.changed[0]!.severity).toBe('high');
+    expect(r.changed[0]!.producedBy).toContain('skeptic:upheld');
+  });
+});

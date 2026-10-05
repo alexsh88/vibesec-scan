@@ -21,6 +21,8 @@ export type Triage = z.infer<typeof TriageSchema>;
 export const AdvisorySchema = z.object({
   id: z.string(), aliases: z.array(z.string()), summary: z.string(),
   severity: SeveritySchema, cvss: z.number().nullable(), fixedIn: z.string().nullable(), url: z.string().nullable(),
+  /** The CVSS vector `cvss` was computed from (e.g. 'CVSS:3.1/AV:N/…'), when known. */
+  cvssVector: z.string().optional(),
 });
 export type Advisory = z.infer<typeof AdvisorySchema>;
 

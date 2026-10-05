@@ -223,8 +223,15 @@ export class FindingRepo {
     }
     // Triage isn't its own column (it lives on the finding JSON so it round-trips with the rest of the
     // finding); filtering via json_extract keeps `all` (the default) a plain no-op clause.
-    if (filter.triage === 'open') clauses.push(`json_extract(data_json, '$.triage.status') IS NULL`);
-    else if (filter.triage === 'suppressed') clauses.push(`json_extract(data_json, '$.triage.status') IS NOT NULL`);
+    // A triage whose expiresAt has passed no longer suppresses: the finding is open again.
+    const lapsed = `(json_extract(data_json, '$.triage.expiresAt') IS NOT NULL AND julianday(json_extract(data_json, '$.triage.expiresAt')) <= julianday(?))`;
+    if (filter.triage === 'open') {
+      clauses.push(`(json_extract(data_json, '$.triage.status') IS NULL OR ${lapsed})`);
+      params.push(this.now());
+    } else if (filter.triage === 'suppressed') {
+      clauses.push(`(json_extract(data_json, '$.triage.status') IS NOT NULL AND NOT ${lapsed})`);
+      params.push(this.now());
+    }
     if (filter.scanStatus) {
       clauses.push(`json_extract(data_json, '$.scanStatus') = ?`);
       params.push(filter.scanStatus);
