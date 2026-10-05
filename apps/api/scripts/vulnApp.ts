@@ -124,13 +124,19 @@ export type VulnAppHarness = {
 };
 
 export type VulnAppHarnessOptions = {
-  /** Environment for loadConfig (defaults to an empty env → mock mode). DB/work dir/sandbox are forced. */
+  /** Environment for loadConfig (defaults to an empty env → mock mode). DB/work dir are forced.
+   *  SANDBOX_ENABLED defaults to 'false' (hermetic, no Docker) but `env` may override it. */
   env?: Record<string, string | undefined>;
   /** OSV/registry fetch; omit for the real network (live mode). */
   fetch?: typeof fetch;
   wrapTransport?: ContainerOverrides['wrapTransport'];
   /** The fixture repo's history, built from the vuln-app files (default: one commit with all of them). */
   commits?: (files: Record<string, string>) => FixtureCommit[];
+  /** Docker sandbox override passed straight to createContainer (default: null, matching the forced
+   *  SANDBOX_ENABLED default above). Pass a stub whose `availability` resolves `{ok: false, ...}` to
+   *  exercise the dependencies analyzer's "sandbox unavailable" fallback deterministically — no real
+   *  Docker daemon required — together with `env: {SANDBOX_ENABLED: 'true'}`. */
+  sandbox?: ContainerOverrides['sandbox'];
 };
 
 export async function startVulnAppHarness(opts: VulnAppHarnessOptions = {}): Promise<VulnAppHarness> {
@@ -138,14 +144,15 @@ export async function startVulnAppHarness(opts: VulnAppHarnessOptions = {}): Pro
   const repo = await createFixtureRepo(opts.commits ? opts.commits(files) : [{ files }]);
   const workDir = await mkdtemp(join(tmpdir(), 'vibesec-vuln-app-'));
   const config = loadConfig({
+    SANDBOX_ENABLED: 'false',
     ...(opts.env ?? {}),
-    DB_PATH: ':memory:', ALLOW_LOCAL_REPOS: 'true', SANDBOX_ENABLED: 'false', WORK_DIR: workDir,
+    DB_PATH: ':memory:', ALLOW_LOCAL_REPOS: 'true', WORK_DIR: workDir,
   });
   const github = {
     getRepo: async (): Promise<RepoMeta> => ({ isPrivate: false, defaultBranch: 'main', sizeBytes: 50_000, htmlUrl: '', archived: false }),
   } as unknown as GitHubClient;
   const container = createContainer(config, {
-    sandbox: null, github, remoteUrlFor: () => repo.url,
+    sandbox: opts.sandbox !== undefined ? opts.sandbox : null, github, remoteUrlFor: () => repo.url,
     ...(opts.fetch ? { fetch: opts.fetch } : {}),
     ...(opts.wrapTransport ? { wrapTransport: opts.wrapTransport } : {}),
   });

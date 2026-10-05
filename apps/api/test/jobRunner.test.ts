@@ -63,7 +63,7 @@ describe('JobRunner', () => {
     await runner.whenIdle();
     const dto = scans.getDto(id)!;
     expect(dto.state).toBe('COMPLETED_WITH_WARNINGS');
-    expect(dto.warnings).toEqual([{ code: 'OSV_UNAVAILABLE', message: 'osv down', stage: 'ANALYZING' }]);
+    expect(dto.warnings).toEqual([{ code: 'OSV_UNAVAILABLE', message: 'osv down', stage: 'ANALYZING', level: 'warning' }]);
     expect(verifying).toHaveBeenCalledOnce();
   });
 
@@ -323,8 +323,8 @@ describe('JobRunner regressions (code review)', () => {
     runner.enqueue(id, {});
     await runner.whenIdle();
     expect(scans.getDto(id)!.warnings).toEqual([
-      { code: 'OSV_UNAVAILABLE', message: 'osv down', stage: 'ANALYZING' },
-      { code: 'VERIFY_SKIPPED', message: 'skipped', stage: 'VERIFYING' },
+      { code: 'OSV_UNAVAILABLE', message: 'osv down', stage: 'ANALYZING' }, // pre-seeded directly; never re-classified
+      { code: 'VERIFY_SKIPPED', message: 'skipped', stage: 'VERIFYING', level: 'warning' }, // re-added via ctx.warn on resume
     ]);
   });
 

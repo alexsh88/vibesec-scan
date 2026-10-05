@@ -106,7 +106,9 @@ export async function planIncremental(
   const base = deps.scans.findIncrementalBase(row.repo_id, input.commitSha, keys, ctx.scanId);
   if (!base?.commit_sha) return undefined;
 
-  const info = (code: string, message: string) => ctx.warn({ code, message, stage: 'ANALYZING', level: 'info' });
+  // Level is decided centrally (pipeline/warningLevels.ts), not here — these two codes fall back to a
+  // full scan at no cost to completeness, so they're classified 'info'.
+  const info = (code: string, message: string) => ctx.warn({ code, message, stage: 'ANALYZING' });
   const call = { token: ctx.secrets.token, signal: ctx.signal, onActivity: ctx.touch };
   let diff = await deps.git.diffNameStatus(input.repoDir, base.commit_sha, input.commitSha, call);
   if (diff === null && await deps.git.fetchCommit(input.repoDir, base.commit_sha, call)) {

@@ -6,6 +6,7 @@ import type { Checkpoint, ScanRepo } from '../db/scanRepo';
 import { AppError, toAppError } from '../errors/AppError';
 import type { EventBus } from '../events/EventBus';
 import { SKIP_REMAINING_STAGES, type Pipeline, type PipelineContext, type ScanSecrets, type StageName } from '../pipeline/types';
+import { classifyWarningLevel } from '../pipeline/warningLevels';
 import type { ScanLifecycle } from '../scans/ScanLifecycle';
 import { scrubSecrets } from '../security/scrub';
 
@@ -264,7 +265,14 @@ export class JobRunner implements ScanQueue {
         signal,
         checkpointData: checkpoint.data,
         emit: (event) => { touch(); lifecycle.emit(scanId, event); },
-        warn: (w) => { touch(); if (w.level !== 'info') warned = true; lifecycle.warn(scanId, w); },
+        // The level is ALWAYS taken from the central table (pipeline/warningLevels.ts), never from `w`:
+        // one place decides what's expected-and-clean vs. real degradation, so a call site never has to.
+        warn: (w) => {
+          touch();
+          const level = classifyWarningLevel(w.code);
+          if (level !== 'info') warned = true;
+          lifecycle.warn(scanId, { ...w, level });
+        },
         touch,
       };
 

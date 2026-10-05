@@ -129,9 +129,10 @@ export function withFullScanCache(resolve: StageSpec, deps: FullCacheDeps): Stag
       try {
         copied = deps.atomically(() => copyScan(deps, source, ctx.scanId));
       } catch (raw) {
-        // Never fail a scan over its cache: run it normally instead.
+        // Never fail a scan over its cache: run it normally instead. Level is decided centrally
+        // (pipeline/warningLevels.ts: CACHE_UNAVAILABLE is 'info' — this scan still ran in full).
         ctx.warn({
-          code: 'CACHE_UNAVAILABLE', level: 'info', stage: 'RESOLVING',
+          code: 'CACHE_UNAVAILABLE', stage: 'RESOLVING',
           message: `The cached result of scan ${source.id} could not be reused (${toAppError(raw).userMessage}); running a full scan instead.`,
         });
         return;
