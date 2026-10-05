@@ -50,6 +50,20 @@ describe('AnthropicTransport', () => {
     expect(params.output_config.effort).toBeUndefined();
   });
 
+  it('passes tools and tool_choice, and omits the output format when there is no schema', async () => {
+    const { t, stream } = transport();
+    const tools = [{ name: 'read_file', description: 'Read a file', input_schema: { type: 'object' as const, properties: { path: { type: 'string' } }, required: ['path'] } }];
+    await t.send(req({ schema: undefined, tools, toolChoice: { type: 'auto' } }), new AbortController().signal);
+    const [params] = stream.mock.calls[0] as unknown as [Record<string, any>];
+    expect(params.tools).toEqual(tools);
+    expect(params.tool_choice).toEqual({ type: 'auto' });
+    expect(params.output_config).toEqual({ effort: 'medium' });
+    await t.send(req({ schema: undefined, effort: undefined }), new AbortController().signal);
+    const [plain] = stream.mock.calls[1] as unknown as [Record<string, any>];
+    expect(plain.output_config).toBeUndefined();
+    expect(plain.tools).toBeUndefined();
+  });
+
   it('maps errors thrown while finalizing the stream to AppErrors', async () => {
     const { t, stream } = transport();
     stream.mockReturnValueOnce({
@@ -121,5 +135,15 @@ describe('requestHash', () => {
 
     const c = requestHash(req({ messages: [{ role: 'user', content: [{ type: 'text', text: 'Review this differently.' }] }] }));
     expect(c).not.toBe(a);
+  });
+
+  it('includes tools and tool choice; requests without tools keep their previous hash shape', () => {
+    const tool = { name: 'grep', description: 'Search', input_schema: { type: 'object' as const, properties: {} } };
+    const base = requestHash(req());
+    const withTools = requestHash(req({ tools: [tool] }));
+    expect(withTools).not.toBe(base);
+    expect(requestHash(req({ tools: [{ ...tool, description: 'Search code' }] }))).not.toBe(withTools);
+    expect(requestHash(req({ tools: [tool], toolChoice: { type: 'any' } }))).not.toBe(withTools);
+    expect(requestHash(req({ schema: undefined }))).not.toBe(base);
   });
 });

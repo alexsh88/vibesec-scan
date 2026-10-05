@@ -59,6 +59,51 @@ function fake(s: JsonSchema): unknown {
   }
 }
 
+const MOCK_REPLY = Symbol('mockReply');
+
+/** A full assistant turn a responder can return instead of a structured-output value (agent loops). */
+export type MockReply = {
+  readonly [MOCK_REPLY]: true;
+  content: Array<{ type: 'text'; text: string } | { type: 'tool_use'; name: string; input: unknown; id?: string }>;
+  stopReason?: Anthropic.StopReason;
+};
+
+function isMockReply(value: unknown): value is MockReply {
+  return typeof value === 'object' && value !== null && (value as Partial<MockReply>)[MOCK_REPLY] === true;
+}
+
+/** One assistant turn calling `name` with `input` (stop_reason tool_use). */
+export function mockToolUse(name: string, input: unknown): MockReply {
+  return { [MOCK_REPLY]: true, content: [{ type: 'tool_use', name, input }] };
+}
+
+/** One assistant turn calling several tools in parallel. */
+export function mockToolUses(calls: Array<{ name: string; input: unknown }>): MockReply {
+  return { [MOCK_REPLY]: true, content: calls.map((c) => ({ type: 'tool_use' as const, name: c.name, input: c.input })) };
+}
+
+/** One assistant turn with plain text that ends the turn (stop_reason end_turn). */
+export function mockText(text: string): MockReply {
+  return { [MOCK_REPLY]: true, content: [{ type: 'text', text }] };
+}
+
+/** A refusal (stop_reason refusal, no content). */
+export function mockRefusal(): MockReply {
+  return { [MOCK_REPLY]: true, content: [], stopReason: 'refusal' };
+}
+
+/** 0-based turn of an agent conversation: the number of assistant messages already in the transcript. */
+export function mockTurnIndex(req: LlmRequest): number {
+  return req.messages.filter((m) => m.role === 'assistant').length;
+}
+
+/**
+ * Responses: recordings → responders → defaults. A responder returns either a structured-output value
+ * (serialized as the reply text) or a `MockReply` (mockToolUse/mockText/…) for agent turns; it receives the
+ * whole request, so scripted multi-turn mocks can branch on `mockTurnIndex(req)` or on prior tool results.
+ * Defaults: schema → `fakeFromSchema`; no schema (agent request) → an empty end_turn reply, so mock agent
+ * loops finish immediately with nothing collected (cheap and deterministic).
+ */
 export class MockTransport implements LlmTransport {
   readonly mode = 'mock' as const;
 
@@ -76,19 +121,23 @@ export class MockTransport implements LlmTransport {
       output = responder(req);
       if (output !== undefined) break;
     }
-    if (output === undefined) output = fakeFromSchema(req.schema);
-    const text = JSON.stringify(output);
+    if (output === undefined) output = req.schema ? fakeFromSchema(req.schema) : mockText('');
+    const reply = isMockReply(output) ? output : mockText(JSON.stringify(output));
+    const content = reply.content.map((b, i) => (b.type === 'text'
+      ? { type: 'text', text: b.text, citations: null }
+      : { type: 'tool_use', id: b.id ?? `toolu_mock_${hash.slice(0, 12)}_${i}`, name: b.name, input: b.input, caller: { type: 'direct' } }));
+    const stopReason = reply.stopReason ?? (content.some((b) => b.type === 'tool_use') ? 'tool_use' : 'end_turn');
     return {
       id: `msg_mock_${hash.slice(0, 16)}`,
       type: 'message',
       role: 'assistant',
       model: req.model,
-      content: [{ type: 'text', text, citations: null }],
-      stop_reason: 'end_turn',
+      content,
+      stop_reason: stopReason,
       stop_sequence: null,
       usage: {
-        input_tokens: estimateTokens(JSON.stringify(req.system) + JSON.stringify(req.messages)),
-        output_tokens: estimateTokens(text),
+        input_tokens: estimateTokens(JSON.stringify(req.system) + (req.tools ? JSON.stringify(req.tools) : '') + JSON.stringify(req.messages)),
+        output_tokens: Math.max(estimateTokens(reply.content.map((b) => (b.type === 'text' ? b.text : JSON.stringify(b.input))).join('')), 1),
         cache_creation_input_tokens: 0,
         cache_read_input_tokens: 0,
       },

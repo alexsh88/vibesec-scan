@@ -19,13 +19,19 @@ export class AnthropicTransport implements LlmTransport {
       // adaptive thinking (the SDK's own non-streaming sizing is ~60min * maxTokens/128000), and
       // passing an explicit `timeout` bypasses the SDK's "streaming required" guard for large
       // max_tokens. Stream instead and read the accumulated result (#I-2).
+      const outputConfig = {
+        ...(req.schema ? { format: zodOutputFormat(req.schema) } : {}),
+        ...(req.effort ? { effort: req.effort } : {}),
+      };
       const stream = this.client.messages.stream({
         model: req.model,
         max_tokens: req.maxTokens,
         system: req.system,
         messages: req.messages,
         ...(req.thinking ? { thinking: { type: 'adaptive' as const } } : {}),
-        output_config: { format: zodOutputFormat(req.schema), ...(req.effort ? { effort: req.effort } : {}) },
+        ...(req.tools?.length ? { tools: req.tools.map((t) => ({ name: t.name, description: t.description, input_schema: t.input_schema })) } : {}),
+        ...(req.toolChoice ? { tool_choice: req.toolChoice } : {}),
+        ...(Object.keys(outputConfig).length ? { output_config: outputConfig } : {}),
       }, { signal, timeout: this.timeoutMs });
       return await stream.finalMessage();
     } catch (err) {
