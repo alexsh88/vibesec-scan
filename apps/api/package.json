@@ -6,7 +6,8 @@
   "scripts": {
     "dev": "tsx watch src/server.ts",
     "start": "tsx src/server.ts",
-    "typecheck": "tsc -p tsconfig.json"
+    "typecheck": "tsc -p tsconfig.json",
+    "llm:smoke": "tsx scripts/llmSmoke.ts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.131.0",
