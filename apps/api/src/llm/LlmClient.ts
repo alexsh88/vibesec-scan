@@ -5,7 +5,7 @@ import type { ScanRepo } from '../db/scanRepo';
 import { AppError, toAppError } from '../errors/AppError';
 import { CircuitBreaker } from '../resilience/circuitBreaker';
 import { RETRY_POLICIES, withRetry, type RetryDeps } from '../resilience/retry';
-import type { BudgetTracker } from './budget';
+import type { BudgetTracker, SettleBudget } from './budget';
 import { capsOf, costUsd, DEFAULT_EFFORT, DEGRADE_ROLE, FALLBACK_ROLE, type Effort, type ModelRole, type TokenUsage } from './models';
 import { buildRequestParts, estimateTokens } from './prompt';
 import type { RateLimiter, Semaphore } from './rateLimiter';
@@ -152,7 +152,7 @@ export class LlmClient {
     };
   }
 
-  /** One logical send: budget check → semaphore slot → breaker(retry chain). Truncation is permanent. */
+  /** One logical send: budget check → semaphore slot → breaker(retry chain, budget reservation per attempt). Truncation is permanent. */
   private async send(call: StructuredCall<unknown>, req: LlmRequest): Promise<Sent> {
     if (call.signal.aborted) throw new AppError('CANCELLED', 'cancelled', 'Operation was cancelled');
     if (call.scanId) this.deps.budget.ensureAvailable(call.scanId);
@@ -160,20 +160,28 @@ export class LlmClient {
     try {
       const estimate = estimateTokens(JSON.stringify(req.system) + JSON.stringify(req.messages));
       const inputHash = requestHash(req);
+      // Worst case for one attempt: the full input estimate plus all of max_tokens as output.
+      const estimateUsd = costUsd(req.model, { inputTokens: estimate, outputTokens: req.maxTokens, cacheReadTokens: 0, cacheWriteTokens: 0 });
       const sent = await this.breaker.run(() => withRetry(async (attempt) => {
-        await this.deps.limiter.acquire(estimate, call.signal);
-        call.onActivity?.();
-        const started = this.now();
-        let message: Anthropic.Message;
+        // Reserve per attempt so concurrent in-flight calls cannot jointly overshoot the scan budget.
+        const settle: SettleBudget = call.scanId ? this.deps.budget.reserve(call.scanId, estimateUsd) : () => {};
         try {
-          message = await this.deps.transport.send(req, call.signal);
-        } catch (raw) {
-          const err = toAppError(raw);
-          if ((err.details as { rateLimited?: boolean } | undefined)?.rateLimited) this.deps.limiter.penalize();
-          if (err.kind !== 'cancelled') this.record(call, req.model, inputHash, attempt, started, null, err.code);
-          throw err;
+          await this.deps.limiter.acquire(estimate, call.signal);
+          call.onActivity?.();
+          const started = this.now();
+          let message: Anthropic.Message;
+          try {
+            message = await this.deps.transport.send(req, call.signal);
+          } catch (raw) {
+            const err = toAppError(raw);
+            if ((err.details as { rateLimited?: boolean } | undefined)?.rateLimited) this.deps.limiter.penalize();
+            if (err.kind !== 'cancelled') this.record(call, req.model, inputHash, attempt, started, null, err.code, settle);
+            throw err;
+          }
+          return this.record(call, req.model, inputHash, attempt, started, message, null, settle);
+        } finally {
+          settle(0); // no-op once record() settled; frees the reservation on cancellation/limiter errors
         }
-        return this.record(call, req.model, inputHash, attempt, started, message, null);
       }, RETRY_POLICIES.anthropic, call.signal, this.deps.retryDeps));
       call.onActivity?.();
       const stop = sent.message.stop_reason;
@@ -188,7 +196,7 @@ export class LlmClient {
 
   private record(
     call: StructuredCall<unknown>, model: string, inputHash: string, attempt: number, started: number,
-    message: Anthropic.Message | null, errorCode: string | null,
+    message: Anthropic.Message | null, errorCode: string | null, settle: SettleBudget,
   ): Sent {
     const usage: TokenUsage = message ? {
       inputTokens: message.usage.input_tokens ?? 0,
@@ -201,12 +209,11 @@ export class LlmClient {
       scanId: call.scanId, analyzer: call.analyzer, purpose: call.purpose, model, promptVersion: call.promptVersion, inputHash,
       ...usage, costUsd: cost, latencyMs: this.now() - started, stopReason: message?.stop_reason ?? null, attempt, errorCode,
     });
+    // Budget first: its lazy load reads scans.cost_usd, so adding there first would double-count.
+    // settle() frees this attempt's reservation and commits the actual cost (0 on failure).
+    settle(cost);
     if (call.scanId) {
-      if (cost > 0) {
-        // Budget first: its lazy load reads scans.cost_usd, so adding there first would double-count.
-        this.deps.budget.add(call.scanId, cost);
-        this.deps.scans.addCost(call.scanId, cost);
-      }
+      if (cost > 0) this.deps.scans.addCost(call.scanId, cost);
       this.deps.onUsage?.(call.scanId, this.deps.calls.totals(call.scanId));
     }
     return { message: message as Anthropic.Message, model, callId, usage, costUsd: cost };

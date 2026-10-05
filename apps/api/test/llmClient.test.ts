@@ -141,6 +141,40 @@ describe('LlmClient.structured', () => {
     expect(transport.send).toHaveBeenCalledOnce();
   });
 
+  it('reserves worst-case cost per attempt so concurrent calls cannot overspend the budget', async () => {
+    // Worst case per call: deep = claude-sonnet-5, output $10/1M × 4_000 max tokens = $0.04, plus a few
+    // input tokens at $2/1M ≈ $0.0001. A $0.10 budget fits two such reservations, never a third.
+    const { client, call, transport, budget, scanId } = setup([], { budgetUsd: 0.1 });
+    const gates: Array<() => void> = [];
+    vi.mocked(transport.send).mockImplementation(async (req: LlmRequest) => {
+      await new Promise<void>((resolve) => gates.push(resolve));
+      return msg(req.model, JSON.stringify({ verdict: 'safe', reason: 'ok' }));
+    });
+    const c = call({ maxTokens: 4_000 });
+    const first = client.structured(c);
+    const second = client.structured(c);
+    await vi.waitFor(() => expect(transport.send).toHaveBeenCalledTimes(2));
+    expect(budget.reservedUsd(scanId)).toBeGreaterThan(0.08);
+    expect(budget.reservedUsd(scanId)).toBeLessThan(0.1);
+
+    await expect(client.structured(c)).rejects.toMatchObject({ code: 'BUDGET_EXHAUSTED', kind: 'budget' });
+    expect(transport.send).toHaveBeenCalledTimes(2);
+
+    gates.forEach((release) => release());
+    const results = await Promise.all([first, second]);
+    // Actual usage per call: (1000×2 + 100×10 + 500×0.2)/1e6 = $0.0031 — far below the reserved worst case.
+    expect(results.map((r) => r.costUsd)).toEqual([expect.closeTo(0.0031, 9), expect.closeTo(0.0031, 9)]);
+    expect(budget.reservedUsd(scanId)).toBe(0);
+    expect(budget.spentUsd(scanId)).toBeCloseTo(0.0062, 9);
+  });
+
+  it('frees the reservation of a failed attempt', async () => {
+    const { client, call, budget, scanId } = setup([{ error: new AppError('LLM_UNAVAILABLE', 'permanent', 'x') }]);
+    await expect(client.structured(call())).rejects.toMatchObject({ kind: 'permanent' });
+    expect(budget.reservedUsd(scanId)).toBe(0);
+    expect(budget.spentUsd(scanId)).toBe(0);
+  });
+
   it('does not retry permanent errors and stops on cancellation', async () => {
     const perm = setup([{ error: new AppError('LLM_UNAVAILABLE', 'permanent', 'bad key') }]);
     await expect(perm.client.structured(perm.call())).rejects.toMatchObject({ kind: 'permanent' });
