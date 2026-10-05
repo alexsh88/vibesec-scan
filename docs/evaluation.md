@@ -39,16 +39,21 @@ These were measured by the lead with real Claude on the full pipeline, at defaul
 
 | Run | Scope | Recall | False positives | Cost | Duration | LLM calls |
 |---|---|---|---|---|---|---|
-| 1 | Analyzers only (milestone P6) | 30/31 | 3/6 (old metric: *any* finding on a safe line) | — | — | — |
-| 2 | Analyzers, after fixes | 30/31 | 1/6 same-concern | — | — | — |
+| 1 | Analyzers only (milestone P6) | 30/31 | 3/6 (old metric: *any* finding on a safe line) | $0.69 | 139 s | 72 |
+| 2 | Analyzers, after fixes | 30/31 | 1/6 same-concern | $0.70 | 128 s | 72 |
 | 3 | **Full pipeline**: verify + skeptic, scoring, synthesis | **31/31** | **0/6** same-concern | **$1.19** | **287 s** | **93** |
 
 What changed between runs:
-- **Run 1 → 2:** prompt and analyzer fixes, and the false-positive metric was made concern-aware. One lesson from the first live evals is now in the code: the quality analyzer is constrained to a maintainability-only catalogue, because an early live run produced ~60 quality findings, most of them re-reported injections and hardcoded credentials.
+- **Run 1 → 2:**
+  - Run 1 produced ~60 quality findings, most of them re-reported injections and hardcoded credentials. The quality analyzer is now constrained to a maintainability-only rule catalogue.
+  - Run 1 surfaced a transport bug: the SDK validated structured output itself, so a truncated or off-schema reply became a permanent error with no repair attempt. Fixed for every analyzer.
+  - Run 1's "miss" (a Supabase service-role key used in browser code) had in fact been found by SAST under a different rule label. The ground truth now accepts that label, and SAST also receives deterministic client-exposure hints.
+  - The false-positive metric was made concern-aware.
+- **Run 2's miss:** the Dockerfile `curl | sh` (V23). Claude refuted both deterministic Dockerfile hints, and refuted hints used to be dropped. Now an AI verdict can only downgrade a deterministic hint (to `info`, with its reason); it can never make it disappear.
 - **The fixture was wrong, not the scanner.** Run 2's one same-concern "false positive" was on a look-alike redirect guard using `startsWith('/')`. That guard is a **real open redirect**, because `//evil.com` passes. The model was right, and the fixture was fixed.
 - **Run 2 → 3:**
   - Verification, skeptic, scoring and synthesis were added.
-  - The scorer was corrected to accept the merged taint finding for a planted SAST issue. The one "miss" in runs 1–2 had been found, but by the other analyzer.
+  - Run 3's only scorer "miss" (`eval` of LLM output, V12) was found as a critical `taint/code-injection` on the exact line: dedupe correctly kept the taint finding over SAST. The scorer was corrected to accept taint findings for planted SAST issues.
 
 ## Caveats
 
