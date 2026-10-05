@@ -1,0 +1,5 @@
+{
+  "name": "demo2",
+  "version": "1.0.0",
+  "dependencies": { "ms": "^2.0.0" }
+}
