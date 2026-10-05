@@ -4,6 +4,7 @@ import { SEVERITY_RANK } from '../findings/helpers';
 import type { Db } from './database';
 
 export type TriageFilter = 'open' | 'suppressed' | 'all';
+export type FindingRow = { analyzer: string; finding: Finding };
 
 export type FindingFilter = {
   category?: Category;
@@ -80,10 +81,60 @@ export class FindingRepo {
   }
 
   /** Every finding of a scan with the analyzer that produced it (post-analysis stages: verify, score). */
-  all(scanId: string): { analyzer: string; finding: Finding }[] {
+  all(scanId: string): FindingRow[] {
     const rows = this.db.prepare(`SELECT analyzer, data_json FROM findings WHERE scan_id = ? ORDER BY id`)
       .all(scanId) as { analyzer: string; data_json: string }[];
     return rows.map((r) => ({ analyzer: r.analyzer, finding: JSON.parse(r.data_json) as Finding }));
+  }
+
+  /** Atomically replaces every finding row of a scan — the full-scan cache copy. */
+  replaceAll(scanId: string, rows: readonly FindingRow[]): void {
+    const parsed = rows.map((r) => ({ analyzer: r.analyzer, finding: FindingSchema.parse(r.finding) }));
+    this.db.transaction(() => {
+      this.db.prepare(`DELETE FROM findings WHERE scan_id = ?`).run(scanId);
+      this.insertRows(scanId, parsed);
+    })();
+  }
+
+  private insertRows(scanId: string, rows: readonly FindingRow[]): void {
+    const createdAt = this.now();
+    const insert = this.db.prepare(
+      `INSERT INTO findings (id, scan_id, analyzer, fingerprint, category, rule_id, title, severity, severity_rank, risk_score, file, start_line, data_json, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT (scan_id, fingerprint) DO NOTHING`,
+    );
+    for (const { analyzer, finding: f } of rows) {
+      insert.run(
+        f.id, scanId, analyzer, f.fingerprint, f.category, f.ruleId, f.title, f.severity,
+        SEVERITY_RANK[f.severity], f.riskScore, f.location.file, f.location.startLine, JSON.stringify(f), createdAt,
+      );
+    }
+  }
+
+  /**
+   * Stores one analyzer's output exactly as it returned it (before VERIFYING/SCORING rewrite the
+   * persisted rows): what an incremental rescan re-attaches for unchanged files (migration 012).
+   */
+  saveAnalyzerResult(scanId: string, analyzer: string, findings: readonly Finding[]): void {
+    const json = JSON.stringify(findings.map((f) => FindingSchema.parse(f)));
+    this.db.prepare(
+      `INSERT INTO analyzer_results (scan_id, analyzer, findings_json, created_at) VALUES (?, ?, ?, ?)
+       ON CONFLICT (scan_id, analyzer) DO UPDATE SET findings_json = excluded.findings_json, created_at = excluded.created_at`,
+    ).run(scanId, analyzer, json, this.now());
+  }
+
+  /** One analyzer's stored output for a scan; [] when it never ran (or the scan predates migration 012). */
+  analyzerResult(scanId: string, analyzer: string): Finding[] {
+    const row = this.db.prepare(`SELECT findings_json FROM analyzer_results WHERE scan_id = ? AND analyzer = ?`)
+      .get(scanId, analyzer) as { findings_json: string } | undefined;
+    return row ? (JSON.parse(row.findings_json) as Finding[]) : [];
+  }
+
+  /** Every analyzer output stored for a scan (the full-scan cache copies them along). */
+  analyzerResults(scanId: string): Array<{ analyzer: string; findings: Finding[] }> {
+    const rows = this.db.prepare(`SELECT analyzer, findings_json FROM analyzer_results WHERE scan_id = ? ORDER BY analyzer`)
+      .all(scanId) as Array<{ analyzer: string; findings_json: string }>;
+    return rows.map((r) => ({ analyzer: r.analyzer, findings: JSON.parse(r.findings_json) as Finding[] }));
   }
 
   /**

@@ -7,7 +7,7 @@ import { ScanRepo } from '../src/db/scanRepo';
 import { AppError } from '../src/errors/AppError';
 import { EventBus } from '../src/events/EventBus';
 import { JobRunner, type JobRunnerConfig } from '../src/jobs/JobRunner';
-import type { PipelineContext, StageName, StageSpec } from '../src/pipeline/types';
+import { SKIP_REMAINING_STAGES, type PipelineContext, type StageName, type StageSpec } from '../src/pipeline/types';
 import { ScanLifecycle } from '../src/scans/ScanLifecycle';
 import { memoryDb, waitFor } from './helpers';
 
@@ -591,3 +591,29 @@ function setupWithClock(nowMs: number, stages: StageSpec[] = [stage('ANALYZING')
     now: () => clock, advance: (ms: number) => { clock += ms; },
   };
 }
+
+describe('JobRunner — P7 caching hooks', () => {
+  it('skips (and checkpoints) every remaining stage once a stage sets SKIP_REMAINING_STAGES', async () => {
+    const later = vi.fn(async () => {});
+    const { runner, newScan, states, scans } = setup([
+      stage('RESOLVING', { run: async (ctx) => { ctx.checkpointData[SKIP_REMAINING_STAGES] = true; } }),
+      stage('CLONING', { run: later }), stage('ANALYZING', { run: later }),
+    ]);
+    const id = newScan();
+    runner.enqueue(id, {});
+    await runner.whenIdle();
+    expect(later).not.toHaveBeenCalled();
+    expect(states(id)).toEqual(['RESOLVING', 'COMPLETED']);
+    expect(scans.getCheckpoint(id)?.completedStages).toEqual(['RESOLVING', 'CLONING', 'ANALYZING']);
+  });
+
+  it("does not degrade the outcome for 'info' warnings", async () => {
+    const { runner, newScan, scans } = setup([
+      stage('ANALYZING', { run: async (ctx) => { ctx.warn({ code: 'INCREMENTAL_DIFF_TOO_LARGE', message: 'full scan', level: 'info' }); } }),
+    ]);
+    const id = newScan();
+    runner.enqueue(id, {});
+    await runner.whenIdle();
+    expect(scans.getDto(id)).toMatchObject({ state: 'COMPLETED', warnings: [{ code: 'INCREMENTAL_DIFF_TOO_LARGE', level: 'info' }] });
+  });
+});

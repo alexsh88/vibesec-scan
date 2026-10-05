@@ -115,8 +115,28 @@ describe('Claude code analyzers, end to end over fixtures/vuln-app (mock LLM)', 
     for (const raw of RAW_CREDENTIALS) expect(haystack.includes(raw), `leaked ${raw.slice(0, 4)}…`).toBe(false);
   }, 120_000);
 
-  it('serves an unchanged rescan from the SAST cache', async () => {
+  it('answers a rescan of the same commit from the full-scan cache: instantly, $0, identical findings', async () => {
+    const first = full.container.scans.listByRepo(full.container.scans.findRepo('acme', 'vuln-app')!.id).at(-1)!;
     const { scanId } = await full.scan();
+    const scan = full.container.scans.getDto(scanId)!;
+    expect(scan).toMatchObject({ state: first.state, cacheHit: 'full', costUsd: 0, commitSha: first.commitSha });
+    expect(scan.reuse).toMatchObject({ baseScanId: first.id, filesChanged: 0 });
+    expect(scan.reuse!.filesReused).toBeGreaterThan(0);
+    expect(scan.reuse!.estimatedSavedUsd).toBeCloseTo(first.costUsd, 6);
+    expect(full.container.llmCalls.totals(scanId).calls).toBe(0);
+    const strip = (fs: Finding[]) => fs.map(({ id: _id, scanId: _s, ...rest }) => rest).sort((x, y) => (x.fingerprint < y.fingerprint ? -1 : 1));
+    expect(strip(findingsOf(full.container, scanId))).toEqual(strip(findingsOf(full.container, first.id)));
+    expect(full.container.summaries.get(scanId)?.riskGrade).toBe(full.container.summaries.get(first.id)?.riskGrade);
+    // Straight from RESOLVING to the terminal state; the UI gets the reuse numbers in a `cache` event.
+    const events = full.container.bus.replay(scanId, 0).map((e) => e.event);
+    expect(events.flatMap((e) => (e.type === 'state' ? [e.state] : []))).toEqual(['QUEUED', 'RESOLVING', first.state]);
+    expect(events).toContainEqual(expect.objectContaining({ type: 'cache', filesAnalyzed: 0, filesReused: scan.reuse!.filesReused }));
+    expect(events.at(-1)).toEqual({ type: 'done', state: first.state });
+  }, 120_000);
+
+  it('serves a rescan with other options (no full-cache hit, no incremental base) from the SAST and triage caches', async () => {
+    const { scanId } = await full.scan({ budgetUsd: 9 });
+    expect(full.container.scans.getDto(scanId)?.cacheHit).toBe('none');
     const diag = await diagnostics(full, scanId);
     expect(diag.coverage.byAnalyzer.sast!.cached).toBeGreaterThan(0);
     expect(diag.coverage.byAnalyzer.sast!.reviewed ?? 0).toBe(0);

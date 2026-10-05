@@ -51,6 +51,8 @@ async function runAnalyzer(
   try {
     const result: Finding[] = await analyzer.run(actx);
     deps.findings.replaceForAnalyzer(ctx.scanId, analyzer.id, result);
+    // The analyzer's own output, before VERIFYING/SCORING rewrite the rows: a later incremental rescan re-attaches from it.
+    deps.findings.saveAnalyzerResult(ctx.scanId, analyzer.id, result);
     for (const finding of dedupeByFingerprint(result)) {
       ctx.emit({ type: 'finding', finding: FindingSummarySchema.parse(finding) });
     }

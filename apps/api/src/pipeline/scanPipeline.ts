@@ -1,9 +1,10 @@
+import type { ScanOptions } from '@vibesec/shared';
 import type { Analyzer } from '../analyzers/types';
 import type { CoverageRepo } from '../db/coverageRepo';
 import type { FindingRepo } from '../db/findingRepo';
 import type { FixPlanRepo } from '../db/fixPlanRepo';
 import type { IndexRepo } from '../db/indexRepo';
-import type { ScanRepo } from '../db/scanRepo';
+import type { ScanCacheKeys, ScanRepo } from '../db/scanRepo';
 import type { SummaryRepo } from '../db/summaryRepo';
 import { AppError, toAppError } from '../errors/AppError';
 import type { GitService } from '../git/GitService';
@@ -11,6 +12,7 @@ import type { LlmClient } from '../llm/LlmClient';
 import type { SuppressionService } from '../suppressions/suppressionService';
 import { analyzeStage } from './stages/analyzeStage';
 import { cloneStage } from './stages/cloneStage';
+import { withFullScanCache } from './stages/fullCache';
 import { indexStage, type IndexDeps } from './stages/indexStage';
 import { resolveStage, type ResolveDeps } from './stages/resolveStage';
 import { scoreStage } from './stages/scoreStage';
@@ -20,17 +22,21 @@ import type { Pipeline, PipelineContext, StageSpec } from './types';
 
 export type ScanPipelineDeps = Omit<ResolveDeps, 'git' | 'scans'> & Omit<IndexDeps, 'git' | 'indexRepo'> & {
   git: Pick<GitService, 'remoteUrl' | 'resolveRef' | 'ensureCheckout' | 'removeScanDir' | 'repoDir'>;
-  scans: Pick<ScanRepo, 'updateRepoMeta' | 'setCommitSha' | 'getDto'>;
-  indexRepo: Pick<IndexRepo, 'replace' | 'files' | 'entrypoints'>;
+  scans: Pick<ScanRepo, 'updateRepoMeta' | 'setCommitSha' | 'getDto' | 'setCacheKeys' | 'findFullCacheSource' | 'setReuse' | 'getDiagnostics'>;
+  indexRepo: Pick<IndexRepo, 'replace' | 'files' | 'imports' | 'entrypoints' | 'stats'>;
   analyzers: readonly Analyzer[];
   findings: FindingRepo;
   coverage: CoverageRepo;
-  fixPlans: Pick<FixPlanRepo, 'get'>;
-  summaries: Pick<SummaryRepo, 'save'>;
+  fixPlans: Pick<FixPlanRepo, 'get' | 'save'>;
+  summaries: Pick<SummaryRepo, 'get' | 'save'>;
   /** VERIFYING's skeptic pass and SYNTHESIZING's summary. */
   llm: Pick<LlmClient, 'structured'>;
   /** Re-applies the repo's triage decisions after SCORING. */
   suppressions: Pick<SuppressionService, 'applySuppressions'>;
+  /** The scan's cache keys (scans/cacheKeys.ts); omit to disable the full-scan cache. */
+  cacheKeys?: (options: ScanOptions) => ScanCacheKeys;
+  /** One DB transaction (the full-scan cache copy). */
+  atomically: <T>(fn: () => T) => T;
   /** Called after cleanup, once the scan reaches a terminal state (e.g. budget-tracker cleanup). */
   onFinished?: (scanId: string) => void;
 };
@@ -63,13 +69,16 @@ function scoringStage(deps: ScanPipelineDeps): StageSpec {
 }
 
 /**
- * RESOLVING → CLONING → INDEXING → ANALYZING → VERIFYING → SCORING (+ suppressions) → SYNTHESIZING. Every stage is idempotent, so
+ * RESOLVING (+ full-scan cache) → CLONING → INDEXING → ANALYZING → VERIFYING → SCORING (+ suppressions)
+ * → SYNTHESIZING. Every stage is idempotent, so
  * JobRunner's resume (skip checkpointed stages, re-run the interrupted one) is safe.
  */
 export function createScanPipeline(deps: ScanPipelineDeps): Pipeline {
+  const resolve = resolveStage(deps);
+  const cacheKeys = deps.cacheKeys;
   return {
     stages: [
-      resolveStage(deps),
+      cacheKeys ? withFullScanCache(resolve, { ...deps, cacheKeys }) : resolve,
       cloneStage(deps),
       indexStage(deps),
       analyzeStage({ analyzers: deps.analyzers, findings: deps.findings, indexRepo: deps.indexRepo, git: deps.git, coverage: deps.coverage }),

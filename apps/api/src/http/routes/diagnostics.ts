@@ -16,6 +16,9 @@ export function diagnosticsRoutes(app: FastifyInstance, c: Container): void {
       durationMs: started !== null && finished !== null ? finished - started : null,
       warnings: scan.warnings,
       index: c.indexRepo.stats(scan.id),
+      /** Full-scan cache hit or incremental rescan: what was reused from which scan ("N files reused, $X saved"). */
+      cacheHit: scan.cacheHit,
+      reuse: scan.reuse ?? null,
       /** Per-file AI-review coverage: counts by status (overall and per analyzer) + every budget-skipped file. */
       coverage: coverage.summary(scan.id),
       llm: {

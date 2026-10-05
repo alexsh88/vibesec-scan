@@ -1,18 +1,21 @@
 import { AuditLogger } from './audit/AuditLogger';
-import { configMockResponder, createConfigAnalyzer } from './analyzers/code/config/configAnalyzer';
-import { createQualityAnalyzer, qualityMockResponder } from './analyzers/code/quality/qualityAnalyzer';
+import { CONFIG_PROMPT_VERSION, configMockResponder, createConfigAnalyzer } from './analyzers/code/config/configAnalyzer';
+import { createQualityAnalyzer, QUALITY_PROMPT_VERSION, qualityMockResponder } from './analyzers/code/quality/qualityAnalyzer';
 import { createSastAnalyzer, sastMockResponder } from './analyzers/code/sast';
-import { createTaintAnalyzer, taintMockResponder } from './analyzers/code/taint';
-import { codeTriageMockResponder, TriageService } from './analyzers/code/triage';
+import { SAST_PROMPT_VERSION } from './analyzers/code/sastPrompt';
+import { createTaintAnalyzer, TAINT_PROMPT_VERSION, taintMockResponder } from './analyzers/code/taint';
+import { codeTriageMockResponder, TRIAGE_PROMPT_VERSION, TriageService } from './analyzers/code/triage';
 import { createCredentialsAnalyzer } from './analyzers/credentials/credentialsAnalyzer';
-import { createCredentialHunter, credentialHunterMockResponder } from './analyzers/credentials/hunter';
-import { credentialsFpMockResponder } from './analyzers/credentials/fpFilter';
+import { createCredentialHunter, CREDENTIAL_HUNTER_PROMPT_VERSION, credentialHunterMockResponder } from './analyzers/credentials/hunter';
+import { credentialsFpMockResponder, FP_FILTER_PROMPT_VERSION } from './analyzers/credentials/fpFilter';
 import { SecretVerifier } from './analyzers/credentials/verifiers';
 import { createDependenciesAnalyzer } from './analyzers/dependencies/dependenciesAnalyzer';
 import { OsvClient } from './analyzers/dependencies/osv/osvClient';
-import { dependencyReachabilityMockResponder } from './analyzers/dependencies/reachabilityJudge';
+import { dependencyReachabilityMockResponder, REACHABILITY_JUDGE_PROMPT_VERSION } from './analyzers/dependencies/reachabilityJudge';
 import { skepticMockResponder } from './findings/skeptic';
-import { synthesisMockResponder } from './synthesis/synthesisPrompt';
+import { SKEPTIC_PROMPT_VERSION } from './findings/skepticPrompt';
+import { scanCacheKeys } from './scans/cacheKeys';
+import { SYNTHESIS_PROMPT_VERSION, synthesisMockResponder } from './synthesis/synthesisPrompt';
 import { RegistryClient } from './analyzers/dependencies/registry';
 import { AdvisoryCacheRepo } from './db/advisoryCacheRepo';
 import { CoverageRepo } from './db/coverageRepo';
@@ -80,6 +83,12 @@ export const MOCK_RESPONDERS: MockResponder[] = [
   skepticMockResponder, synthesisMockResponder,
 ];
 
+/** Every prompt version that shapes a scan result: part of the cache keys (scans/cacheKeys.ts). */
+export const PROMPT_VERSIONS: readonly string[] = [
+  TRIAGE_PROMPT_VERSION, SAST_PROMPT_VERSION, TAINT_PROMPT_VERSION, QUALITY_PROMPT_VERSION, CONFIG_PROMPT_VERSION,
+  CREDENTIAL_HUNTER_PROMPT_VERSION, FP_FILTER_PROMPT_VERSION, REACHABILITY_JUDGE_PROMPT_VERSION, SKEPTIC_PROMPT_VERSION,
+  SYNTHESIS_PROMPT_VERSION,
+];
 
 /** Composition root: the only place that wires concrete implementations together. */
 export function createContainer(config: Config, overrides: ContainerOverrides = {}): Container {
@@ -145,9 +154,15 @@ export function createContainer(config: Config, overrides: ContainerOverrides = 
     createCredentialHunter({ llm, triage, lanes }),
   ];
 
+  const resultConfig = {
+    analyzers: analyzers.map((a) => ({ id: a.id, version: a.version })),
+    promptVersions: PROMPT_VERSIONS, models: config.models, llmMode: config.scanMode,
+  };
   const pipeline = overrides.pipeline ?? createScanPipeline({
     git, github, scans, indexRepo, indexer, maxRepoBytes: config.maxRepoBytes, maxFiles: config.maxFiles,
     analyzers, findings, coverage: new CoverageRepo(db), fixPlans, summaries, llm, suppressions,
+    cacheKeys: (options) => scanCacheKeys(options, resultConfig),
+    atomically: (fn) => lifecycle.atomically(fn),
     onFinished: (scanId) => {
       budget.forget(scanId);
       triage.forget(scanId);

@@ -49,6 +49,25 @@ export type CreateScanRequest = z.infer<typeof CreateScanRequestSchema>;
 
 export const CacheHitSchema = z.enum(['none', 'partial', 'full']);
 
+/**
+ * What a cached rescan reused from an earlier scan (spec §11): 'full' = same commit + same result
+ * configuration → every result copied, $0; 'partial' = incremental rescan, only changed/affected files
+ * were analyzed again. `estimatedSavedUsd` is an estimate (see apps/api/src/pipeline/incremental.ts).
+ */
+export const ReuseStatsSchema = z.object({
+  baseScanId: z.string(),
+  filesChanged: z.number().int().nonnegative(),
+  filesDeleted: z.number().int().nonnegative().optional(),
+  filesReused: z.number().int().nonnegative(),
+  estimatedSavedUsd: z.number().nonnegative(),
+});
+export type ReuseStats = z.infer<typeof ReuseStatsSchema>;
+
+/** `level: 'info'` warnings are notes (e.g. "rescan fell back to a full scan"): they never make a scan COMPLETED_WITH_WARNINGS. */
+export const ScanWarningSchema = z.object({
+  code: z.string(), message: z.string(), stage: z.string().optional(), level: z.enum(['info', 'warning']).optional(),
+});
+
 export const ScanDtoSchema = z.object({
   id: z.string(),
   repo: z.object({ id: z.string(), owner: z.string(), name: z.string(), isPrivate: z.boolean() }),
@@ -63,6 +82,8 @@ export const ScanDtoSchema = z.object({
   createdAt: z.string(),
   startedAt: z.string().nullable(),
   finishedAt: z.string().nullable(),
-  warnings: z.array(z.object({ code: z.string(), message: z.string(), stage: z.string().optional() })),
+  warnings: z.array(ScanWarningSchema),
+  /** The earlier scan whose results were reused (cacheHit 'full' | 'partial'), with reuse stats. */
+  reuse: ReuseStatsSchema.nullable().optional(),
 });
 export type ScanDto = z.infer<typeof ScanDtoSchema>;

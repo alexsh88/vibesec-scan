@@ -3,6 +3,12 @@ import type { ScanWarning } from '../db/scanRepo';
 
 export type StageName = Exclude<ScanState, 'QUEUED' | 'COMPLETED' | 'COMPLETED_WITH_WARNINGS' | 'FAILED' | 'CANCELLED'>;
 
+/**
+ * Checkpoint-data flag a stage sets when the scan needs no further stage (e.g. the full-scan cache
+ * already copied every result): JobRunner records every remaining stage as completed and skips it.
+ */
+export const SKIP_REMAINING_STAGES = 'skipRemainingStages';
+
 /** Held in memory only for the lifetime of a scan; never persisted or logged. */
 export type ScanSecrets = { token?: string };
 

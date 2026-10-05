@@ -5,7 +5,7 @@ import type { Config } from '../config';
 import type { Checkpoint, ScanRepo } from '../db/scanRepo';
 import { AppError, toAppError } from '../errors/AppError';
 import type { EventBus } from '../events/EventBus';
-import type { Pipeline, PipelineContext, ScanSecrets, StageName } from '../pipeline/types';
+import { SKIP_REMAINING_STAGES, type Pipeline, type PipelineContext, type ScanSecrets, type StageName } from '../pipeline/types';
 import type { ScanLifecycle } from '../scans/ScanLifecycle';
 import { scrubSecrets } from '../security/scrub';
 
@@ -254,7 +254,8 @@ export class JobRunner implements ScanQueue {
       const pending = pipeline.stages.map((s) => s.name).filter((n) => !checkpoint.completedStages.includes(n));
       scans.removeWarningsForStages(scanId, pending);
 
-      let warned = (scans.getDto(scanId)?.warnings.length ?? 0) > 0;
+      // Only real warnings degrade the outcome; 'info' notes (e.g. a rescan that fell back to a full scan) do not.
+      let warned = (scans.getDto(scanId)?.warnings ?? []).some((w) => w.level !== 'info');
       let currentStage: StageName | undefined;
       const ctx: PipelineContext = {
         scanId,
@@ -263,7 +264,7 @@ export class JobRunner implements ScanQueue {
         signal,
         checkpointData: checkpoint.data,
         emit: (event) => { touch(); lifecycle.emit(scanId, event); },
-        warn: (w) => { touch(); warned = true; lifecycle.warn(scanId, w); },
+        warn: (w) => { touch(); if (w.level !== 'info') warned = true; lifecycle.warn(scanId, w); },
         touch,
       };
 
@@ -289,6 +290,13 @@ export class JobRunner implements ScanQueue {
           // A stage that swallowed the abort did not really finish: never checkpoint it as complete.
           if (signal.aborted) throw new AppError('CANCELLED', 'cancelled', 'Scan aborted');
           checkpoint.completedStages.push(stage.name);
+          // A stage may finish the whole scan early (the full-scan cache served every result): the
+          // remaining stages are checkpointed as done, so a resume never runs them either.
+          if (checkpoint.data[SKIP_REMAINING_STAGES] === true) {
+            for (const rest of pipeline.stages) {
+              if (!checkpoint.completedStages.includes(rest.name)) checkpoint.completedStages.push(rest.name);
+            }
+          }
           scans.setCheckpoint(scanId, checkpoint);
         }
         outcome = { ok: true };

@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { isTerminalState, type ScanDto, type ScanOptions, type ScanState } from '@vibesec/shared';
+import { isTerminalState, ReuseStatsSchema, type ReuseStats, type ScanDto, type ScanOptions, type ScanState } from '@vibesec/shared';
 import type { Db } from './database';
 
 export type RepoRecord = { id: string; owner: string; name: string; isPrivate: boolean; defaultBranch: string | null };
@@ -12,14 +12,20 @@ export type ScanRow = {
   checkpoint_json: string | null; heartbeat_at: string | null; diagnostics_json: string | null;
   warnings_json: string; cost_usd: number; tokens_json: string | null; summary_json: string | null;
   created_at: string; started_at: string | null; finished_at: string | null;
+  result_options_hash: string | null;
 };
 
-export type ScanWarning = { code: string; message: string; stage?: string };
+export type ScanWarning = { code: string; message: string; stage?: string; level?: 'info' | 'warning' };
+/** Persisted in scans.diagnostics_json (free-form per-scan diagnostics; today only the reuse stats). */
+export type ScanDiagnostics = { reuse?: ReuseStats };
+/** The scan configuration the result caches key on (spec §11), besides the repo and the commit. */
+export type ScanCacheKeys = { resultOptionsHash: string; analyzerVersionsHash: string };
 export type Checkpoint = { completedStages: ScanState[]; data: Record<string, unknown> };
 
 type RepoRow = { id: string; owner: string; name: string; is_private: number; default_branch: string | null };
 
 const TERMINAL_SQL = `('COMPLETED','COMPLETED_WITH_WARNINGS','FAILED','CANCELLED')`;
+const COMPLETED_SQL = `('COMPLETED','COMPLETED_WITH_WARNINGS')`;
 
 export class ScanRepo {
   constructor(private readonly db: Db, private readonly now: () => string = () => new Date().toISOString()) {}
@@ -84,7 +90,52 @@ export class ScanRepo {
       startedAt: row.started_at,
       finishedAt: row.finished_at,
       warnings: JSON.parse(row.warnings_json) as ScanWarning[],
+      reuse: this.diagnosticsOf(row).reuse ?? null,
     };
+  }
+
+  private diagnosticsOf(row: ScanRow): ScanDiagnostics {
+    if (!row.diagnostics_json) return {};
+    const raw = JSON.parse(row.diagnostics_json) as ScanDiagnostics;
+    const reuse = ReuseStatsSchema.safeParse(raw.reuse);
+    return reuse.success ? { ...raw, reuse: reuse.data } : { ...raw, reuse: undefined };
+  }
+
+  getDiagnostics(id: string): ScanDiagnostics {
+    const row = this.getRow(id);
+    return row ? this.diagnosticsOf(row) : {};
+  }
+
+  /** Records the cache keys a scan was run with (set once the commit is resolved). */
+  setCacheKeys(id: string, keys: ScanCacheKeys): void {
+    this.db.prepare(`UPDATE scans SET result_options_hash = ?, analyzer_versions_hash = ? WHERE id = ?`)
+      .run(keys.resultOptionsHash, keys.analyzerVersionsHash, id);
+  }
+
+  /**
+   * Marks a scan as served (fully or partly) from an earlier one: cache_hit, base_scan_id and the reuse
+   * stats in diagnostics_json. `cacheHit: 'none'` clears it (a resumed scan that fell back to a full scan).
+   */
+  setReuse(id: string, cacheHit: 'none' | 'partial' | 'full', reuse: ReuseStats | null): void {
+    const row = this.getRow(id);
+    if (!row) return;
+    const diagnostics = this.diagnosticsOf(row);
+    if (reuse) diagnostics.reuse = reuse;
+    else delete diagnostics.reuse;
+    this.db.prepare(`UPDATE scans SET cache_hit = ?, base_scan_id = ?, diagnostics_json = ? WHERE id = ?`)
+      .run(cacheHit, reuse?.baseScanId ?? null, JSON.stringify(diagnostics), id);
+  }
+
+  /**
+   * Full-scan cache (spec §11): the most recent completed scan of the same repo at the same commit with
+   * the same result configuration — its results can be served as-is.
+   */
+  findFullCacheSource(repoId: string, commitSha: string, keys: ScanCacheKeys, excludeId: string): ScanRow | undefined {
+    return this.db.prepare(
+      `SELECT * FROM scans WHERE repo_id = ? AND commit_sha = ? AND result_options_hash = ? AND analyzer_versions_hash = ?
+         AND state IN ${COMPLETED_SQL} AND id <> ?
+       ORDER BY finished_at DESC, rowid DESC LIMIT 1`,
+    ).get(repoId, commitSha, keys.resultOptionsHash, keys.analyzerVersionsHash, excludeId) as ScanRow | undefined;
   }
 
   findActiveDuplicate(repoId: string, ref: string | null, optionsHash: string): ScanRow | undefined {
