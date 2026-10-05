@@ -18,8 +18,10 @@
 //     Terraform, k8s-ish manifests, settings/config entrypoints) PLUS source files that the Haiku
 //     triage pass (../code/triage.ts) already flagged `credentialRisk: true` — never the whole repo;
 //   - lockfiles, vendored/minified/oversized (> 200 KiB) files are never selected;
-//   - the set is hard-capped (`maxFiles`, default 25) and content is batched to a small token
-//     budget (~10k tokens/batch) on the cheapest ("fast") model tier;
+//   - every such file is covered (no count cap — cost is bounded by the scan's dollar budget, this
+//     being budget tier 1 with a lease projecting its remaining batches, see llm/budget.ts), batched
+//     to a small token budget (~10k tokens/batch) on the cheapest ("fast") model tier; batches the
+//     budget could not cover are recorded as 'budget-skipped' coverage;
 //   - the model is explicitly told never to echo a full credential value anywhere in its reply
 //     except the one "snippet" line, which WE redact before it is ever stored or displayed — the
 //     model's own words (description, etc.) are also scrubbed of any value we end up masking;
@@ -42,7 +44,9 @@ import { estimateTokens, untrustedFile } from '../../llm/prompt';
 import type { LlmRequest } from '../../llm/transport';
 import type { RawCodeIssue } from '../code/types';
 import type { TriageService } from '../code/triage';
-import type { Analyzer, AnalyzerContext } from '../types';
+import type { WorkLease } from '../../llm/budget';
+import { NO_LEASE, type BudgetLanes } from '../../llm/budgetLanes';
+import type { Analyzer, AnalyzerContext, CoverageStatus } from '../types';
 import { detectSecrets, redact, secretHash } from './rules';
 import { scanText } from './scanText';
 
@@ -52,7 +56,9 @@ export const CREDENTIAL_HUNTER_TASK_MARKER = 'Task: credential-hunt';
 
 export type HunterKind = 'custom-token' | 'split-string' | 'encoded' | 'comment' | 'crypto-key' | 'connection-password' | 'other';
 
-const DEFAULT_MAX_FILES = 25;
+/** Projected output of one batch (budget-lane projection only). */
+const PROJECTED_OUTPUT_TOKENS = 1_000;
+const PROJECTED_SYSTEM_TOKENS = 1_000;
 const DEFAULT_BATCH_TOKENS = 10_000;
 const DEFAULT_MAX_FILE_BYTES = 200 * 1024;
 const READ_CONCURRENCY = 16;
@@ -166,16 +172,13 @@ function comparePriority(a: IndexedFile, b: IndexedFile): number {
   return a.path < b.path ? -1 : a.path > b.path ? 1 : 0;
 }
 
-export type FileSelection = { selected: IndexedFile[]; truncated: boolean };
-
-export function selectHunterFiles(files: readonly IndexedFile[], credentialRiskPaths: ReadonlySet<string>, maxFiles: number, maxFileBytes: number): FileSelection {
+/** Every config/CI/infra file plus every credentialRisk source file, highest priority first (no count cap). */
+export function selectHunterFiles(files: readonly IndexedFile[], credentialRiskPaths: ReadonlySet<string>, maxFileBytes: number): IndexedFile[] {
   const selectable = files.filter((f) => isSelectable(f, maxFileBytes));
   const configFiles = selectable.filter((f) => isConfigCiInfraFile(f));
   const configPaths = new Set(configFiles.map((f) => f.path));
   const riskFiles = selectable.filter((f) => !configPaths.has(f.path) && credentialRiskPaths.has(f.path));
-  const combined = [...configFiles, ...riskFiles].sort(comparePriority);
-  const truncated = combined.length > maxFiles;
-  return { selected: combined.slice(0, maxFiles), truncated };
+  return [...configFiles, ...riskFiles].sort(comparePriority);
 }
 
 // --- safe file read (bounded, repo-confined, binary-aware) ---------------------------------------
@@ -472,7 +475,8 @@ function buildHunterFinding(
 export type CredentialHunterDeps = {
   llm: Pick<LlmClient, 'structured'>;
   triage: Pick<TriageService, 'forScan'>;
-  maxFiles?: number;
+  /** Budget lanes: a tier-1 lease projecting the remaining batches (llm/budget.ts). */
+  lanes?: BudgetLanes;
   batchTokens?: number;
   maxFileBytes?: number;
 };
@@ -480,16 +484,25 @@ export type CredentialHunterDeps = {
 export function createCredentialHunter(deps: CredentialHunterDeps): Analyzer {
   return {
     id: 'credential-hunter',
-    version: '1',
+    version: '2',
     category: 'secret',
 
     async run(ctx: AnalyzerContext): Promise<Finding[]> {
+      if (ctx.signal.aborted) throw toAppError(ctx.signal.reason ?? new Error('aborted'));
+      const lease = deps.lanes?.open(ctx.scanId) ?? NO_LEASE; // before the first await (see llm/budget.ts)
+      try {
+        return await hunt(ctx, lease);
+      } finally {
+        lease.close();
+      }
+    },
+  };
+
+  async function hunt(ctx: AnalyzerContext, lease: WorkLease): Promise<Finding[]> {
       const checkAbort = (): void => {
         if (ctx.signal.aborted) throw toAppError(ctx.signal.reason ?? new Error('aborted'));
       };
-      checkAbort();
-
-      const maxFiles = deps.maxFiles ?? DEFAULT_MAX_FILES;
+      const record = (path: string, status: CoverageStatus) => ctx.recordCoverage?.('credential-hunter', path, status);
       const batchTokens = deps.batchTokens ?? DEFAULT_BATCH_TOKENS;
       const maxFileBytes = deps.maxFileBytes ?? DEFAULT_MAX_FILE_BYTES;
 
@@ -497,10 +510,7 @@ export function createCredentialHunter(deps: CredentialHunterDeps): Analyzer {
       checkAbort();
       const credentialRiskPaths = new Set([...triageResult.files.values()].filter((f) => f.credentialRisk).map((f) => f.path));
 
-      const { selected, truncated } = selectHunterFiles(ctx.files, credentialRiskPaths, maxFiles, maxFileBytes);
-      if (truncated) {
-        ctx.warn('CREDENTIAL_HUNTER_FILE_LIMIT', `The credential hunter was limited to ${maxFiles} files; additional candidate file(s) were not sent to the model`);
-      }
+      const selected = selectHunterFiles(ctx.files, credentialRiskPaths, maxFileBytes);
       if (selected.length === 0) return [];
 
       const contentOf = new Map<string, string>();
@@ -510,18 +520,32 @@ export function createCredentialHunter(deps: CredentialHunterDeps): Analyzer {
         if (text !== null) contentOf.set(f.path, text);
         ctx.touch();
       });
+      for (const f of selected) if (!contentOf.has(f.path)) record(f.path, 'failed');
       if (contentOf.size === 0) return [];
 
       const regexCoveredLines = regexCoverage(contentOf);
 
-      const promptFiles = [...contentOf.entries()].map(([path, text]) => buildPromptFile(path, text, batchTokens));
+      // Priority order (env > config/CI/infra > credentialRisk source), so the budget covers the riskiest first.
+      const promptFiles = selected.filter((f) => contentOf.has(f.path)).map((f) => buildPromptFile(f.path, contentOf.get(f.path)!, batchTokens));
       const batches = packBatches(promptFiles, batchTokens);
+      const batchUsd = (batch: PromptFile[]) => deps.lanes?.estimateUsd(
+        'fast', PROJECTED_SYSTEM_TOKENS + batch.reduce((n, f) => n + f.blockTokens, 0), PROJECTED_OUTPUT_TOKENS,
+      ) ?? 0;
+      let remainingUsd = batches.reduce((sum, b) => sum + batchUsd(b), 0);
+      lease.project(remainingUsd);
+      let budgetExhausted = false;
 
       const findings: Finding[] = [];
       let warnedPartial = false;
       for (const batch of batches) {
         checkAbort();
+        remainingUsd -= batchUsd(batch);
         const batchPaths = new Set(batch.map((f) => f.path));
+        if (budgetExhausted) {
+          for (const f of batch) record(f.path, 'budget-skipped');
+          lease.project(remainingUsd);
+          continue;
+        }
         const call: StructuredCall<HunterOutput> = {
           scanId: ctx.scanId, analyzer: 'credential-hunter', purpose: 'credential-hunt',
           promptVersion: CREDENTIAL_HUNTER_PROMPT_VERSION, role: 'fast', system: SYSTEM_PROMPT,
@@ -535,6 +559,13 @@ export function createCredentialHunter(deps: CredentialHunterDeps): Analyzer {
         } catch (raw) {
           const err = toAppError(raw);
           if (err.kind === 'cancelled' || ctx.signal.aborted) throw err;
+          lease.project(remainingUsd);
+          if (err.kind === 'budget') {
+            budgetExhausted = true;
+            for (const f of batch) record(f.path, 'budget-skipped');
+            continue;
+          }
+          for (const f of batch) record(f.path, 'failed');
           if (!warnedPartial) {
             warnedPartial = true;
             ctx.warn('CREDENTIAL_HUNTER_PARTIAL', 'AI credential hunting failed for one or more file batches; those files were only covered by the regex scanner');
@@ -548,12 +579,13 @@ export function createCredentialHunter(deps: CredentialHunterDeps): Analyzer {
           const finding = buildHunterFinding(ctx, r, fileText, regexCoveredLines);
           if (finding) findings.push(finding);
         }
+        for (const f of batch) record(f.path, 'reviewed');
+        lease.project(remainingUsd);
         ctx.touch();
       }
 
       return findings;
-    },
-  };
+  }
 }
 
 // --- mock responder --------------------------------------------------------------------------

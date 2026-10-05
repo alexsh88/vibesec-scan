@@ -116,8 +116,7 @@ describe('selectHunterFiles', () => {
       file('src/config.js'),
       file('config/app.json'),
     ];
-    const { selected, truncated } = selectHunterFiles(files, new Set(), 25, 200 * 1024);
-    expect(truncated).toBe(false);
+    const selected = selectHunterFiles(files, new Set(), 200 * 1024);
     expect(selected.map((f) => f.path).sort()).toEqual(files.map((f) => f.path).sort());
   });
 
@@ -130,21 +129,22 @@ describe('selectHunterFiles', () => {
       file('config/link.yml', { skipReason: 'symlink' }),
       file('config/huge.yml', { size: 500 * 1024 }),
     ];
-    const { selected } = selectHunterFiles(files, new Set(), 25, 200 * 1024);
+    const selected = selectHunterFiles(files, new Set(), 200 * 1024);
     expect(selected).toHaveLength(0);
   });
 
   it('includes source files the triage pass flagged credentialRisk, but not other source files', () => {
     const files = [file('src/payment.ts'), file('src/util.ts')];
-    const { selected } = selectHunterFiles(files, new Set(['src/payment.ts']), 25, 200 * 1024);
+    const selected = selectHunterFiles(files, new Set(['src/payment.ts']), 200 * 1024);
     expect(selected.map((f) => f.path)).toEqual(['src/payment.ts']);
   });
 
-  it('prioritizes env files, then other config/CI/infra files, then credentialRisk source files, and caps at maxFiles', () => {
-    const files = [file('src/risky.ts'), file('Dockerfile'), file('.env')];
-    const { selected, truncated } = selectHunterFiles(files, new Set(['src/risky.ts']), 2, 200 * 1024);
-    expect(truncated).toBe(true);
-    expect(selected.map((f) => f.path)).toEqual(['.env', 'Dockerfile']);
+  it('prioritizes env files, then other config/CI/infra files, then credentialRisk source files, with no count cap', () => {
+    const files = [file('src/risky.ts'), file('Dockerfile'), file('.env'), ...Array.from({ length: 40 }, (_, i) => file(`config/c${i}.yml`))];
+    const selected = selectHunterFiles(files, new Set(['src/risky.ts']), 200 * 1024);
+    expect(selected).toHaveLength(43);
+    expect(selected.map((f) => f.path).slice(0, 2)).toEqual(['.env', 'Dockerfile']);
+    expect(selected.at(-1)!.path).toBe('src/risky.ts');
   });
 });
 
@@ -177,17 +177,19 @@ describe('createCredentialHunter batching', () => {
     for (const f of files) expect(allPrompts).toContain(`path="${f.path}"`);
   });
 
-  it('warns CREDENTIAL_HUNTER_FILE_LIMIT and caps selection when more candidates exist than maxFiles', async () => {
-    const files = await writeRepoFiles({ 'a.env': 'A=1', 'b.env': 'B=2', 'c.env': 'C=3' });
-    const { llm, calls } = stubLlm(async () => ({ results: [] }));
+  it('after a budget refusal, records the refused and every later batch as budget-skipped (no further calls)', async () => {
+    const content = 'x'.repeat(300);
+    const files = await writeRepoFiles({ 'a.env': content, 'b.env': content, 'c.env': content });
+    const blockTokens = estimateTokens(untrustedFile('a.env', `1: ${content}`));
+    const { llm, calls } = stubLlm(async () => { throw new AppError('BUDGET_EXHAUSTED', 'budget', 'out'); });
     const warnings: string[][] = [];
-    const analyzer = makeAnalyzer(llm, triageStub(), { maxFiles: 2 });
-
-    await analyzer.run(makeCtx(files, { warnings }));
-
-    expect(warnings.some(([code]) => code === 'CREDENTIAL_HUNTER_FILE_LIMIT')).toBe(true);
-    const sentPaths = new Set(calls.flatMap((c) => files.map((f) => f.path).filter((p) => c.prompt.includes(`path="${p}"`))));
-    expect(sentPaths.size).toBe(2);
+    const ctx = makeCtx(files, { warnings });
+    const coverage = new Map<string, string>();
+    ctx.recordCoverage = (a, path, status) => { expect(a).toBe('credential-hunter'); coverage.set(path, status); };
+    await makeAnalyzer(llm, triageStub(), { batchTokens: blockTokens }).run(ctx);
+    expect(calls).toHaveLength(1);
+    expect(warnings).toEqual([]);
+    expect(Object.fromEntries(coverage)).toEqual({ 'a.env': 'budget-skipped', 'b.env': 'budget-skipped', 'c.env': 'budget-skipped' });
   });
 });
 

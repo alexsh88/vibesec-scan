@@ -1,9 +1,9 @@
 // Deterministic code-quality metrics: function/nesting extraction (JS/TS via the TypeScript
-// compiler API, Python via an indentation heuristic), duplicate-block detection, and the
-// RawCodeIssue templates built from those numbers. Pure, synchronous, no network/LLM.
+// compiler API, Python via an indentation heuristic), duplicate-block detection, and a review
+// ranking. Metrics are evidence for the AI quality review only — they never become findings
+// themselves. Pure, synchronous, no network/LLM.
 
 import ts from 'typescript';
-import type { RawCodeIssue } from '../types';
 
 export type QualityLanguage = 'js' | 'ts' | 'py';
 
@@ -466,122 +466,7 @@ export function findDuplicateBlocks(
   return results.slice(0, MAX_DUPLICATE_GROUPS);
 }
 
-// --- issue construction + ranking -----------------------------------------------------------------
-
-function firstLineText(text: string, line: number): string {
-  const lines = splitLines(text);
-  const raw = lines[line - 1] ?? '';
-  return raw.length > 300 ? raw.slice(0, 300) : raw;
-}
-
-function makeIssue(partial: Omit<RawCodeIssue, 'confidence' | 'severity'> & { severity: RawCodeIssue['severity'] }): RawCodeIssue {
-  return { confidence: 'high', ...partial };
-}
-
-export function qualityIssuesFromMetrics(
-  files: readonly { path: string; text: string }[],
-  metrics: readonly FileMetrics[],
-  duplicates: readonly DuplicateBlock[],
-): RawCodeIssue[] {
-  const textByPath = new Map(files.map((f) => [f.path, f.text]));
-  const issues: RawCodeIssue[] = [];
-
-  for (const m of metrics) {
-    const text = textByPath.get(m.path) ?? '';
-
-    if (m.lines > LONG_FILE_LINES) {
-      issues.push(
-        makeIssue({
-          ruleId: 'quality/long-file',
-          title: 'Long file',
-          severity: 'low',
-          file: m.path,
-          startLine: 1,
-          endLine: m.lines,
-          snippet: firstLineText(text, 1),
-          explanation: `File has ${m.lines} lines (threshold ${LONG_FILE_LINES}).`,
-          impact: 'Large files are harder to review and more likely to hide bugs.',
-          remediation: 'Split this file into smaller, cohesive modules.',
-        }),
-      );
-    }
-
-    for (const fn of m.functions) {
-      if (fn.length > LONG_FUNCTION_LINES) {
-        issues.push(
-          makeIssue({
-            ruleId: 'quality/long-function',
-            title: 'Long function',
-            severity: 'low',
-            file: m.path,
-            startLine: fn.startLine,
-            endLine: fn.endLine,
-            snippet: firstLineText(text, fn.startLine),
-            explanation: `Function '${fn.name}' is ${fn.length} lines long (threshold ${LONG_FUNCTION_LINES}).`,
-            impact: 'Long functions are harder to test, review and understand.',
-            remediation: 'Extract smaller functions with a single responsibility.',
-          }),
-        );
-      }
-      if (fn.maxNesting > DEEP_NESTING_DEPTH) {
-        issues.push(
-          makeIssue({
-            ruleId: 'quality/deep-nesting',
-            title: 'Deeply nested function',
-            severity: 'low',
-            file: m.path,
-            startLine: fn.startLine,
-            endLine: fn.endLine,
-            snippet: firstLineText(text, fn.startLine),
-            explanation: `Function '${fn.name}' nests ${fn.maxNesting} levels deep (threshold ${DEEP_NESTING_DEPTH}).`,
-            impact: 'Deep nesting increases cyclomatic complexity and the chance of logic errors.',
-            remediation: 'Flatten control flow with early returns, guard clauses, or extracted helpers.',
-          }),
-        );
-      }
-    }
-
-    if (m.todoDensity > TODO_DENSITY_THRESHOLD) {
-      issues.push(
-        makeIssue({
-          ruleId: 'quality/todo-density',
-          title: 'High TODO/FIXME density',
-          severity: 'info',
-          file: m.path,
-          startLine: 1,
-          endLine: m.lines,
-          snippet: firstLineText(text, 1),
-          explanation: `${m.todoCount} TODO/FIXME/XXX/HACK markers, ${m.todoDensity} per 100 code lines (threshold ${TODO_DENSITY_THRESHOLD}).`,
-          impact: 'A high density of TODO markers suggests unfinished or poorly tracked work.',
-          remediation: 'Convert TODOs into tracked issues or resolve them.',
-        }),
-      );
-    }
-  }
-
-  for (const dup of duplicates) {
-    for (const occ of dup.occurrences) {
-      const text = textByPath.get(occ.path) ?? '';
-      const others = dup.occurrences.filter((o) => o !== occ).map((o) => `${o.path}:${o.startLine}`);
-      issues.push(
-        makeIssue({
-          ruleId: 'quality/duplicate-code',
-          title: 'Duplicate code block',
-          severity: 'low',
-          file: occ.path,
-          startLine: occ.startLine,
-          endLine: occ.startLine + DUPLICATE_WINDOW - 1,
-          snippet: firstLineText(text, occ.startLine),
-          explanation: `Duplicate of ${dup.occurrences.length} copies total (also at ${others.join(', ')}).`,
-          impact: 'Duplicated logic drifts out of sync and multiplies the cost of fixes.',
-          remediation: 'Extract the shared logic into a single function or module.',
-        }),
-      );
-    }
-  }
-
-  return issues;
-}
+// --- ranking ----------------------------------------------------------------------------------
 
 export function rankFilesForQualityReview(metrics: readonly FileMetrics[]): string[] {
   const scored = metrics.map((m) => {

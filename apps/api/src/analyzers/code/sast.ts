@@ -1,9 +1,17 @@
-// Claude SAST analyzer (P6). The findings come from Claude: one Sonnet review per security-relevant
-// file, guided by the OWASP Top 10 + VibeSec rule catalogue in sastPrompt.ts. Deterministic code
-// here only (a) picks which files deserve a review (Haiku triage + entrypoints + Supabase/Firebase
-// policy files), (b) packs context for the model, and (c) verifies what the model says — every
-// reported snippet is re-located in the real file (findings/verify.ts) and anything that cannot be
-// found, or that points at another file, is dropped as a probable hallucination / injection.
+// Claude SAST analyzer (P6). The findings come from Claude, guided by the OWASP Top 10 + VibeSec rule
+// catalogue in sastPrompt.ts. The WHOLE repository is covered, risk first, under the scan's dollar
+// budget (no file-count cap):
+//   - deep pass (Sonnet, budget tier 1): every file triage rated relevance >= 2, or with any sink, or a
+//     detected entrypoint, plus Supabase migrations / Firebase rules — ordered by risk (relevance,
+//     entrypoint, number of sinks/sources);
+//   - fast pass (Haiku, budget tier 2, same prompt/schema): every relevance-1 file; findings are
+//     marked producedBy 'sast:llm-fast' with confidence capped at 'medium';
+//   - relevance 0 (and test/example files): not SAST-reviewed (triage already read them) — recorded as
+//     'not-relevant' coverage. Budget refusals are recorded as 'budget-skipped', never silent.
+// Deterministic code here only (a) orders the work, (b) packs context for the model, and (c) verifies
+// what the model says — every reported snippet is re-located in the real file (findings/verify.ts)
+// and anything that cannot be found, or that points at another file, is dropped as a probable
+// hallucination / injection.
 //
 // Context layout (prompt-cache friendly, see llm/prompt.ts buildRequestParts):
 //   system  — SAST_SYSTEM_PROMPT (frozen per prompt version, cached across every scan)
@@ -15,15 +23,14 @@
 // Rough token budget per file (estimateTokens = chars / 3.5): system ~2.6k (cache read after the
 // first call), shared context 0.2–1.5k (cache read), target file ~10 tokens/line (a 300-line file
 // ≈ 3–4k, capped at FILE_TOKEN_CAP), local context ≤ 6k, hints ≤ 0.4k, output typically 0.3–3k
-// (max_tokens = role default 8192). So ≈ 5–15k fresh input tokens per file; at maxFiles = 60 a full
-// scan is ≈ 0.4–0.9M input tokens.
+// (max_tokens = role default 8192). So ≈ 5–15k fresh input tokens per file (≈ $0.02–0.05 on Sonnet).
 //
-// Caching: an optional per-file result cache (deps.cache) keyed by sha256(per-file prompt) +
-// SAST_PROMPT_VERSION + model. The per-file prompt embeds the file content, its local context and
-// its hints, so an unchanged file in an unchanged neighbourhood hits; raw model issues are cached
-// (verification always re-runs). TODO(P7): back it with a sast_cache table (migration + repo, same
-// shape as triage_cache) — deliberately not added here to avoid a migration-number collision with
-// the other P6 work in flight.
+// Caching: an optional per-file result cache (deps.cache, persisted by db/sastCacheRepo.ts) keyed by
+// sha256(per-file prompt) + SAST_PROMPT_VERSION + the model id of the pass (deep or fast). The
+// per-file prompt embeds the file content, its local context and its hints, so an unchanged file in
+// an unchanged neighbourhood hits. Only VERIFIED issues are cached, as locations + the model's prose,
+// never code: on a hit the snippet is re-read from the (byte-identical) file. Degraded results are
+// never cached.
 
 import { createHash } from 'node:crypto';
 import { lstat, open } from 'node:fs/promises';
@@ -32,13 +39,14 @@ import type { Finding } from '@vibesec/shared';
 import type { IndexRepo } from '../../db/indexRepo';
 import { toAppError } from '../../errors/AppError';
 import type { Entrypoint, ImportEdge, IndexedFile } from '../../index/types';
-import type { BudgetTracker } from '../../llm/budget';
+import type { WorkLease } from '../../llm/budget';
+import { NO_LEASE, tokensForBytes, type BudgetLanes } from '../../llm/budgetLanes';
 import type { LlmClient, StructuredCall } from '../../llm/LlmClient';
 import type { MockResponder } from '../../llm/mockTransport';
 import { estimateTokens, untrustedFile, untrustedText } from '../../llm/prompt';
 import type { LlmRequest } from '../../llm/transport';
 import { verifyIssueLocation } from '../../findings/verify';
-import type { Analyzer, AnalyzerContext } from '../types';
+import type { Analyzer, AnalyzerContext, CoverageStatus } from '../types';
 import {
   SAST_PROMPT_VERSION, SAST_SYSTEM_PROMPT, SAST_TASK_MARKER, SastOutputSchema, type SastIssue, type SastOutput,
 } from './sastPrompt';
@@ -48,10 +56,11 @@ import type { FileTriage, RawCodeIssue } from './types';
 
 export { SAST_PROMPT_VERSION, SAST_TASK_MARKER } from './sastPrompt';
 
-const DEFAULT_MAX_FILES = 60;
 const DEFAULT_CONCURRENCY = 4;
-const BUDGET_RESTRICT_RATIO = 0.8;
 const MAX_FILE_BYTES = 256 * 1024;
+/** Projection of one file review: system + shared/local context + hints, and a typical reply. */
+const PROJECTED_OVERHEAD_TOKENS = 6_000;
+const PROJECTED_OUTPUT_TOKENS = 1_500;
 const NUL_PROBE_BYTES = 8_192;
 const CHARS_PER_TOKEN = 3.5; // matches estimateTokens()
 /** The target file is truncated beyond this (very large files are rare among triaged sources). */
@@ -63,9 +72,11 @@ const LOCAL_CONTEXT_MAX_SIGNATURES = 60;
 const MAX_ENTRYPOINTS_IN_CONTEXT = 80;
 const MAX_MANIFESTS = 10;
 const PRODUCED_BY = ['sast:llm'];
+const PRODUCED_BY_FAST = ['sast:llm-fast'];
 
 const SEVERITY_RANK: Record<RawCodeIssue['severity'], number> = { critical: 0, high: 1, medium: 2, low: 3, info: 4 };
 const LOWER_CONFIDENCE: Record<RawCodeIssue['confidence'], RawCodeIssue['confidence']> = { high: 'medium', medium: 'low', low: 'low' };
+const CAP_MEDIUM: Record<RawCodeIssue['confidence'], RawCodeIssue['confidence']> = { high: 'medium', medium: 'medium', low: 'low' };
 
 /** Supabase migrations and Firebase rules are not JS/TS/Python, so triage never sees them; they are
  *  reviewed anyway because "no RLS" / "allow read, write: if true" is a top vibe-coding failure. */
@@ -73,22 +84,26 @@ const POLICY_FILE_RE = /(^|\/)supabase\/migrations\/[^/]+\.sql$|(^|\/)(firestore
 
 // --- deps ----------------------------------------------------------------------------------------
 
-/** Per-file raw-issue cache (see header). Implementations must treat keys as opaque. */
+/** A verified issue as cached: its (relocated) location and the model's prose — no code snippet. */
+export type CachedSastIssue = Omit<SastIssue, 'snippet'>;
+
+/** Per-file verified-issue cache (see header). Implementations must treat keys as opaque. */
 export type SastResultCache = {
-  get(key: string): SastIssue[] | undefined;
-  set(key: string, issues: SastIssue[]): void;
+  get(key: string): CachedSastIssue[] | undefined;
+  set(key: string, issues: CachedSastIssue[]): void;
 };
+
+export type SastPass = 'deep' | 'fast';
 
 export type SastAnalyzerDeps = {
   llm: Pick<LlmClient, 'structured'>;
   triage: Pick<TriageService, 'forScan'>;
   indexRepo: Pick<IndexRepo, 'imports' | 'entrypoints'>;
-  /** Committed-spend ratio of the scan budget; at >= 0.8 only relevance-3 files are reviewed. */
-  budget?: Pick<BudgetTracker, 'ratio'>;
-  maxFiles?: number;
+  /** Budget lanes: the deep pass holds a tier-1 lease projecting its remaining cost (llm/budget.ts). */
+  lanes?: BudgetLanes;
   concurrency?: number;
-  /** Optional result cache; `model` (current deep-tier model id) is part of the key. */
-  cache?: { store: SastResultCache; model: () => string };
+  /** Optional result cache; `model(pass)` (current model id of that pass's tier) is part of the key. */
+  cache?: { store: SastResultCache; model: (pass: SastPass) => string };
 };
 
 // --- file reading ----------------------------------------------------------------------------
@@ -287,28 +302,81 @@ function toRaw(issue: SastIssue, degraded: boolean): RawCodeIssue {
   return raw;
 }
 
-/** Orders candidates: relevance-3 triaged files, then policy files (RLS/rules), then the rest. */
-function selectFiles(
-  ctx: AnalyzerContext, triaged: Map<string, FileTriage>, triageOrder: readonly string[], restrict: boolean,
-): string[] {
-  const usable = new Set(ctx.files.filter((f) => f.skipReason === null && !f.tags.includes('test') && !f.tags.includes('example')).map((f) => f.path));
-  const fromTriage = triageOrder.filter((p) => usable.has(p) && (!restrict || triaged.get(p)?.relevance === 3));
-  const top = fromTriage.filter((p) => triaged.get(p)?.relevance === 3);
-  const rest = fromTriage.filter((p) => triaged.get(p)?.relevance !== 3);
-  const policy = ctx.files
-    .filter((f: IndexedFile) => usable.has(f.path) && POLICY_FILE_RE.test(f.path) && !triaged.has(f.path))
+/** Verified issue → cache entry (location + prose; the snippet is re-read from the file on a hit). */
+function toCached(issue: RawCodeIssue): CachedSastIssue {
+  const cached: CachedSastIssue = {
+    ruleId: issue.ruleId as SastIssue['ruleId'], title: issue.title, severity: issue.severity as SastIssue['severity'],
+    confidence: issue.confidence, file: issue.file, startLine: issue.startLine, endLine: issue.endLine,
+    explanation: issue.explanation, impact: issue.impact, remediation: issue.remediation,
+  };
+  if (issue.cwe) cached.cwe = issue.cwe;
+  if (issue.patch) cached.patch = issue.patch;
+  return cached;
+}
+
+function fromCached(c: CachedSastIssue, content: string): RawCodeIssue | null {
+  const lines = content.split(/\r?\n/);
+  const snippet = lines.slice(c.startLine - 1, c.endLine).join('\n');
+  if (snippet.trim() === '') return null;
+  const raw: RawCodeIssue = {
+    ruleId: c.ruleId, title: c.title, severity: c.severity, confidence: c.confidence, file: c.file,
+    startLine: c.startLine, endLine: c.endLine, snippet, explanation: c.explanation, impact: c.impact, remediation: c.remediation,
+  };
+  if (c.cwe) raw.cwe = c.cwe;
+  if (c.patch) raw.patch = c.patch;
+  return raw;
+}
+
+type WorkItem = { path: string; pass: SastPass };
+
+/**
+ * Risk-ordered SAST plan over the whole repo (see header): deep = relevance-3 files, then
+ * Supabase/Firebase policy files, then the rest of the deep set; fast = relevance-1 files;
+ * notRelevant = relevance 0 and test/example files (with their reason recorded as coverage).
+ */
+function planFiles(
+  ctx: AnalyzerContext, triaged: Map<string, FileTriage>, entrypoints: ReadonlySet<string>,
+): { deep: string[]; fast: string[]; notRelevant: string[] } {
+  const indexed = ctx.files.filter((f) => f.skipReason === null);
+  const isTestish = (f: IndexedFile) => f.tags.includes('test') || f.tags.includes('example');
+  const usable = new Set(indexed.filter((f) => !isTestish(f)).map((f) => f.path));
+  const notRelevant: string[] = indexed.filter((f) => isTestish(f) && triaged.has(f.path)).map((f) => f.path);
+
+  const deepSet = new Set(selectForSast({ files: triaged, skipped: [], warnings: [] }, entrypoints).filter((p) => usable.has(p)));
+  const risk = (p: string): number[] => {
+    const t = triaged.get(p);
+    return [t?.relevance ?? 0, entrypoints.has(p) ? 1 : 0, t?.sinks.length ?? 0, t?.sources.length ?? 0];
+  };
+  const byRisk = (a: string, b: string): number => {
+    const ra = risk(a);
+    const rb = risk(b);
+    for (let i = 0; i < ra.length; i++) if (ra[i] !== rb[i]) return rb[i]! - ra[i]!;
+    return a < b ? -1 : a > b ? 1 : 0;
+  };
+  const ordered = [...deepSet].sort(byRisk);
+  const top = ordered.filter((p) => triaged.get(p)?.relevance === 3);
+  const rest = ordered.filter((p) => triaged.get(p)?.relevance !== 3);
+  const policy = indexed
+    .filter((f) => usable.has(f.path) && POLICY_FILE_RE.test(f.path) && !triaged.has(f.path))
     .map((f) => f.path)
     .sort();
-  return [...top, ...policy, ...rest];
+
+  const fast: string[] = [];
+  for (const [path, t] of triaged) {
+    if (!usable.has(path) || deepSet.has(path)) continue;
+    if (t.relevance >= 1) fast.push(path);
+    else notRelevant.push(path);
+  }
+  fast.sort(byRisk);
+  return { deep: [...top, ...policy, ...rest], fast, notRelevant: notRelevant.sort() };
 }
 
 export function createSastAnalyzer(deps: SastAnalyzerDeps): Analyzer {
-  const maxFiles = deps.maxFiles ?? DEFAULT_MAX_FILES;
   const concurrency = deps.concurrency ?? DEFAULT_CONCURRENCY;
 
   return {
     id: 'sast',
-    version: '1',
+    version: '2',
     category: 'sast',
 
     async run(ctx: AnalyzerContext): Promise<Finding[]> {
@@ -316,94 +384,139 @@ export function createSastAnalyzer(deps: SastAnalyzerDeps): Analyzer {
         if (ctx.signal.aborted) throw toAppError(ctx.signal.reason ?? new Error('aborted'));
       };
       checkAbort();
-
-      const triage = await deps.triage.forScan(ctx);
-      checkAbort();
-      const entrypoints = deps.indexRepo.entrypoints(ctx.scanId);
-      const imports = deps.indexRepo.imports(ctx.scanId);
-      const entrySet = new Set(entrypoints.map((e) => e.path));
-
-      const restrict = (deps.budget?.ratio(ctx.scanId) ?? 0) >= BUDGET_RESTRICT_RATIO;
-      if (restrict) ctx.warn('SAST_BUDGET_RESTRICTED', 'AI budget is mostly spent; the SAST review was limited to the most security-critical files');
-      const candidates = selectFiles(ctx, triage.files, selectForSast(triage, entrySet), restrict);
-      const selected = candidates.slice(0, maxFiles);
-      if (candidates.length > maxFiles) {
-        ctx.warn('SAST_FILE_LIMIT', `AI code review was limited to ${maxFiles} files; ${candidates.length - maxFiles} additional candidate file(s) were not reviewed`);
+      // Opened before the first await, so lower budget tiers wait until the deep pass declares its demand.
+      const lease = deps.lanes?.open(ctx.scanId) ?? NO_LEASE;
+      try {
+        return await review(ctx, checkAbort, lease);
+      } finally {
+        lease.close();
       }
-      if (selected.length === 0) return [];
-
-      const indexed = new Set(ctx.files.filter((f) => f.skipReason === null).map((f) => f.path));
-      const sharedContext = await buildSharedContext(ctx, entrypoints);
-      ctx.touch();
-
-      const byFingerprint = new Map<string, Finding>();
-      let dropped = 0;
-      let warnedPartial = false;
-      let budgetExhausted = false;
-      let done = 0;
-
-      await forEachLimit(selected, concurrency, async (path) => {
-        checkAbort();
-        if (budgetExhausted) return;
-        const content = await readRepoFile(ctx.repoDir, path);
-        if (content === null) return;
-        const prompt = buildPrompt(path, content, await buildLocalContext(ctx, path, imports, indexed), hintsFor(triage.files.get(path)));
-
-        let issues: SastIssue[];
-        let degraded = false;
-        const key = deps.cache ? cacheKey(prompt, deps.cache.model()) : null;
-        const cached = key ? deps.cache!.store.get(key) : undefined;
-        if (cached) {
-          issues = cached;
-        } else {
-          const call: StructuredCall<SastOutput> = {
-            scanId: ctx.scanId, analyzer: 'sast', purpose: 'sast-file', promptVersion: SAST_PROMPT_VERSION,
-            role: 'deep', effort: 'medium', system: SAST_SYSTEM_PROMPT, context: sharedContext, prompt,
-            schema: SastOutputSchema, signal: ctx.signal, onActivity: ctx.touch,
-          };
-          try {
-            const result = await deps.llm.structured(call);
-            issues = result.output.issues;
-            degraded = result.degraded;
-            if (key && !degraded) deps.cache!.store.set(key, issues);
-          } catch (raw) {
-            const err = toAppError(raw);
-            if (err.kind === 'cancelled' || ctx.signal.aborted) throw err;
-            if (err.kind === 'budget') {
-              if (!budgetExhausted) {
-                budgetExhausted = true;
-                ctx.warn('SAST_BUDGET_EXHAUSTED', 'The AI budget ran out during the SAST review; remaining files were not reviewed');
-              }
-              return;
-            }
-            if (!warnedPartial) {
-              warnedPartial = true;
-              ctx.warn('SAST_PARTIAL', 'AI code review failed for one or more files; those files have no SAST findings');
-            }
-            return;
-          } finally {
-            ctx.touch();
-          }
-        }
-
-        for (const issue of issues) {
-          if (issue.file !== path) { dropped++; continue; }
-          const outcome = verifyIssueLocation(toRaw(issue, degraded), content);
-          if (outcome.status === 'dropped') { dropped++; continue; }
-          const finding = issueToFinding(ctx, 'sast', outcome.issue, PRODUCED_BY);
-          const existing = byFingerprint.get(finding.fingerprint);
-          if (!existing || SEVERITY_RANK[finding.severity] < SEVERITY_RANK[existing.severity]) byFingerprint.set(finding.fingerprint, finding);
-        }
-        done++;
-        ctx.progress(`SAST: reviewed ${done}/${selected.length} files`);
-      });
-
-      if (dropped > 0) {
-        ctx.warn('SAST_UNVERIFIED_DROPPED', `${dropped} AI-reported issue(s) were dropped because the cited code could not be found in the reviewed file`);
-      }
-      return [...byFingerprint.values()];
     },
   };
+
+  async function review(ctx: AnalyzerContext, checkAbort: () => void, lease: WorkLease): Promise<Finding[]> {
+    const record = (path: string, status: CoverageStatus) => ctx.recordCoverage?.('sast', path, status);
+    const triage = await deps.triage.forScan(ctx);
+    checkAbort();
+    const entrypoints = deps.indexRepo.entrypoints(ctx.scanId);
+    const imports = deps.indexRepo.imports(ctx.scanId);
+    const entrySet = new Set(entrypoints.map((e) => e.path));
+
+    const plan = planFiles(ctx, triage.files, entrySet);
+    for (const p of plan.notRelevant) record(p, 'not-relevant');
+
+    // Tier-1 demand projection for the deep pass, shrinking as files finish (see llm/budget.ts).
+    const sizeOf = new Map(ctx.files.map((f) => [f.path, f.size]));
+    const projectedUsd = (path: string) => deps.lanes?.estimateUsd(
+      'deep', tokensForBytes(Math.min(sizeOf.get(path) ?? 0, MAX_FILE_BYTES)) + PROJECTED_OVERHEAD_TOKENS, PROJECTED_OUTPUT_TOKENS,
+    ) ?? 0;
+    let remainingUsd = plan.deep.reduce((sum, p) => sum + projectedUsd(p), 0);
+    let deepLeft = plan.deep.length;
+    if (deepLeft === 0) lease.close();
+    else lease.project(remainingUsd);
+    const deepDone = (path: string) => {
+      remainingUsd -= projectedUsd(path);
+      if (--deepLeft === 0) lease.close();
+      else lease.project(remainingUsd);
+    };
+
+    const work: WorkItem[] = [...plan.deep.map((path) => ({ path, pass: 'deep' as const })), ...plan.fast.map((path) => ({ path, pass: 'fast' as const }))];
+    if (work.length === 0) return [];
+
+    const indexed = new Set(ctx.files.filter((f) => f.skipReason === null).map((f) => f.path));
+    const sharedContext = await buildSharedContext(ctx, entrypoints);
+    ctx.touch();
+
+    const byFingerprint = new Map<string, Finding>();
+    let dropped = 0;
+    let warnedPartial = false;
+    const exhausted: Record<SastPass, boolean> = { deep: false, fast: false };
+    let done = 0;
+
+    const keep = (issue: RawCodeIssue, pass: SastPass) => {
+      const finding = issueToFinding(ctx, 'sast', issue, pass === 'deep' ? PRODUCED_BY : PRODUCED_BY_FAST);
+      const existing = byFingerprint.get(finding.fingerprint);
+      if (!existing || SEVERITY_RANK[finding.severity] < SEVERITY_RANK[existing.severity]) byFingerprint.set(finding.fingerprint, finding);
+    };
+
+    const reviewOne = async ({ path, pass }: WorkItem): Promise<void> => {
+      checkAbort();
+      const content = await readRepoFile(ctx.repoDir, path);
+      if (content === null) { record(path, 'failed'); return; }
+      const prompt = buildPrompt(path, content, await buildLocalContext(ctx, path, imports, indexed), hintsFor(triage.files.get(path)));
+
+      const key = deps.cache ? cacheKey(prompt, deps.cache.model(pass)) : null;
+      const cached = key ? deps.cache!.store.get(key) : undefined;
+      if (cached) {
+        for (const c of cached) {
+          const raw = fromCached(c, content);
+          const outcome = raw ? verifyIssueLocation(raw, content) : null; // re-clips exactly like the first run
+          if (outcome && outcome.status !== 'dropped') keep(outcome.issue, pass);
+        }
+        record(path, 'cached');
+        return;
+      }
+      if (exhausted[pass] || (pass === 'fast' && exhausted.deep)) { record(path, 'budget-skipped'); return; }
+
+      const call: StructuredCall<SastOutput> = {
+        scanId: ctx.scanId, analyzer: 'sast', purpose: pass === 'deep' ? 'sast-file' : 'sast-file-fast', promptVersion: SAST_PROMPT_VERSION,
+        role: pass, system: SAST_SYSTEM_PROMPT, context: sharedContext, prompt,
+        schema: SastOutputSchema, signal: ctx.signal, onActivity: ctx.touch,
+        ...(pass === 'deep' ? { effort: 'medium' as const } : { tier: 2 as const }),
+      };
+      let issues: SastIssue[];
+      let degraded = false;
+      try {
+        const result = await deps.llm.structured(call);
+        issues = result.output.issues;
+        degraded = result.degraded;
+      } catch (raw) {
+        const err = toAppError(raw);
+        if (err.kind === 'cancelled' || ctx.signal.aborted) throw err;
+        if (err.kind === 'budget') {
+          exhausted[pass] = true;
+          record(path, 'budget-skipped');
+          return;
+        }
+        record(path, 'failed');
+        if (!warnedPartial) {
+          warnedPartial = true;
+          ctx.warn('SAST_PARTIAL', 'AI code review failed for one or more files; those files have no SAST findings');
+        }
+        return;
+      } finally {
+        ctx.touch();
+      }
+
+      const verified: RawCodeIssue[] = [];
+      for (const issue of issues) {
+        if (issue.file !== path) { dropped++; continue; }
+        const raw = toRaw(issue, degraded);
+        if (pass === 'fast') raw.confidence = CAP_MEDIUM[raw.confidence];
+        const outcome = verifyIssueLocation(raw, content);
+        if (outcome.status === 'dropped') { dropped++; continue; }
+        verified.push(outcome.issue);
+        keep(outcome.issue, pass);
+      }
+      if (key && !degraded) deps.cache!.store.set(key, verified.map(toCached));
+      record(path, pass === 'deep' ? 'reviewed' : 'reviewed-fast');
+      done++;
+      ctx.progress(`SAST: reviewed ${done}/${work.length} files`);
+    };
+
+    await forEachLimit(work, concurrency, async (item) => {
+      try {
+        await reviewOne(item);
+      } finally {
+        if (item.pass === 'deep') deepDone(item.path);
+      }
+    });
+
+    if (dropped > 0) {
+      ctx.warn('SAST_UNVERIFIED_DROPPED', `${dropped} AI-reported issue(s) were dropped because the cited code could not be found in the reviewed file`);
+    }
+    return [...byFingerprint.values()];
+  }
 }
 
 // --- mock responder ------------------------------------------------------------------------------

@@ -34,6 +34,8 @@ export const ScanOptionsSchema = z.object({
   verifySecrets: z.boolean().default(false),
   historyDepth: z.number().int().min(0).max(500).default(50),
   categories: z.array(CategorySchema).min(1).default([...CATEGORIES]),
+  /** Per-scan AI budget in USD (defaults to the server's SCAN_BUDGET_USD). Part of the options hash. */
+  budgetUsd: z.number().min(0.5).max(100).optional(),
 });
 export type ScanOptions = z.infer<typeof ScanOptionsSchema>;
 

@@ -236,19 +236,26 @@ describe('taint analyzer', () => {
     expect(warnings).toEqual([{ code: 'TAINT_UNVERIFIED_DROPPED', message: expect.stringContaining('2 reported taint flow(s)') }]);
   });
 
-  it('caps entrypoints by triage relevance / sources and warns', async () => {
+  it('traces every entrypoint with sources (no cap), risk first, recording coverage and a shrinking budget projection', async () => {
     const { llm, seen, scanId } = llmSetup([script([mockText('Nothing to report.')])]);
-    const eps: Entrypoint[] = ['src/route.ts', 'src/a.ts', 'src/b.ts'].map((path) => ({ path, kind: 'http-route', line: 1, detail: null }));
+    const eps: Entrypoint[] = ['src/route.ts', 'src/a.ts', 'src/b.ts', 'src/db.ts'].map((path) => ({ path, kind: 'http-route', line: 1, detail: null }));
     const triage = triageOf([
       { path: 'src/b.ts', relevance: 2, sources: ['req.body.b (line 1)'] },
       { path: 'src/a.ts', relevance: 2, sources: ['req.body.a (line 1)', 'req.query (line 1)'] },
       { path: 'src/route.ts', relevance: 3 },
+      { path: 'src/db.ts', relevance: 3, sources: [] },
     ]);
     const { ctx, warnings } = makeCtx(scanId);
-    await analyzer(llm, { triage, maxEntrypoints: 2, concurrency: 1, indexRepo: { imports: () => imports, entrypoints: () => eps } }).run(ctx);
+    const coverage = new Map<string, string>();
+    ctx.recordCoverage = (a, path, status) => { expect(a).toBe('taint'); coverage.set(path, status); };
+    const projections: number[] = [];
+    const lanes = { open: () => ({ project: (usd: number) => { projections.push(usd); }, close: () => {} }), estimateUsd: () => 1 };
+    await analyzer(llm, { triage, lanes, concurrency: 1, indexRepo: { imports: () => imports, entrypoints: () => eps } }).run(ctx);
     const traced = seen.map((r) => (r.messages[0]!.content as Anthropic.TextBlockParam[])[0]!.text.match(/^Entrypoint: (.+)$/m)![1]);
-    expect(traced).toEqual(['src/route.ts', 'src/a.ts']);
-    expect(warnings.map((w) => w.code)).toEqual(['TAINT_ENTRYPOINT_LIMIT']);
+    expect(traced).toEqual(['src/route.ts', 'src/a.ts', 'src/b.ts']);
+    expect(warnings).toEqual([]);
+    expect(Object.fromEntries(coverage)).toEqual({ 'src/route.ts': 'reviewed', 'src/a.ts': 'reviewed', 'src/b.ts': 'reviewed', 'src/db.ts': 'not-relevant' });
+    expect(projections).toEqual([3, 2, 1, 0]);
   });
 
   it('keeps partial results when the agent hits max_turns', async () => {

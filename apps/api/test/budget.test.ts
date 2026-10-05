@@ -147,3 +147,83 @@ describe('BudgetTracker.reserve', () => {
     expect(b.spentUsd('s1')).toBeCloseTo(0.3, 9);
   });
 });
+
+describe('BudgetTracker per-scan limits', () => {
+  it('uses the per-scan limit when loadLimit returns one, else the default', () => {
+    const b = new BudgetTracker(10, () => 0, (id) => (id === 'small' ? 0.5 : undefined));
+    expect(b.limitFor('small')).toBe(0.5);
+    expect(b.limitFor('other')).toBe(10);
+    b.add('small', 0.25);
+    expect(b.ratio('small')).toBeCloseTo(0.5, 9);
+    b.add('small', 0.25);
+    expect(() => b.ensureAvailable('small')).toThrow(expect.objectContaining({ code: 'BUDGET_EXHAUSTED' }));
+    expect(() => b.ensureAvailable('other')).not.toThrow();
+  });
+});
+
+describe('BudgetTracker lanes (risk-first tiers)', () => {
+  const budgetError = expect.objectContaining({ code: 'BUDGET_EXHAUSTED', kind: 'budget' });
+  const state = async <T>(p: Promise<T>): Promise<'pending' | 'resolved' | 'rejected'> => {
+    let s: 'pending' | 'resolved' | 'rejected' = 'pending';
+    p.then(() => { s = 'resolved'; }, () => { s = 'rejected'; });
+    await new Promise((r) => setTimeout(r, 5));
+    return s;
+  };
+
+  it('caps tier 2 at 70% and tier 3 at 50% of the scan budget', async () => {
+    const b = new BudgetTracker(1, () => 0.45);
+    await expect(b.reserve('s1', 0.1, undefined, 3)).rejects.toEqual(budgetError); // 0.55 > 0.5
+    await expect(b.reserve('s1', 0.04, undefined, 3)).resolves.toBeTypeOf('function'); // 0.49
+    const settle = await b.reserve('s1', 0.2, undefined, 2); // 0.45 + 0.04 + 0.2 = 0.69
+    settle(0.2);
+    await expect(b.reserve('s1', 0.1, undefined, 2)).rejects.toEqual(budgetError);
+    await expect(b.reserve('s1', 0.2, undefined, 1)).resolves.toBeTypeOf('function'); // tier 1 keeps the rest
+    expect(() => b.ensureAvailable('s1', 3)).toThrow(budgetError);
+    expect(() => b.ensureAvailable('s1', 1)).not.toThrow();
+  });
+
+  it('lower tiers wait while tier-1 work is open and undeclared, then spend only what tier 1 does not project', async () => {
+    const b = new BudgetTracker(1, () => 0);
+    const lease = b.openWork('s1');
+    const quality = b.reserve('s1', 0.1, undefined, 3);
+    expect(await state(quality)).toBe('pending'); // projection unknown yet
+    lease.project(0.35); // 0.35 + 0.1 <= 0.5 → fits
+    expect(await state(quality)).toBe('resolved');
+    lease.project(0.45);
+    const blocked = b.reserve('s1', 0.1, undefined, 3); // 0.1 in flight + 0.45 + 0.1 > 0.5
+    expect(await state(blocked)).toBe('pending');
+    lease.close(); // tier-1 done: only committed + in flight count now
+    expect(await state(blocked)).toBe('resolved');
+  });
+
+  it('a lower tier whose lane cannot fit once tier-1 work closes is refused, never starving tier 1', async () => {
+    const b = new BudgetTracker(1, () => 0);
+    const lease = b.openWork('s1');
+    lease.project(0.9);
+    const fast = b.reserve('s1', 0.05, undefined, 2);
+    expect(await state(fast)).toBe('pending');
+    const deep = await b.reserve('s1', 0.3, undefined, 1); // tier 1 is never gated by leases
+    deep(0.75);
+    lease.close();
+    await expect(fast).rejects.toEqual(budgetError); // 0.75 committed + 0.05 > 0.7
+  });
+
+  it('once tier 1 is refused, every lower-tier waiter and caller is refused too', async () => {
+    const b = new BudgetTracker(1, () => 0.3);
+    const lease = b.openWork('s1');
+    lease.project(0.25);
+    const waiting = b.reserve('s1', 0.01, undefined, 3);
+    expect(await state(waiting)).toBe('pending'); // 0.3 + 0.25 + 0.01 > 0.5
+    await expect(b.reserve('s1', 0.8, undefined, 1)).rejects.toEqual(budgetError);
+    await expect(waiting).rejects.toEqual(budgetError);
+    lease.close();
+    await expect(b.reserve('s1', 0.001, undefined, 2)).rejects.toEqual(budgetError);
+  });
+
+  it('forget drops leases and the tier-1 refusal', async () => {
+    const b = new BudgetTracker(1, () => 0);
+    b.openWork('s1');
+    b.forget('s1');
+    await expect(b.reserve('s1', 0.1, undefined, 3)).resolves.toBeTypeOf('function');
+  });
+});

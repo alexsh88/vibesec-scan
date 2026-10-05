@@ -3,6 +3,10 @@
 // always writes the findings (quality is not security-critical, so there is no fail-open emission of
 // raw metrics as findings; a file whose AI review fails simply produces no quality findings).
 //
+// Coverage: EVERY JS/TS/Python file is reviewed (Haiku), worst metrics first, in budget tier 3 — the
+// lowest priority (llm/budget.ts): quality only spends what security work does not project to need,
+// and files the budget could not cover are recorded as 'budget-skipped' coverage, never silently.
+//
 // Pattern follows triage.ts / credentials/fpFilter.ts: bounded-concurrency safe reads confined to
 // repoDir, an injection-safe untrusted wrapper per file, verification before a Finding is ever built,
 // and a deterministic mock responder keyed by a task marker in the system prompt.
@@ -19,7 +23,7 @@ import type { MockResponder } from '../../../llm/mockTransport';
 import { untrustedFile } from '../../../llm/prompt';
 import type { LlmRequest } from '../../../llm/transport';
 import type { IndexedFile, Language } from '../../../index/types';
-import type { Analyzer, AnalyzerContext } from '../../types';
+import type { Analyzer, AnalyzerContext, CoverageStatus } from '../../types';
 import { issueToFinding } from '../toFinding';
 import type { RawCodeIssue } from '../types';
 import {
@@ -32,7 +36,6 @@ export const QUALITY_PROMPT_VERSION = 'quality-v1';
 /** Appears verbatim in the system prompt; `qualityMockResponder` keys on it. */
 export const QUALITY_TASK_MARKER = 'Task: code-quality-review';
 
-const DEFAULT_MAX_FILES = 12;
 const MAX_FILE_BYTES = 200 * 1024;
 const READ_CONCURRENCY = 16;
 const REVIEW_CONCURRENCY = 4;
@@ -204,14 +207,12 @@ function normalizeRuleId(ruleId: string): string {
 
 export type QualityAnalyzerDeps = {
   llm: Pick<LlmClient, 'structured'>;
-  /** Top N files (by rankFilesForQualityReview) actually sent to the model. Default 12. */
-  maxFiles?: number;
 };
 
 export function createQualityAnalyzer(deps: QualityAnalyzerDeps): Analyzer {
   return {
     id: 'quality',
-    version: '1',
+    version: '2',
     category: 'quality',
 
     async run(ctx: AnalyzerContext): Promise<Finding[]> {
@@ -220,7 +221,7 @@ export function createQualityAnalyzer(deps: QualityAnalyzerDeps): Analyzer {
       };
       checkAbort();
 
-      const maxFiles = deps.maxFiles ?? DEFAULT_MAX_FILES;
+      const record = (path: string, status: CoverageStatus) => ctx.recordCoverage?.('quality', path, status);
 
       const candidates = ctx.files.filter((f: IndexedFile) => f.skipReason === null && LANG_MAP[f.language] !== undefined);
       const contentOf = new Map<string, string>();
@@ -249,7 +250,9 @@ export function createQualityAnalyzer(deps: QualityAnalyzerDeps): Analyzer {
 
       const metricsByPath = new Map(metrics.map((m) => [m.path, m]));
       const textByPath = new Map(withLang.map((f) => [f.path, f.text]));
-      const selected = rankFilesForQualityReview(metrics).slice(0, Math.max(0, maxFiles));
+      for (const f of candidates) if (!contentOf.has(f.path)) record(f.path, 'failed');
+      const selected = rankFilesForQualityReview(metrics);
+      let budgetExhausted = false;
 
       const findings: Finding[] = [];
       let warnedPartial = false;
@@ -259,11 +262,12 @@ export function createQualityAnalyzer(deps: QualityAnalyzerDeps): Analyzer {
         const m = metricsByPath.get(path);
         const text = textByPath.get(path);
         if (!m || text === undefined) return;
+        if (budgetExhausted) { record(path, 'budget-skipped'); return; }
 
         const prompt = `${untrustedFile(path, numberLines(text))}\n\n${buildFacts(m, duplicatesByPath.get(path) ?? [])}`;
         const call: StructuredCall<QualityOutput> = {
           scanId: ctx.scanId, analyzer: 'quality', purpose: 'quality-review', promptVersion: QUALITY_PROMPT_VERSION,
-          role: 'fast', system: SYSTEM_PROMPT, prompt, schema: QualityOutputSchema,
+          role: 'fast', tier: 3, system: SYSTEM_PROMPT, prompt, schema: QualityOutputSchema,
           signal: ctx.signal, onActivity: ctx.touch,
         };
 
@@ -287,9 +291,16 @@ export function createQualityAnalyzer(deps: QualityAnalyzerDeps): Analyzer {
             if (outcome.status === 'dropped') continue;
             findings.push(issueToFinding(ctx, 'quality', outcome.issue, ['quality:llm']));
           }
+          record(path, 'reviewed');
         } catch (rawErr) {
           const err = toAppError(rawErr);
           if (err.kind === 'cancelled' || ctx.signal.aborted) throw err;
+          if (err.kind === 'budget') {
+            budgetExhausted = true;
+            record(path, 'budget-skipped');
+            return;
+          }
+          record(path, 'failed');
           // Quality is not security-critical: a file whose AI review fails produces NO findings,
           // only a once-per-run warning (unlike config's fail-open, which keeps low-confidence hints).
           if (!warnedPartial) {

@@ -6,6 +6,11 @@
 // (verifyTrace); a flow whose source or sink cannot be confirmed is dropped. Surviving flows become
 // one finding at the SINK location carrying the full verified source→sink trace (shown in the UI).
 //
+// Every entrypoint with an untrusted source is traced (no count cap), highest risk first (triage
+// relevance, then number of sources), under the scan's dollar budget: the analyzer holds a tier-1
+// budget lease projecting the cost of the agents still to run (llm/budget.ts). Entrypoints the budget
+// could not cover are recorded as 'budget-skipped' coverage, never dropped silently.
+//
 // Fail-open per entrypoint (one failing agent never sinks the analyzer), partial results on
 // max_turns / timeout / budget, cancellation always propagates.
 
@@ -20,28 +25,33 @@ import type { Entrypoint, ImportEdge, IndexedFile } from '../../index/types';
 import { defineTool, type AgentResult, type AgentStopReason, type LlmClient } from '../../llm/LlmClient';
 import { mockText, mockToolUse, mockToolUses, type MockResponder } from '../../llm/mockTransport';
 import type { LlmRequest } from '../../llm/transport';
-import type { Analyzer, AnalyzerContext } from '../types';
+import type { WorkLease } from '../../llm/budget';
+import { NO_LEASE, type BudgetLanes } from '../../llm/budgetLanes';
+import type { Analyzer, AnalyzerContext, CoverageStatus } from '../types';
 import { createRepoTools, normalizeRepoPath, ReportFlowInput } from './repoTools';
 import { buildSeedPrompt, SEED_LINES, TAINT_PROMPT_VERSION, TAINT_SYSTEM_PROMPT, TAINT_TASK_MARKER } from './taintPrompt';
 import { issueToFinding } from './toFinding';
 import { selectForTaint, type TriageService } from './triage';
-import type { RawCodeIssue, TraceStep } from './types';
+import type { FileTriage, RawCodeIssue, TraceStep } from './types';
 
 export { TAINT_PROMPT_VERSION, TAINT_TASK_MARKER } from './taintPrompt';
 
-const DEFAULT_MAX_ENTRYPOINTS = 12;
 const DEFAULT_CONCURRENCY = 2;
 const DEFAULT_MAX_TURNS = 25;
 const DEFAULT_WALL_CLOCK_MS = 300_000;
 const MAX_VERIFY_FILE_BYTES = 1024 * 1024;
 const NUL_PROBE_BYTES = 8_000;
+/** Projected cost of one entrypoint agent: ~10 turns over a growing transcript (input mostly cache reads). */
+const PROJECTED_AGENT_INPUT_TOKENS = 60_000;
+const PROJECTED_AGENT_OUTPUT_TOKENS = 6_000;
 const UNREADABLE: ReadonlySet<IndexedFile['skipReason']> = new Set(['binary', 'symlink', 'submodule']);
 
 export type TaintAnalyzerDeps = {
   llm: Pick<LlmClient, 'agent'>;
   triage: Pick<TriageService, 'forScan'>;
   indexRepo: Pick<IndexRepo, 'imports' | 'entrypoints'>;
-  maxEntrypoints?: number;
+  /** Budget lanes: a tier-1 lease projecting the cost of the remaining agents (llm/budget.ts). */
+  lanes?: BudgetLanes;
   concurrency?: number;
   maxTurns?: number;
   wallClockMs?: number;
@@ -53,18 +63,26 @@ type VerifiedFlow = { flow: Flow; trace: TraceStep[]; ruleId: string; sink: Trac
 export function createTaintAnalyzer(deps: TaintAnalyzerDeps): Analyzer {
   return {
     id: 'taint',
-    version: '1',
+    version: '2',
     category: 'taint',
-    run: (ctx) => runTaint(deps, ctx),
+    run: async (ctx) => {
+      if (ctx.signal.aborted) throw new AppError('CANCELLED', 'cancelled', 'Operation was cancelled');
+      const lease = deps.lanes?.open(ctx.scanId) ?? NO_LEASE; // before the first await (see SAST)
+      try {
+        return await runTaint(deps, ctx, lease);
+      } finally {
+        lease.close();
+      }
+    },
   };
 }
 
-async function runTaint(deps: TaintAnalyzerDeps, ctx: AnalyzerContext): Promise<Finding[]> {
+async function runTaint(deps: TaintAnalyzerDeps, ctx: AnalyzerContext, lease: WorkLease): Promise<Finding[]> {
   const checkAbort = () => {
     if (ctx.signal.aborted) throw new AppError('CANCELLED', 'cancelled', 'Operation was cancelled');
   };
   checkAbort();
-  const maxEntrypoints = deps.maxEntrypoints ?? DEFAULT_MAX_ENTRYPOINTS;
+  const record = (path: string, status: CoverageStatus) => ctx.recordCoverage?.('taint', path, status);
 
   // 1. Entrypoints worth tracing, ranked by triage relevance then number of sources.
   const entrypoints = deps.indexRepo.entrypoints(ctx.scanId);
@@ -79,11 +97,16 @@ async function runTaint(deps: TaintAnalyzerDeps, ctx: AnalyzerContext): Promise<
   const ranked = selectForTaint(triage, new Set(kindsOf.keys()))
     .map((path) => triage.files.get(path)!)
     .sort((a, b) => b.relevance - a.relevance || b.sources.length - a.sources.length || (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
-  if (ranked.length === 0) return [];
-  const selected = ranked.slice(0, maxEntrypoints);
-  if (ranked.length > maxEntrypoints) {
-    ctx.warn('TAINT_ENTRYPOINT_LIMIT', `Taint tracing was limited to ${maxEntrypoints} entrypoints; ${ranked.length - maxEntrypoints} lower-priority entrypoint(s) were not traced`);
+  const rankedPaths = new Set(ranked.map((f) => f.path));
+  for (const path of [...kindsOf.keys()].sort()) if (!rankedPaths.has(path)) record(path, 'not-relevant'); // no untrusted source seen
+  const perAgentUsd = deps.lanes?.estimateUsd('deep', PROJECTED_AGENT_INPUT_TOKENS, PROJECTED_AGENT_OUTPUT_TOKENS) ?? 0;
+  let agentsLeft = ranked.length;
+  if (agentsLeft === 0) {
+    lease.close();
+    return [];
   }
+  lease.project(agentsLeft * perAgentUsd);
+  const selected = ranked;
 
   // 2. One agent per entrypoint (bounded concurrency), sharing one set of confined repo tools (and its file cache).
   const imports: ImportEdge[] = deps.indexRepo.imports(ctx.scanId);
@@ -103,10 +126,19 @@ async function runTaint(deps: TaintAnalyzerDeps, ctx: AnalyzerContext): Promise<
   let budgetExhausted = false;
 
   await forEachLimit(selected, deps.concurrency ?? DEFAULT_CONCURRENCY, async (file) => {
+    try {
+      await traceOne(file);
+    } finally {
+      agentsLeft--;
+      lease.project(agentsLeft * perAgentUsd);
+    }
+  });
+
+  async function traceOne(file: FileTriage): Promise<void> {
     checkAbort();
-    if (budgetExhausted) return;
+    if (budgetExhausted) { record(file.path, 'budget-skipped'); return; }
     const text = await reader.read(file.path);
-    if (text === null) return;
+    if (text === null) { record(file.path, 'failed'); return; }
     const lines = toLines(text);
     const prompt = buildSeedPrompt({
       entrypoint: file.path, kinds: kindsOf.get(file.path) ?? [], sources: file.sources, sinks: file.sinks,
@@ -123,8 +155,13 @@ async function runTaint(deps: TaintAnalyzerDeps, ctx: AnalyzerContext): Promise<
     } catch (raw) {
       const err = toAppError(raw);
       if (err.kind === 'cancelled' || ctx.signal.aborted) throw err;
-      if (err.kind === 'budget') budgetExhausted = true;
+      if (err.kind === 'budget') {
+        budgetExhausted = true;
+        record(file.path, 'budget-skipped');
+        return;
+      }
       failed++;
+      record(file.path, 'failed');
       ctx.progress(`Taint agent failed for ${file.path}: ${err.userMessage}`);
       return;
     }
@@ -135,8 +172,10 @@ async function runTaint(deps: TaintAnalyzerDeps, ctx: AnalyzerContext): Promise<
       partialReasons.add(result.stopReason);
       ctx.warn('TAINT_PARTIAL', `Taint tracing of ${file.path} stopped early (${result.stopReason}); results for it may be incomplete`);
     }
+    // An agent stopped by the budget before its first turn traced nothing: that is a budget skip.
+    record(file.path, result.stopReason === 'budget' && result.turns === 0 ? 'budget-skipped' : 'reviewed');
     ctx.progress(`Taint agent traced ${file.path}: ${result.finished.length} flow(s) in ${result.turns} turn(s)`);
-  });
+  }
   checkAbort();
   if (failed > 0) {
     ctx.warn('TAINT_ENTRYPOINT_FAILED', `Taint tracing failed for ${failed} entrypoint(s); other entrypoints were still analyzed`);

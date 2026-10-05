@@ -3,10 +3,10 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { FindingSchema, ScanOptionsSchema, type ScanDto } from '@vibesec/shared';
-import { createSastAnalyzer, sastMockResponder, SAST_PROMPT_VERSION, SAST_TASK_MARKER, type SastResultCache } from '../src/analyzers/code/sast';
+import { createSastAnalyzer, sastMockResponder, SAST_PROMPT_VERSION, SAST_TASK_MARKER, type CachedSastIssue, type SastResultCache } from '../src/analyzers/code/sast';
 import { SAST_SYSTEM_PROMPT, SastOutputSchema, type SastIssue, type SastOutput } from '../src/analyzers/code/sastPrompt';
 import type { FileTriage, TriageResult } from '../src/analyzers/code/types';
-import type { AnalyzerContext } from '../src/analyzers/types';
+import type { AnalyzerContext, CoverageStatus } from '../src/analyzers/types';
 import { LlmCallRepo } from '../src/db/llmCallRepo';
 import { ScanRepo } from '../src/db/scanRepo';
 import { AppError } from '../src/errors/AppError';
@@ -42,7 +42,7 @@ async function writeFiles(files: Record<string, string>, tags: Record<string, In
   return indexed;
 }
 
-function makeCtx(files: IndexedFile[], opts: { warn?: (code: string, message: string) => void; signal?: AbortSignal; scanId?: string } = {}): AnalyzerContext {
+function makeCtx(files: IndexedFile[], opts: { warn?: (code: string, message: string) => void; signal?: AbortSignal; scanId?: string; coverage?: Map<string, CoverageStatus> } = {}): AnalyzerContext {
   const scan: ScanDto = {
     id: opts.scanId ?? 'scan-1', repo: { id: 'repo-1', owner: 'acme', name: 'app', isPrivate: false }, ref: null,
     commitSha: 'c'.repeat(40), state: 'ANALYZING', errorCode: null, errorMessage: null, cacheHit: 'none',
@@ -52,6 +52,7 @@ function makeCtx(files: IndexedFile[], opts: { warn?: (code: string, message: st
   return {
     scanId: scan.id, scan, repoDir: dir, commitSha: scan.commitSha!, repo: scan.repo, files,
     signal: opts.signal ?? new AbortController().signal, touch: () => {}, warn: opts.warn ?? (() => {}), progress: () => {},
+    recordCoverage: (analyzer, path, status) => { expect(analyzer).toBe('sast'); opts.coverage?.set(path, status); },
   };
 }
 
@@ -115,9 +116,16 @@ describe('SAST analyzer — file selection', () => {
       triage: triageOf(tri('src/a.ts', 3), tri('src/b.ts', 2), tri('src/c.ts', 1), tri('src/d.ts', 0), tri('src/e.ts', 1, { sinks: ['eval (line 1)'] }), tri('src/f.ts', 1), tri('test/t.ts', 3)),
       indexRepo: indexRepoOf([{ path: 'src/f.ts', kind: 'http-route', line: 1, detail: 'GET /f' }]),
     });
-    expect(analyzer).toMatchObject({ id: 'sast', version: '1', category: 'sast' });
-    await analyzer.run(makeCtx(files));
-    expect(calls.map(targetOf).sort()).toEqual(['src/a.ts', 'src/b.ts', 'src/e.ts', 'src/f.ts']);
+    expect(analyzer).toMatchObject({ id: 'sast', version: '2', category: 'sast' });
+    const coverage = new Map<string, CoverageStatus>();
+    await analyzer.run(makeCtx(files, { coverage }));
+    expect(calls.filter((c) => c.role === 'deep').map(targetOf).sort()).toEqual(['src/a.ts', 'src/b.ts', 'src/e.ts', 'src/f.ts']);
+    // Relevance 1 → the cheaper fast pass (tier 2); relevance 0 and test files → not reviewed, but recorded.
+    expect(calls.filter((c) => c.role === 'fast').map(targetOf)).toEqual(['src/c.ts']);
+    expect(Object.fromEntries(coverage)).toEqual({
+      'src/a.ts': 'reviewed', 'src/b.ts': 'reviewed', 'src/e.ts': 'reviewed', 'src/f.ts': 'reviewed',
+      'src/c.ts': 'reviewed-fast', 'src/d.ts': 'not-relevant', 'test/t.ts': 'not-relevant',
+    });
   });
 
   it('also reviews Supabase migrations and Firebase rules (never triaged)', async () => {
@@ -127,25 +135,47 @@ describe('SAST analyzer — file selection', () => {
     expect(calls.map(targetOf).sort()).toEqual(['firestore.rules', 'supabase/migrations/001_init.sql']);
   });
 
-  it('caps at maxFiles (highest relevance first) and warns SAST_FILE_LIMIT with the count', async () => {
-    const files = await writeFiles({ 'a.ts': 'a', 'b.ts': 'b', 'c.ts': 'c', 'd.ts': 'd' });
+  it('has no file cap: reviews every candidate in risk order, deep pass before the fast pass', async () => {
+    const paths = Array.from({ length: 70 }, (_, i) => `f${String(i).padStart(2, '0')}.ts`);
+    const files = await writeFiles({ ...Object.fromEntries(paths.map((p) => [p, p])), 'ep.ts': 'e', 'low.ts': 'l' });
     const { llm, calls } = stubLlm(async () => ok([]));
-    const warnings: Array<[string, string]> = [];
-    await createSastAnalyzer({ llm, maxFiles: 2, triage: triageOf(tri('a.ts', 2), tri('b.ts', 3), tri('c.ts', 2), tri('d.ts', 3)), indexRepo: indexRepoOf() })
-      .run(makeCtx(files, { warn: (c, m) => warnings.push([c, m]) }));
-    expect(calls.map(targetOf).sort()).toEqual(['b.ts', 'd.ts']);
-    const w = warnings.find(([c]) => c === 'SAST_FILE_LIMIT');
-    expect(w?.[1]).toMatch(/2 additional/);
+    const triaged = [...paths.map((p, i) => tri(p, i % 2 === 0 ? 3 : 2, { sinks: i === 1 ? ['exec (line 1)', 'eval (line 2)'] : [] })), tri('ep.ts', 2), tri('low.ts', 1)];
+    const warnings: string[] = [];
+    await createSastAnalyzer({
+      llm, concurrency: 1, triage: triageOf(...triaged),
+      indexRepo: indexRepoOf([{ path: 'ep.ts', kind: 'http-route', line: 1, detail: 'GET /' }]),
+    }).run(makeCtx(files, { warn: (c) => warnings.push(c) }));
+    const order = calls.map(targetOf);
+    expect(order).toHaveLength(72);
+    expect(warnings).toEqual([]);
+    expect(order.slice(0, 35).every((p) => paths.indexOf(p) % 2 === 0)).toBe(true); // relevance 3 first
+    expect(order[35]).toBe('ep.ts'); // then relevance 2, entrypoints first…
+    expect(order[36]).toBe('f01.ts'); // …then by number of sinks
+    expect(order.at(-1)).toBe('low.ts');
+    expect(calls.at(-1)).toMatchObject({ role: 'fast', tier: 2, purpose: 'sast-file-fast' });
   });
 
-  it('restricts to relevance 3 when >= 80% of the budget is spent', async () => {
-    const files = await writeFiles({ 'a.ts': 'a', 'b.ts': 'b' });
-    const { llm, calls } = stubLlm(async () => ok([]));
-    const warnings: string[] = [];
-    await createSastAnalyzer({ llm, budget: { ratio: () => 0.85 }, triage: triageOf(tri('a.ts', 3), tri('b.ts', 2)), indexRepo: indexRepoOf() })
-      .run(makeCtx(files, { warn: (c) => warnings.push(c) }));
-    expect(calls.map(targetOf)).toEqual(['a.ts']);
-    expect(warnings).toContain('SAST_BUDGET_RESTRICTED');
+  it('fast-pass findings are marked sast:llm-fast with confidence capped at medium', async () => {
+    const files = await writeFiles({ 'src/route.ts': ROUTE });
+    const { llm } = stubLlm(async () => ok([issue('src/route.ts', { confidence: 'high' })]));
+    const [finding] = await createSastAnalyzer({ llm, triage: triageOf(tri('src/route.ts', 1)), indexRepo: indexRepoOf() }).run(makeCtx(files));
+    expect(finding).toMatchObject({ producedBy: ['sast:llm-fast'], confidence: 'medium' });
+  });
+
+  it('holds a tier-1 budget lease for the deep pass, projecting its remaining cost until it is done', async () => {
+    const files = await writeFiles({ 'a.ts': 'a'.repeat(3_500), 'b.ts': 'b', 'c.ts': 'c' });
+    const projections: number[] = [];
+    let closed = 0;
+    const lanes = {
+      open: () => ({ project: (usd: number) => { projections.push(usd); }, close: () => { closed++; } }),
+      estimateUsd: (_role: string, input: number, output: number) => (input + output) / 1_000_000,
+    };
+    const { llm } = stubLlm(async () => ok([]));
+    await createSastAnalyzer({ llm, lanes, concurrency: 1, triage: triageOf(tri('a.ts', 3), tri('b.ts', 2), tri('c.ts', 1)), indexRepo: indexRepoOf() })
+      .run(makeCtx(files));
+    expect(projections[0]).toBeCloseTo((1_000 + 6_000 + 1_500 + 1 + 6_000 + 1_500) / 1_000_000, 9);
+    expect(projections[1]).toBeCloseTo((1 + 6_000 + 1_500) / 1_000_000, 9);
+    expect(closed).toBeGreaterThanOrEqual(1);
   });
 });
 
@@ -254,15 +284,17 @@ describe('SAST analyzer — resilience', () => {
     expect(warnings.filter((w) => w === 'SAST_PARTIAL')).toHaveLength(1);
   });
 
-  it('stops scheduling files once the budget is exhausted', async () => {
-    const files = await writeFiles({ 'a.ts': ROUTE, 'b.ts': ROUTE, 'c.ts': ROUTE });
+  it('stops calling once the budget is exhausted and records every remaining file as budget-skipped', async () => {
+    const files = await writeFiles({ 'a.ts': ROUTE, 'b.ts': ROUTE, 'c.ts': ROUTE, 'd.ts': ROUTE });
     const { llm, calls } = stubLlm(async () => { throw new AppError('BUDGET_EXHAUSTED', 'budget', 'out'); });
     const warnings: string[] = [];
-    const findings = await createSastAnalyzer({ llm, concurrency: 1, triage: triageOf(tri('a.ts', 3), tri('b.ts', 3), tri('c.ts', 3)), indexRepo: indexRepoOf() })
-      .run(makeCtx(files, { warn: (c) => warnings.push(c) }));
+    const coverage = new Map<string, CoverageStatus>();
+    const findings = await createSastAnalyzer({ llm, concurrency: 1, triage: triageOf(tri('a.ts', 3), tri('b.ts', 3), tri('c.ts', 3), tri('d.ts', 1)), indexRepo: indexRepoOf() })
+      .run(makeCtx(files, { warn: (c) => warnings.push(c), coverage }));
     expect(findings).toEqual([]);
     expect(calls).toHaveLength(1);
-    expect(warnings).toEqual(['SAST_BUDGET_EXHAUSTED']);
+    expect(warnings).toEqual([]); // the pipeline reports BUDGET_COVERAGE_PARTIAL from the coverage instead
+    expect(Object.fromEntries(coverage)).toEqual({ 'a.ts': 'budget-skipped', 'b.ts': 'budget-skipped', 'c.ts': 'budget-skipped', 'd.ts': 'budget-skipped' });
   });
 
   it('propagates cancellation from the LLM and stops other workers', async () => {
@@ -289,15 +321,20 @@ describe('SAST analyzer — resilience', () => {
 
   it('serves an unchanged file from the result cache without an LLM call', async () => {
     const files = await writeFiles({ 'src/route.ts': ROUTE });
-    const map = new Map<string, SastIssue[]>();
+    const map = new Map<string, CachedSastIssue[]>();
     const store: SastResultCache = { get: (k) => map.get(k), set: (k, v) => void map.set(k, v) };
     const { llm, calls } = stubLlm(async () => ok([issue('src/route.ts')]));
-    const deps = { llm, cache: { store, model: () => 'claude-sonnet-5' }, triage: triageOf(tri('src/route.ts', 3)), indexRepo: indexRepoOf() };
+    const deps = { llm, cache: { store, model: (pass: 'deep' | 'fast') => (pass === 'deep' ? 'claude-sonnet-5' : 'claude-haiku-4-5') }, triage: triageOf(tri('src/route.ts', 3)), indexRepo: indexRepoOf() };
     const first = await createSastAnalyzer(deps).run(makeCtx(files));
-    const second = await createSastAnalyzer(deps).run(makeCtx(files));
+    const coverage = new Map<string, CoverageStatus>();
+    const second = await createSastAnalyzer(deps).run(makeCtx(files, { coverage }));
     expect(calls).toHaveLength(1);
     expect([...map.keys()][0]).toMatch(new RegExp(`^[0-9a-f]{64}:${SAST_PROMPT_VERSION}:claude-sonnet-5$`));
     expect(second.map((f) => f.fingerprint)).toEqual(first.map((f) => f.fingerprint));
+    expect(second.map((f) => f.location)).toEqual(first.map((f) => f.location));
+    expect(coverage.get('src/route.ts')).toBe('cached');
+    // Only verified locations + prose are cached — never repository code.
+    expect(JSON.stringify([...map.values()])).not.toContain('SELECT * FROM users');
   });
 });
 

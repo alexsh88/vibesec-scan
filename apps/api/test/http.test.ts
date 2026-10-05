@@ -169,7 +169,7 @@ describe('HTTP API', () => {
     const diag = (await app.inject({ method: 'GET', url: `/api/scans/${scanId}/diagnostics` })).json();
     expect(diag).toMatchObject({
       scanId,
-      llm: { mode: 'mock', budgetUsd: 5, totals: { calls: 1, failedCalls: 0 }, byAnalyzer: [{ analyzer: 'sast', calls: 1 }] },
+      llm: { mode: 'mock', budgetUsd: 10, totals: { calls: 1, failedCalls: 0 }, byAnalyzer: [{ analyzer: 'sast', calls: 1 }] },
     });
     expect(diag.llm.totals.costUsd).toBeCloseTo(r.costUsd, 9);
     expect(diag.llm.reservedUsd).toBe(0);

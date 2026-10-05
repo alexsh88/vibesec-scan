@@ -67,7 +67,9 @@ export function createContainer(config: Config, overrides: ContainerOverrides = 
   const indexer = new RepoIndexer(git, { maxFiles: config.maxFiles, maxFileBytes: config.maxFileBytes });
 
   const llmCalls = new LlmCallRepo(db);
-  const budget = new BudgetTracker(config.scanBudgetUsd, (scanId) => scans.getDto(scanId)?.costUsd ?? 0);
+  const budget = new BudgetTracker(
+    config.scanBudgetUsd, (scanId) => scans.getDto(scanId)?.costUsd ?? 0, (scanId) => scans.getDto(scanId)?.options.budgetUsd,
+  );
   const llm = new LlmClient({
     transport: createTransport(config, [credentialsFpMockResponder, dependencyReachabilityMockResponder]),
     models: config.models,

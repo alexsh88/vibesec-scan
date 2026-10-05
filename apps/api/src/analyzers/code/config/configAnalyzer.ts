@@ -25,7 +25,9 @@ import type { MockResponder } from '../../../llm/mockTransport';
 import { estimateTokens, untrustedFile, untrustedText } from '../../../llm/prompt';
 import type { LlmRequest } from '../../../llm/transport';
 import type { IndexedFile } from '../../../index/types';
-import type { Analyzer, AnalyzerContext } from '../../types';
+import type { WorkLease } from '../../../llm/budget';
+import { NO_LEASE, type BudgetLanes } from '../../../llm/budgetLanes';
+import type { Analyzer, AnalyzerContext, CoverageStatus } from '../../types';
 import { issueToFinding } from '../toFinding';
 import type { RawCodeIssue } from '../types';
 import { isDockerfile } from './dockerfile';
@@ -37,7 +39,9 @@ export const CONFIG_PROMPT_VERSION = 'config-v1';
 /** Appears verbatim in the system prompt; `configMockResponder` keys on it. */
 export const CONFIG_TASK_MARKER = 'Task: config-review';
 
-const MAX_CONFIG_FILES = 40;
+/** Projection of one batch review (budget tier 1): system prompt + batch, and a typical reply. */
+const PROJECTED_SYSTEM_TOKENS = 1_500;
+const PROJECTED_OUTPUT_TOKENS = 2_000;
 const MAX_FILE_BYTES = 200 * 1024;
 const READ_CONCURRENCY = 16;
 const BATCH_TOKENS = 10_000;
@@ -334,19 +338,32 @@ function overlaps(a: RawCodeIssue, b: RawCodeIssue): boolean {
 
 export type ConfigAnalyzerDeps = {
   llm: Pick<LlmClient, 'structured'>;
+  /** Budget lanes: a tier-1 lease projecting the remaining batches (llm/budget.ts). */
+  lanes?: BudgetLanes;
 };
 
 export function createConfigAnalyzer(deps: ConfigAnalyzerDeps): Analyzer {
   return {
     id: 'config',
-    version: '1',
+    version: '2',
     category: 'config',
 
     async run(ctx: AnalyzerContext): Promise<Finding[]> {
+      if (ctx.signal.aborted) throw toAppError(ctx.signal.reason ?? new Error('aborted'));
+      const lease = deps.lanes?.open(ctx.scanId) ?? NO_LEASE; // before the first await (see llm/budget.ts)
+      try {
+        return await review(ctx, lease);
+      } finally {
+        lease.close();
+      }
+    },
+  };
+
+  async function review(ctx: AnalyzerContext, lease: WorkLease): Promise<Finding[]> {
       const checkAbort = () => {
         if (ctx.signal.aborted) throw toAppError(ctx.signal.reason ?? new Error('aborted'));
       };
-      checkAbort();
+      const record = (path: string, status: CoverageStatus) => ctx.recordCoverage?.('config', path, status);
 
       const strictCandidates = ctx.files.filter((f: IndexedFile) => f.skipReason === null && isStrictConfigPath(f.path));
       const yamlSniffCandidates = ctx.files.filter((f: IndexedFile) => f.skipReason === null && YAML_RE.test(f.path) && !isStrictConfigPath(f.path));
@@ -365,12 +382,8 @@ export function createConfigAnalyzer(deps: ConfigAnalyzerDeps): Analyzer {
         if (text !== undefined && looksLikeK8sManifest(text)) matchedPaths.add(f.path);
       }
 
-      let selectedPaths = [...matchedPaths].sort();
-      if (selectedPaths.length > MAX_CONFIG_FILES) {
-        const dropped = selectedPaths.length - MAX_CONFIG_FILES;
-        selectedPaths = selectedPaths.slice(0, MAX_CONFIG_FILES);
-        ctx.warn('CONFIG_FILE_LIMIT', `Config review was limited to ${MAX_CONFIG_FILES} files; ${dropped} additional file(s) were not reviewed`);
-      }
+      for (const f of strictCandidates) if (!rawByPath.has(f.path)) record(f.path, 'failed');
+      const selectedPaths = [...matchedPaths].sort();
       if (selectedPaths.length === 0) return [];
 
       const rawFiles = selectedPaths.map((path) => ({ path, text: rawByPath.get(path)! }));
@@ -399,11 +412,28 @@ export function createConfigAnalyzer(deps: ConfigAnalyzerDeps): Analyzer {
       const promptFiles = rawFiles.map((f) =>
         buildPromptFile(f.path, effectiveTextByPath.get(f.path)!, hintEntriesByPath.get(f.path) ?? [], BATCH_TOKENS));
       const batches = packBatches(promptFiles, BATCH_TOKENS);
+      const batchUsd = (batch: PromptFile[]) => deps.lanes?.estimateUsd(
+        'deep', PROJECTED_SYSTEM_TOKENS + batch.reduce((n, f) => n + f.blockTokens, 0), PROJECTED_OUTPUT_TOKENS,
+      ) ?? 0;
+      let remainingUsd = batches.reduce((sum, b) => sum + batchUsd(b), 0);
+      lease.project(remainingUsd);
+      let budgetExhausted = false;
 
       const findings: Finding[] = [];
       let warnedUnavailable = false;
 
       await forEachLimit(batches, BATCH_CONCURRENCY, async (batch) => {
+        try {
+          await reviewBatch(batch);
+        } finally {
+          remainingUsd -= batchUsd(batch);
+          lease.project(remainingUsd);
+        }
+      });
+
+      return findings;
+
+      async function reviewBatch(batch: PromptFile[]): Promise<void> {
         checkAbort();
         const batchPaths = new Set(batch.map((f) => f.path));
         const batchHintEntries = batch.flatMap((f) => hintEntriesByPath.get(f.path) ?? []);
@@ -414,6 +444,20 @@ export function createConfigAnalyzer(deps: ConfigAnalyzerDeps): Analyzer {
           role: 'deep', system: SYSTEM_PROMPT, prompt: batch.map((f) => f.block).join('\n\n'), schema: ConfigOutputSchema,
           signal: ctx.signal, onActivity: ctx.touch,
         };
+
+        const keepHintsUnconfirmed = (status: CoverageStatus) => {
+          // Fail-open for security: an unconfirmed hint still becomes a finding, just at low confidence,
+          // rather than silently disappearing because the AI step was unavailable.
+          for (const entry of batchHintEntries) {
+            findings.push(issueToFinding(ctx, 'config', { ...entry.hint, confidence: 'low' }, ['config:rule']));
+          }
+          for (const f of batch) record(f.path, status);
+          if (!warnedUnavailable) {
+            warnedUnavailable = true;
+            ctx.warn('CONFIG_AI_UNAVAILABLE', 'AI config review was unavailable for one or more files; unconfirmed rule hints were kept at low confidence');
+          }
+        };
+        if (budgetExhausted) { keepHintsUnconfirmed('budget-skipped'); return; }
 
         try {
           const result = await deps.llm.structured(call);
@@ -448,25 +492,16 @@ export function createConfigAnalyzer(deps: ConfigAnalyzerDeps): Analyzer {
             if (isDuplicateOfConfirmedHint) continue;
             findings.push(issueToFinding(ctx, 'config', outcome.issue, ['config:llm']));
           }
+          for (const f of batch) record(f.path, 'reviewed');
         } catch (rawErr) {
           const err = toAppError(rawErr);
           if (err.kind === 'cancelled' || ctx.signal.aborted) throw err;
-          // Fail-open for security: an unconfirmed hint still becomes a finding, just at low
-          // confidence, rather than silently disappearing because the AI step was unavailable.
-          for (const entry of batchHintEntries) {
-            findings.push(issueToFinding(ctx, 'config', { ...entry.hint, confidence: 'low' }, ['config:rule']));
-          }
-          if (!warnedUnavailable) {
-            warnedUnavailable = true;
-            ctx.warn('CONFIG_AI_UNAVAILABLE', 'AI config review was unavailable for one or more files; unconfirmed rule hints were kept at low confidence');
-          }
+          if (err.kind === 'budget') budgetExhausted = true;
+          keepHintsUnconfirmed(err.kind === 'budget' ? 'budget-skipped' : 'failed');
         }
         ctx.touch();
-      });
-
-      return findings;
-    },
-  };
+      }
+  }
 }
 
 // --- mock responder ------------------------------------------------------------------------------

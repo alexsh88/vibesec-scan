@@ -30,7 +30,7 @@ const EnvSchema = z.object({
   MAX_CONCURRENT_SCANS: z.coerce.number().int().positive().default(3),
   QUEUE_CAPACITY: z.coerce.number().int().positive().default(50),
   SCAN_DEADLINE_MS: z.coerce.number().int().positive().default(30 * 60_000),
-  SCAN_BUDGET_USD: z.coerce.number().positive().default(5),
+  SCAN_BUDGET_USD: z.coerce.number().positive().default(10),
   HEARTBEAT_MS: z.coerce.number().int().positive().default(10_000),
   STALE_HEARTBEAT_MS: z.coerce.number().int().positive().default(60_000),
   STUCK_AFTER_MS: z.coerce.number().int().positive().default(5 * 60_000),

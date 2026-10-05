@@ -41,6 +41,14 @@ describe('CreateScanRequestSchema', () => {
     });
   });
 
+  it('accepts an optional per-scan budgetUsd between 0.5 and 100', () => {
+    const base = { repoUrl: 'https://github.com/acme/app' };
+    expect(CreateScanRequestSchema.parse({ ...base, options: { budgetUsd: 0.5 } }).options.budgetUsd).toBe(0.5);
+    expect(CreateScanRequestSchema.parse({ ...base, options: { budgetUsd: 100 } }).options.budgetUsd).toBe(100);
+    expect(CreateScanRequestSchema.safeParse({ ...base, options: { budgetUsd: 0.4 } }).success).toBe(false);
+    expect(CreateScanRequestSchema.safeParse({ ...base, options: { budgetUsd: 101 } }).success).toBe(false);
+  });
+
   it('rejects a non-GitHub url', () => {
     expect(CreateScanRequestSchema.safeParse({ repoUrl: 'https://evil.com/a/b' }).success).toBe(false);
   });

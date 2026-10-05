@@ -176,18 +176,34 @@ describe('createConfigAnalyzer: file collection', () => {
     expect(calls.every((c) => c.role === 'deep' && c.analyzer === 'config' && c.purpose === 'config-review' && c.promptVersion === CONFIG_PROMPT_VERSION && c.system.includes(CONFIG_TASK_MARKER))).toBe(true);
   });
 
-  it('caps collection at 40 files and warns CONFIG_FILE_LIMIT', async () => {
+  it('reviews every config file (no cap) and records coverage', async () => {
     const entries: Record<string, string> = {};
     for (let i = 0; i < 45; i++) entries[`infra/stack${i}.tf`] = `resource "null_resource" "r${i}" {}\n`;
     const files = await writeRepoFiles(entries);
     const { llm, calls } = stubLlm(async () => okResult({ hintVerdicts: [], issues: [] }));
     const warnings: string[][] = [];
-    await createConfigAnalyzer({ llm }).run(makeCtx(files, { warnings }));
+    const ctx = makeCtx(files, { warnings });
+    const coverage = new Map<string, string>();
+    ctx.recordCoverage = (a, path, status) => { expect(a).toBe('config'); coverage.set(path, status); };
+    await createConfigAnalyzer({ llm }).run(ctx);
 
     const combined = calls.map((c) => c.prompt).join('\n');
     const seen = new Set([...combined.matchAll(/path="(infra\/stack\d+\.tf)"/g)].map((m) => m[1]));
-    expect(seen.size).toBe(40);
-    expect(warnings.some(([code]) => code === 'CONFIG_FILE_LIMIT')).toBe(true);
+    expect(seen.size).toBe(45);
+    expect(warnings).toEqual([]);
+    expect([...coverage.values()].filter((s) => s === 'reviewed')).toHaveLength(45);
+  });
+
+  it('after a budget refusal keeps the rule hints at low confidence and records budget-skipped', async () => {
+    const files = await writeRepoFiles({ Dockerfile: 'FROM node:20\nRUN curl -sSL https://x.sh | sh\n' });
+    const { llm } = stubLlm(async () => { throw new AppError('BUDGET_EXHAUSTED', 'budget', 'out'); });
+    const ctx = makeCtx(files);
+    const coverage = new Map<string, string>();
+    ctx.recordCoverage = (_a, path, status) => { coverage.set(path, status); };
+    const findings = await createConfigAnalyzer({ llm }).run(ctx);
+    expect(findings.length).toBeGreaterThan(0);
+    expect(findings.every((f) => f.confidence === 'low')).toBe(true);
+    expect(Object.fromEntries(coverage)).toEqual({ Dockerfile: 'budget-skipped' });
   });
 });
 

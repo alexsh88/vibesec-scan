@@ -27,7 +27,7 @@ import type { LlmClient, StructuredCall } from '../../llm/LlmClient';
 import type { MockResponder } from '../../llm/mockTransport';
 import { estimateTokens, untrustedFile } from '../../llm/prompt';
 import type { LlmRequest } from '../../llm/transport';
-import type { AnalyzerContext } from '../types';
+import type { AnalyzerContext, CoverageStatus } from '../types';
 import type { FileTriage, TriageResult } from './types';
 
 export const TRIAGE_PROMPT_VERSION = 'triage-v1';
@@ -35,7 +35,8 @@ export const TRIAGE_PROMPT_VERSION = 'triage-v1';
 export const TRIAGE_TASK_MARKER = 'Task: code-triage';
 
 const DEFAULT_BATCH_TOKENS = 12_000;
-const DEFAULT_MAX_FILES = 1_500;
+/** Safety cap against pathological repos only (whole-repo coverage is the rule; cost is bounded by the dollar budget). */
+const DEFAULT_MAX_FILES = 20_000;
 const DEFAULT_MAX_FILE_BYTES = 200 * 1024;
 const BATCH_CONCURRENCY = 3;
 const READ_CONCURRENCY = 16;
@@ -284,6 +285,7 @@ export class TriageService {
 
     const skipped: string[] = [];
     const warnings: string[] = [];
+    const record = (path: string, status: CoverageStatus) => ctx.recordCoverage?.('triage', path, status);
 
     // 1. Candidate files: indexed, not skipped, JS/TS/Python. Config-ish files are never triaged here.
     const candidates = ctx.files.filter((f) => f.skipReason === null && TRIAGEABLE_LANGUAGES.has(f.language));
@@ -299,16 +301,23 @@ export class TriageService {
       if (readDone % 200 === 0) ctx.touch();
     });
     const readable = candidates.filter((f) => contentOf.has(f.path));
-    for (const f of candidates) if (!contentOf.has(f.path)) skipped.push(f.path);
+    for (const f of candidates) {
+      if (contentOf.has(f.path)) continue;
+      skipped.push(f.path);
+      record(f.path, 'failed');
+    }
 
     // 3. Prioritize and truncate to maxFiles.
     let selected = readable;
     if (readable.length > maxFiles) {
       const prioritized = [...readable].sort((a, b) => comparePriority(a, b, contentOf));
       selected = prioritized.slice(0, maxFiles);
-      for (const f of prioritized.slice(maxFiles)) skipped.push(f.path);
+      for (const f of prioritized.slice(maxFiles)) {
+        skipped.push(f.path);
+        record(f.path, 'budget-skipped'); // cost guard: listed with the budget-skipped files, never silent
+      }
       warnings.push('TRIAGE_FILE_LIMIT');
-      ctx.warn('TRIAGE_FILE_LIMIT', `Haiku triage was limited to ${maxFiles} files; ${prioritized.length - maxFiles} additional file(s) were not triaged`);
+      ctx.warn('TRIAGE_FILE_LIMIT', `This repository exceeds the ${maxFiles}-file safety limit for AI triage; ${prioritized.length - maxFiles} lower-priority file(s) were not triaged (listed in the scan coverage)`);
     }
     ctx.touch();
 
@@ -322,7 +331,10 @@ export class TriageService {
       const key = cacheKeyFor(content, model);
       cacheKeyByPath.set(f.path, key);
       const cached = this.deps.cache.get(key);
-      if (cached) files.set(f.path, { path: f.path, ...cached });
+      if (cached) {
+        files.set(f.path, { path: f.path, ...cached });
+        record(f.path, 'cached');
+      }
       else toSend.push({ path: f.path, content });
     }
 
@@ -352,14 +364,20 @@ export class TriageService {
           files.set(r.path, { path: r.path, ...triage });
           const key = cacheKeyByPath.get(r.path);
           if (key) this.deps.cache.set(key, triage);
+          record(r.path, 'reviewed');
         }
         for (const f of batch) {
-          if (!seen.has(f.path)) files.set(f.path, { path: f.path, ...CONSERVATIVE_DEFAULT }); // omitted by the model: fail-safe default, never cached
+          if (seen.has(f.path)) continue;
+          files.set(f.path, { path: f.path, ...CONSERVATIVE_DEFAULT }); // omitted by the model: fail-safe default, never cached
+          record(f.path, 'failed');
         }
       } catch (raw) {
         const err = toAppError(raw);
         if (err.kind === 'cancelled' || ctx.signal.aborted) throw err;
-        for (const f of batch) files.set(f.path, { path: f.path, ...CONSERVATIVE_DEFAULT });
+        for (const f of batch) {
+          files.set(f.path, { path: f.path, ...CONSERVATIVE_DEFAULT });
+          record(f.path, err.kind === 'budget' ? 'budget-skipped' : 'failed');
+        }
         if (!warnedPartial) {
           warnedPartial = true;
           warnings.push('TRIAGE_PARTIAL');

@@ -2,7 +2,6 @@ import { describe, expect, it } from 'vitest';
 import {
   computeFileMetrics,
   findDuplicateBlocks,
-  qualityIssuesFromMetrics,
   rankFilesForQualityReview,
   LONG_FILE_LINES,
 } from '../src/analyzers/code/quality/metrics';
@@ -134,33 +133,11 @@ describe('computeFileMetrics — Python heuristic', () => {
   });
 });
 
-describe('quality issue thresholds', () => {
-  it('flags long files over the line threshold', () => {
+describe('long-file metric', () => {
+  it('counts lines past the long-file threshold (evidence for the AI review, never a finding)', () => {
     const text = Array.from({ length: LONG_FILE_LINES + 5 }, (_, i) => `const x${i} = ${i};`).join('\n');
     const m = computeFileMetrics('huge.ts', text, 'ts');
     expect(m.lines).toBeGreaterThan(LONG_FILE_LINES);
-    const issues = qualityIssuesFromMetrics([{ path: 'huge.ts', text }], [m], []);
-    const longFile = issues.find((i) => i.ruleId === 'quality/long-file');
-    expect(longFile).toBeDefined();
-    expect(longFile!.severity).toBe('low');
-    expect(longFile!.confidence).toBe('high');
-    expect(longFile!.explanation).toContain(String(m.lines));
-  });
-
-  it('does not flag a short, clean file', () => {
-    const text = 'function ok() {\n  return 1;\n}\n';
-    const m = computeFileMetrics('ok.ts', text, 'ts');
-    const issues = qualityIssuesFromMetrics([{ path: 'ok.ts', text }], [m], []);
-    expect(issues).toHaveLength(0);
-  });
-
-  it('every quality issue has severity low or info (never above medium)', () => {
-    const body = Array.from({ length: 90 }, (_, i) => `  const x${i} = ${i};`).join('\n');
-    const text = `function longFn() {\n${body}\n  if (a) { if (b) { if (c) { if (d) { if (e) { return 1; } } } } }\n}\n`;
-    const m = computeFileMetrics('bad.ts', text, 'ts');
-    const issues = qualityIssuesFromMetrics([{ path: 'bad.ts', text }], [m], []);
-    expect(issues.length).toBeGreaterThan(0);
-    for (const issue of issues) expect(['low', 'info', 'medium']).toContain(issue.severity);
   });
 });
 
@@ -233,20 +210,13 @@ describe('findDuplicateBlocks', () => {
     expect(dups).toHaveLength(0);
   });
 
-  it('produces quality/duplicate-code issues with the real first line as snippet', () => {
+  it('reports each duplicate occurrence with its real start line', () => {
     const shared = ['  const value = 1;', '  const result = value * 2;', '  const total = result + value;', '  console.log(total);', '  return total;', '  doStuff();'];
     const fileA = { path: 'a.ts', text: ['function helperA() {', ...shared, '}'].join('\n') };
     const fileB = { path: 'b.ts', text: ['function helperB() {', ...shared, '}'].join('\n') };
-    const metrics = [computeFileMetrics(fileA.path, fileA.text, 'ts'), computeFileMetrics(fileB.path, fileB.text, 'ts')];
     const dups = findDuplicateBlocks([fileA, fileB]);
-    const issues = qualityIssuesFromMetrics([fileA, fileB], metrics, dups);
-    const dupIssues = issues.filter((i) => i.ruleId === 'quality/duplicate-code');
-    expect(dupIssues).toHaveLength(2);
-    for (const issue of dupIssues) {
-      expect(issue.severity).toBe('low');
-      expect(issue.snippet.trim()).toBe('const value = 1;');
-      expect(issue.explanation).toContain('2 copies');
-    }
+    expect(dups).toHaveLength(1);
+    expect(dups[0]!.occurrences).toEqual([{ path: 'a.ts', startLine: 2 }, { path: 'b.ts', startLine: 2 }]);
   });
 });
 

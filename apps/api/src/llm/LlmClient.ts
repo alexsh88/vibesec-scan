@@ -5,7 +5,7 @@ import type { ScanRepo } from '../db/scanRepo';
 import { AppError, toAppError } from '../errors/AppError';
 import { CircuitBreaker } from '../resilience/circuitBreaker';
 import { RETRY_POLICIES, withRetry, type RetryDeps } from '../resilience/retry';
-import type { BudgetTracker, SettleBudget } from './budget';
+import type { BudgetTier, BudgetTracker, SettleBudget } from './budget';
 import { capsOf, costUsd, DEFAULT_EFFORT, DEFAULT_MAX_TOKENS, DEGRADE_ROLE, FALLBACK_ROLE, type Effort, type ModelRole, type TokenUsage } from './models';
 import { buildRequestParts, estimateTokens } from './prompt';
 import type { RateLimiter, Semaphore } from './rateLimiter';
@@ -29,6 +29,8 @@ export type StructuredCall<T> = {
   signal: AbortSignal;
   /** Called on every attempt; pass ctx.touch so long calls keep the scan watchdog alive. */
   onActivity?: () => void;
+  /** Budget lane (see llm/budget.ts): 1 = security-critical (default), 2 = SAST fast pass, 3 = quality. */
+  tier?: BudgetTier;
 };
 
 export type StructuredResult<T> = {
@@ -107,7 +109,7 @@ export type LlmClientDeps = {
 };
 
 /** What send()/record() need from a call (shared by structured() and agent()). */
-type CallMeta = Pick<StructuredCall<unknown>, 'scanId' | 'analyzer' | 'purpose' | 'promptVersion' | 'signal' | 'onActivity'>;
+type CallMeta = Pick<StructuredCall<unknown>, 'scanId' | 'analyzer' | 'purpose' | 'promptVersion' | 'signal' | 'onActivity' | 'tier'>;
 
 type Sent = { message: Anthropic.Message; model: string; callId: string; usage: TokenUsage; costUsd: number };
 
@@ -347,7 +349,7 @@ export class LlmClient {
   /** One logical send: budget check → semaphore slot → breaker(retry chain, budget reservation per attempt). Truncation is permanent. */
   private async send(call: CallMeta, req: LlmRequest): Promise<Sent> {
     if (call.signal.aborted) throw new AppError('CANCELLED', 'cancelled', 'Operation was cancelled');
-    if (call.scanId) this.deps.budget.ensureAvailable(call.scanId);
+    if (call.scanId) this.deps.budget.ensureAvailable(call.scanId, call.tier ?? 1);
     const release = await this.deps.semaphore.acquire(call.signal);
     try {
       const estimate = estimateTokens(JSON.stringify(req.system) + JSON.stringify(req.messages));
@@ -357,7 +359,7 @@ export class LlmClient {
       const sent = await this.breaker.run(() => withRetry(async (attempt) => {
         // Reserve per attempt so concurrent in-flight calls cannot jointly overshoot the scan budget.
         // Waits (abortably) while only other in-flight reservations block; throws once committed spend can't fit.
-        const settle: SettleBudget = call.scanId ? await this.deps.budget.reserve(call.scanId, estimateUsd, call.signal) : () => {};
+        const settle: SettleBudget = call.scanId ? await this.deps.budget.reserve(call.scanId, estimateUsd, call.signal, call.tier ?? 1) : () => {};
         try {
           await this.deps.limiter.acquire(estimate, call.signal);
           call.onActivity?.();

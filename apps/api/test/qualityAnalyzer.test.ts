@@ -122,25 +122,43 @@ function longFunctionSource(name: string, bodyLines: number): string {
 }
 
 describe('createQualityAnalyzer', () => {
-  it('uses role fast, purpose quality-review, promptVersion, task marker, and ranks/selects only the top maxFiles files', async () => {
+  it('reviews every file (worst metrics first) with role fast in budget tier 3, recording coverage', async () => {
     const files = await writeRepoFiles({
       'src/big.ts': longFunctionSource('bigFn', 90), // long-function + deep-ish score, ranks first
       'src/tiny.ts': 'export const a = 1;\n', // trivial: ranks last
     });
     const { llm, calls } = stubLlm(async () => okResult([]));
-    const analyzer = createQualityAnalyzer({ llm, maxFiles: 1 });
+    const analyzer = createQualityAnalyzer({ llm });
+    const ctx = makeCtx(files);
+    const coverage = new Map<string, string>();
+    ctx.recordCoverage = (a, path, status) => { expect(a).toBe('quality'); coverage.set(path, status); };
 
-    await analyzer.run(makeCtx(files));
+    await analyzer.run(ctx);
 
-    expect(calls).toHaveLength(1);
+    expect(calls).toHaveLength(2);
     const c = calls[0]!;
     expect(c.role).toBe('fast');
+    expect(c.tier).toBe(3);
     expect(c.analyzer).toBe('quality');
     expect(c.purpose).toBe('quality-review');
     expect(c.promptVersion).toBe(QUALITY_PROMPT_VERSION);
     expect(c.system).toContain(QUALITY_TASK_MARKER);
     expect(c.prompt).toContain('path="src/big.ts"');
-    expect(c.prompt).not.toContain('tiny.ts');
+    expect(calls[1]!.prompt).toContain('path="src/tiny.ts"');
+    expect(Object.fromEntries(coverage)).toEqual({ 'src/big.ts': 'reviewed', 'src/tiny.ts': 'reviewed' });
+  });
+
+  it('records files the budget could not cover as budget-skipped, without a per-analyzer warning', async () => {
+    const files = await writeRepoFiles({ 'src/a.ts': longFunctionSource('a', 90), 'src/b.ts': 'export const b = 1;\n' });
+    const { llm, calls } = stubLlm(async () => { throw new AppError('BUDGET_EXHAUSTED', 'budget', 'out'); });
+    const warnings: string[][] = [];
+    const ctx = makeCtx(files, { warnings });
+    const coverage = new Map<string, string>();
+    ctx.recordCoverage = (_a, path, status) => { coverage.set(path, status); };
+    expect(await createQualityAnalyzer({ llm }).run(ctx)).toEqual([]);
+    expect(calls.length).toBeGreaterThanOrEqual(1);
+    expect(warnings).toEqual([]);
+    expect(Object.fromEntries(coverage)).toEqual({ 'src/a.ts': 'budget-skipped', 'src/b.ts': 'budget-skipped' });
   });
 
   it('puts the deterministic metrics in the prompt as facts (never as findings themselves)', async () => {
