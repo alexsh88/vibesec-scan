@@ -20,12 +20,13 @@ async function main(): Promise<void> {
   // instead of adopting / failing the other instance's work.
   await app.listen({ port: config.port, host: config.host });
 
+  const { resumed, failed } = c.runner.recover();
+  if (resumed.length || failed.length) app.log.info({ resumed, failed }, 'recovered scans from previous run');
+
+  // Sweep after recover(): scans it just failed are terminal now, so their checkouts are removed too.
   const live = new Set(c.scans.listNonTerminal().map((s) => s.id));
   const removed = await c.git.sweep((scanId) => live.has(scanId));
   if (removed.length) app.log.info({ removed: removed.length }, 'removed stale scan workspaces');
-
-  const { resumed, failed } = c.runner.recover();
-  if (resumed.length || failed.length) app.log.info({ resumed, failed }, 'recovered scans from previous run');
   c.runner.startWatchdog();
   app.log.info({ scanMode: config.scanMode }, 'vibesec api ready');
 

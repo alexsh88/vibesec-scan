@@ -1,9 +1,11 @@
+import { randomUUID } from 'node:crypto';
 import { existsSync } from 'node:fs';
-import { lstat, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { lstat, mkdir, mkdtemp, readFile, rm, unlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { GitService } from '../src/git/GitService';
+import { runProcess } from '../src/process/runProcess';
 import { createFixtureRepo, type FixtureRepo } from './fixtures/gitRepo';
 
 let repo: FixtureRepo;
@@ -30,7 +32,38 @@ describe('GitService', () => {
   it('init reports the git version and creates the empty global config', async () => {
     expect(await git.init()).toMatch(/^git version \d+\.\d+/);
     expect(existsSync(join(workDir, '.gitconfig-empty'))).toBe(true);
+    expect(existsSync(join(workDir, '.home'))).toBe(true);
   });
+
+  it('runs git with HOME/USERPROFILE/XDG_CONFIG_HOME pointing at <workDir>/.home, never the host home (netrc)', async () => {
+    const fakeHome = await mkdtemp(join(tmpdir(), 'vibesec-host-home-'));
+    const netrc = 'machine github.com login netrcuser password netrcpass\nmachine localhost login netrcuser password netrcpass\n';
+    await writeFile(join(fakeHome, '.netrc'), netrc);
+    await writeFile(join(fakeHome, '_netrc'), netrc);
+    const saved = { HOME: process.env.HOME, USERPROFILE: process.env.USERPROFILE };
+    process.env.HOME = fakeHome;
+    process.env.USERPROFILE = fakeHome;
+    try {
+      const script = 'console.log(JSON.stringify({h:process.env.HOME,u:process.env.USERPROFILE,x:process.env.XDG_CONFIG_HOME}))';
+      const run = (git as unknown as { git(args: string[], o: object): Promise<string> }).git.bind(git);
+      const out = await run(['-c', `alias.vsenv=!node -e '${script}'`, 'vsenv'], {});
+      const seen = JSON.parse(out.trim()) as { h: string; u: string; x: string };
+      const home = join(workDir, '.home');
+      for (const v of [seen.h, seen.u, seen.x]) {
+        expect(v).toBe(home);
+        expect(v).not.toBe(fakeHome);
+      }
+      const origins = await run(['config', '--list', '--show-origin'], {});
+      expect(origins).not.toContain(fakeHome);
+      expect(origins).not.toContain('netrc');
+    } finally {
+      for (const [k, v] of Object.entries(saved)) {
+        if (v === undefined) delete process.env[k];
+        else process.env[k] = v;
+      }
+      await rm(fakeHome, { recursive: true, force: true });
+    }
+  }, 30_000);
 
   it('builds github remote URLs by default', () => {
     expect(new GitService({ workDir, cloneTimeoutMs: 1_000, stallMs: 500, allowFileProtocol: false }).remoteUrl('acme', 'app'))
@@ -41,6 +74,8 @@ describe('GitService', () => {
     expect(await git.resolveRef(repo.url, 'main')).toBe(repo.shas[2]);
     expect(await git.resolveRef(repo.url, 'feature/x')).toBe(repo.shas[0]);
     expect(await git.resolveRef(repo.url, 'v1.0.0')).toBe(repo.shas[2]);
+    expect(await git.resolveRef(repo.url, 'refs/tags/v1.0.0')).toBe(repo.shas[2]);
+    expect(await git.resolveRef(repo.url, 'refs/heads/main')).toBe(repo.shas[2]);
     expect(await git.resolveRef(repo.url, 'HEAD')).toBe(repo.shas[2]);
     expect(await git.resolveRef(repo.url, repo.shas[1]!.toUpperCase())).toBe(repo.shas[1]);
   });
@@ -79,6 +114,25 @@ describe('GitService', () => {
     expect(await git.headSha(dir)).toBe(repo.shas[1]);
   }, 60_000);
 
+  it('re-clones a checkout left empty by a crash between clone --no-checkout and checkout', async () => {
+    const id = randomUUID();
+    await mkdir(git.scanDir(id), { recursive: true });
+    const env = { ...process.env, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: join(workDir, '.gitconfig-empty') };
+    const r = await runProcess('git', ['clone', '--no-checkout', '-q', '--', repo.url, git.repoDir(id)], { env, timeoutMs: 30_000 });
+    expect(r.code).toBe(0);
+    expect(await git.headSha(git.repoDir(id))).toBe(repo.shas[2]); // HEAD already "equals" the tip
+    const dir = await git.ensureCheckout(id, repo.url, repo.shas[2]!);
+    expect(existsSync(join(dir, 'src', 'a.ts'))).toBe(true);
+    expect((await readFile(join(dir, '.git', 'vibesec-checkout'), 'utf8')).trim()).toBe(repo.shas[2]);
+
+    // A checkout whose completion marker is missing is never trusted either.
+    await unlink(join(dir, '.git', 'vibesec-checkout'));
+    await unlink(join(dir, 'src', 'a.ts'));
+    await git.ensureCheckout(id, repo.url, repo.shas[2]!);
+    expect(existsSync(join(dir, 'src', 'a.ts'))).toBe(true);
+    await git.removeScanDir(id);
+  }, 60_000);
+
   it('checks out symlinks as plain files containing the target (no escape)', async () => {
     const dir = await git.ensureCheckout('scan-3', repo.url, repo.shas[2]!);
     const stat = await lstat(join(dir, 'escape'));
@@ -106,6 +160,14 @@ describe('GitService', () => {
     expect(await git.diffNameStatus(dir, 'f'.repeat(40), repo.shas[1]!)).toBeNull();
   }, 60_000);
 
+  it('rejects non-SHA diff arguments without running git (no option injection)', async () => {
+    const dir = await git.ensureCheckout('scan-3', repo.url, repo.shas[2]!);
+    const outFile = join(dir, 'x');
+    expect(await git.diffNameStatus(dir, '--output=x', repo.shas[1]!)).toBeNull();
+    expect(await git.diffNameStatus(dir, repo.shas[0]!, '--output=x')).toBeNull();
+    expect(existsSync(outFile)).toBe(false);
+  }, 60_000);
+
   it('cancels when the signal is already aborted', async () => {
     const ac = new AbortController();
     ac.abort();
@@ -113,14 +175,30 @@ describe('GitService', () => {
       .rejects.toMatchObject({ code: 'CANCELLED' });
   });
 
-  it('removes scan directories and sweeps the ones not kept', async () => {
-    await git.ensureCheckout('keep-me', repo.url, repo.shas[0]!);
-    await git.ensureCheckout('drop-me', repo.url, repo.shas[0]!);
-    const removed = await git.sweep((id) => id === 'keep-me');
-    expect(removed).toContain('drop-me');
-    expect(existsSync(git.scanDir('keep-me'))).toBe(true);
-    expect(existsSync(git.scanDir('drop-me'))).toBe(false);
-    await git.removeScanDir('keep-me');
-    expect(existsSync(git.scanDir('keep-me'))).toBe(false);
+  it('keeps scan workspaces under <workDir>/scans', () => {
+    const id = randomUUID();
+    expect(git.scanDir(id)).toBe(join(workDir, 'scans', id));
+  });
+
+  it('removes scan directories and sweeps only UUID-named scan dirs that are not kept', async () => {
+    const keep = randomUUID();
+    const drop = randomUUID();
+    await git.ensureCheckout(keep, repo.url, repo.shas[0]!);
+    await git.ensureCheckout(drop, repo.url, repo.shas[0]!);
+    const scans = join(workDir, 'scans');
+    await mkdir(join(scans, 'not-a-scan'), { recursive: true });
+    await writeFile(join(scans, randomUUID()), 'plain file');
+    await mkdir(join(workDir, 'operator-data'), { recursive: true });
+
+    const removed = await git.sweep((id) => id === keep);
+    expect(removed).toEqual([drop]);
+    expect(existsSync(git.scanDir(keep))).toBe(true);
+    expect(existsSync(git.scanDir(drop))).toBe(false);
+    expect(existsSync(join(scans, 'not-a-scan'))).toBe(true);
+    expect(existsSync(join(workDir, 'operator-data'))).toBe(true);
+    expect(existsSync(join(workDir, '.gitconfig-empty'))).toBe(true);
+    expect(existsSync(join(workDir, '.home'))).toBe(true);
+    await git.removeScanDir(keep);
+    expect(existsSync(git.scanDir(keep))).toBe(false);
   }, 60_000);
 });

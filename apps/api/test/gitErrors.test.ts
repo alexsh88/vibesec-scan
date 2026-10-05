@@ -34,6 +34,20 @@ describe('classifyGitFailure', () => {
     expect(classifyGitFailure(stderr, { hasToken: true })).toMatchObject({ code: 'GITHUB_RATE_LIMITED', kind: 'transient' });
   });
 
+  it.each([
+    "error: invalid path 'con/aux.txt'\nfatal: unable to checkout working tree",
+    "error: unable to create file a/b.txt: Filename too long",
+    "fatal: cannot create directory at 'x': Filename too long",
+    "error: invalid path 'ssl/Authentication failed/aux.txt'", // repo-controlled path must not trip other patterns
+  ])('maps Windows-invalid checkout paths to a clear permanent error: %s', (stderr) => {
+    const err = classifyGitFailure(stderr, { hasToken: false });
+    expect(err).toMatchObject({
+      code: 'INTERNAL', kind: 'permanent',
+      userMessage: 'The repository contains file paths that cannot be checked out on this server',
+    });
+    expect(err.details).toBeDefined();
+  });
+
   it('never puts raw stderr in the user message and scrubs it in details', () => {
     const err = classifyGitFailure('fatal: weird ghp_0123456789abcdefghijABCDEFGHIJ012345', { hasToken: true });
     expect(err.userMessage).not.toContain('ghp_');

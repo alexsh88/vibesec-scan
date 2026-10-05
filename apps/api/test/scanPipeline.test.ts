@@ -106,12 +106,19 @@ describe('scan pipeline (real git)', () => {
     expect(await run(newScan())).toMatchObject({ state: 'FAILED', errorCode: 'AUTH_REQUIRED' });
   });
 
-  it('continues with git alone when the GitHub API is unavailable', async () => {
+  it('fails without cloning when the GitHub API is unavailable', async () => {
     const { newScan, run } = setup({ meta: new AppError('INTERNAL', 'transient', 'GitHub is temporarily unavailable') });
-    const dto = await run(newScan());
-    expect(dto.state).toBe('COMPLETED_WITH_WARNINGS');
-    expect(dto.commitSha).toBe(repo.shas[1]);
-    expect(dto.warnings[0]).toMatchObject({ stage: 'RESOLVING' });
+    const id = newScan();
+    const dto = await run(id);
+    expect(dto).toMatchObject({ state: 'FAILED', errorCode: 'INTERNAL', commitSha: null });
+    expect(existsSync(git.scanDir(id))).toBe(false);
+  }, 60_000);
+
+  it('fails with GITHUB_RATE_LIMITED without cloning when the GitHub API is rate-limited', async () => {
+    const { newScan, run } = setup({ meta: new AppError('GITHUB_RATE_LIMITED', 'transient', 'rate limited') });
+    const id = newScan();
+    expect(await run(id)).toMatchObject({ state: 'FAILED', errorCode: 'GITHUB_RATE_LIMITED' });
+    expect(existsSync(git.scanDir(id))).toBe(false);
   }, 60_000);
 
   it('fails with REF_NOT_FOUND for an unknown ref', async () => {

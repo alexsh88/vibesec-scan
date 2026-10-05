@@ -6,11 +6,18 @@ const RATE_LIMITED = /secondary rate limit|rate limit exceeded|API rate limit|re
 const REF_NOT_FOUND = /couldn't find remote ref|Remote branch .+ not found|unknown revision|not a valid object name|reference is not a tree|did not match any file|invalid reference/i;
 const AUTH = /Authentication failed|could not read (Username|Password)|terminal prompts disabled|returned error: 40[13]|HTTP Basic: Access denied|Invalid username or password|Write access to repository not granted/i;
 const REPO_NOT_FOUND = /Repository not found|repository '.+' not found|does not appear to be a git repository|returned error: 404/i;
+const UNCHECKOUTABLE_PATH = /invalid path|error: unable to create file|Filename too long/i;
 const NETWORK = /Could not resolve host|Failed to connect|Connection (timed out|reset|refused)|Operation timed out|early EOF|RPC failed|remote end hung up|returned error: 5\d\d|SSL|TLS|schannel|gnutls/i;
 
 /** Maps git's stderr to a typed AppError. The user message never contains raw stderr. */
 export function classifyGitFailure(stderr: string, ctx: { hasToken: boolean }): AppError {
   const details = { stderr: scrubSecrets(stderr.slice(-2_000)) };
+  // Checked first: the offending (repository-controlled) path is echoed in stderr and could otherwise
+  // trip the other patterns (e.g. a file named "ssl/...").
+  if (UNCHECKOUTABLE_PATH.test(stderr)) {
+    // e.g. Windows-reserved names (con, aux, trailing dots) or paths beyond the OS limit.
+    return new AppError('INTERNAL', 'permanent', 'The repository contains file paths that cannot be checked out on this server', { details });
+  }
   if (RATE_LIMITED.test(stderr)) {
     return new AppError('GITHUB_RATE_LIMITED', 'transient', 'GitHub rate limit reached; retrying shortly', { details, retryAfterMs: 30_000 });
   }

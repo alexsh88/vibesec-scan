@@ -1,5 +1,5 @@
 import { existsSync } from 'node:fs';
-import { mkdir, readdir, rm, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { AppError } from '../errors/AppError';
 import { ProcessError, runProcess, type RunResult } from '../process/runProcess';
@@ -23,8 +23,15 @@ export type DiffEntry = { status: 'A' | 'M' | 'D' | 'R' | 'C' | 'T'; path: strin
 const SHA_RE = /^[0-9a-f]{40}$/i;
 const PROGRESS_RE = /^(?:remote:\s*)?([A-Za-z][A-Za-z ]+):\s+\d+%\s+\((\d+)\/(\d+)\)/;
 const SHORT_TIMEOUT_MS = 30_000;
+const LS_REMOTE_TIMEOUT_MS = 20_000;
 const MAX_TREE_BYTES = 64 * 1024 * 1024;
 const EMPTY_CONFIG = '.gitconfig-empty';
+/** Private, empty HOME for git: the operator's ~/.netrc, _netrc and per-user config are never visible. */
+const GIT_HOME = '.home';
+const SCANS_DIR = 'scans';
+/** Written into .git/ only after a successful checkout; its content is the checked-out SHA. */
+const CHECKOUT_MARKER = 'vibesec-checkout';
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const RM_OPTS = { recursive: true, force: true, maxRetries: 5, retryDelay: 200 } as const;
 
 export class GitService {
@@ -36,7 +43,8 @@ export class GitService {
 
   /** Creates the workspace and returns `git --version`; fails fast when git is missing. */
   async init(): Promise<string> {
-    await mkdir(this.opts.workDir, { recursive: true });
+    await mkdir(join(this.opts.workDir, GIT_HOME), { recursive: true });
+    await mkdir(join(this.opts.workDir, SCANS_DIR), { recursive: true });
     await writeFile(join(this.opts.workDir, EMPTY_CONFIG), '');
     return (await this.git(['--version'], {})).trim();
   }
@@ -46,7 +54,7 @@ export class GitService {
   }
 
   scanDir(scanId: string): string {
-    return join(this.opts.workDir, scanId);
+    return join(this.opts.workDir, SCANS_DIR, scanId);
   }
 
   repoDir(scanId: string): string {
@@ -59,7 +67,7 @@ export class GitService {
     // Pass the explicit peel pattern too: with an exact (non-glob) refname, modern git omits the
     // "refs/tags/<ref>^{}" advertisement unless it is itself requested, so an annotated tag would
     // otherwise resolve to the tag object's SHA instead of the commit it points at.
-    const out = await this.git(['ls-remote', '--', remote, ref, `${ref}^{}`], { ...call, timeoutMs: SHORT_TIMEOUT_MS });
+    const out = await this.git(['ls-remote', '--', remote, ref, `${ref}^{}`], { ...call, timeoutMs: LS_REMOTE_TIMEOUT_MS });
     const refs = new Map<string, string>();
     for (const line of out.split('\n')) {
       const [sha, name] = line.trim().split('\t');
@@ -68,13 +76,15 @@ export class GitService {
     const sha = refs.get(`refs/heads/${ref}`)
       ?? refs.get(`refs/tags/${ref}^{}`)
       ?? refs.get(`refs/tags/${ref}`)
+      ?? refs.get(`${ref}^{}`) // fully-qualified annotated tag (refs/tags/x): prefer the peeled commit
       ?? refs.get(ref);
     if (!sha) throw new AppError('REF_NOT_FOUND', 'permanent', 'Branch, tag or commit not found in this repository');
     return sha;
   }
 
   /**
-   * Idempotent: reuses an existing checkout at `sha`, otherwise (re)clones with --filter=blob:none and
+   * Idempotent: reuses an existing checkout only when its completion marker records `sha` (a crash between
+   * `clone --no-checkout` and `checkout` leaves HEAD at the tip with an empty worktree), otherwise (re)clones with --filter=blob:none and
    * checks out `sha` detached. A failed clone never leaves a half-populated directory behind.
    */
   async ensureCheckout(
@@ -85,9 +95,10 @@ export class GitService {
     if (!SHA_RE.test(sha)) throw new AppError('VALIDATION', 'permanent', 'Invalid commit SHA');
     const dir = this.repoDir(scanId);
 
-    if (existsSync(join(dir, '.git'))) {
-      const head = await this.headSha(dir).catch(() => null);
-      if (head === sha.toLowerCase()) return dir;
+    const marker = join(dir, '.git', CHECKOUT_MARKER);
+    if (existsSync(dir)) {
+      const done = await readFile(marker, 'utf8').then((s) => s.trim().toLowerCase(), () => null);
+      if (done === sha.toLowerCase()) return dir;
       await rm(dir, RM_OPTS);
     }
 
@@ -109,6 +120,8 @@ export class GitService {
         await this.git(['fetch', '--filter=blob:none', '--', 'origin', sha], { ...long, cwd: dir });
         await this.git(['checkout', '--force', '--detach', sha], { ...long, cwd: dir });
       }
+      await writeFile(marker, `${sha.toLowerCase()}
+`);
       return dir;
     } catch (err) {
       await rm(dir, RM_OPTS).catch(() => undefined);
@@ -134,6 +147,7 @@ export class GitService {
 
   /** Changed paths between two commits, or null when the base commit is not available locally. */
   async diffNameStatus(dir: string, baseSha: string, sha: string, call: GitCallOptions = {}): Promise<DiffEntry[] | null> {
+    if (!SHA_RE.test(baseSha) || !SHA_RE.test(sha)) return null;
     let out: string;
     try {
       out = await this.git(['diff', '--name-status', '-z', '-M', baseSha, sha, '--'], { ...call, cwd: dir });
@@ -161,12 +175,16 @@ export class GitService {
     await rm(this.scanDir(scanId), RM_OPTS);
   }
 
-  /** Removes workspace directories whose scan should not be kept; returns the removed scan ids. */
+  /**
+   * Removes scan workspaces (UUID-named directories under <workDir>/scans) whose scan should not be kept;
+   * returns the removed scan ids. Anything else in WORK_DIR is never touched.
+   */
   async sweep(keep: (scanId: string) => boolean): Promise<string[]> {
-    if (!existsSync(this.opts.workDir)) return [];
+    const scansDir = join(this.opts.workDir, SCANS_DIR);
+    if (!existsSync(scansDir)) return [];
     const removed: string[] = [];
-    for (const entry of await readdir(this.opts.workDir, { withFileTypes: true })) {
-      if (!entry.isDirectory() || keep(entry.name)) continue;
+    for (const entry of await readdir(scansDir, { withFileTypes: true })) {
+      if (!entry.isDirectory() || !UUID_RE.test(entry.name) || keep(entry.name)) continue;
       await this.removeScanDir(entry.name).catch(() => undefined);
       removed.push(entry.name);
     }
@@ -177,7 +195,11 @@ export class GitService {
     args: string[],
     o: GitCallOptions & { cwd?: string; timeoutMs?: number; maxStdoutBytes?: number; onStderrLine?: (line: string) => void },
   ): Promise<string> {
-    const env = gitEnv({ emptyConfigPath: join(this.opts.workDir, EMPTY_CONFIG), auth: { token: o.token } });
+    const env = gitEnv({
+      emptyConfigPath: join(this.opts.workDir, EMPTY_CONFIG),
+      homeDir: join(this.opts.workDir, GIT_HOME),
+      auth: { token: o.token },
+    });
     let result: RunResult;
     try {
       result = await runProcess(this.gitBinary, [...safeGitFlags(this.opts.allowFileProtocol), ...args], {
