@@ -151,7 +151,7 @@ describe('analyzeStage', () => {
     const b = makeAnalyzer({ id: 'b', category: 'sast', run: async () => { throw new Error('boom b'); } });
     const stage = analyzeStage({ analyzers: [a, b], findings, indexRepo, git: fakeGit });
 
-    await expect(stage.run(ctx)).rejects.toMatchObject({ kind: 'permanent', userMessage: 'All analyzers failed' });
+    await expect(stage.run(ctx)).rejects.toMatchObject({ code: 'ALL_ANALYZERS_FAILED', kind: 'permanent', userMessage: 'All analyzers failed' });
     expect(warnings).toHaveLength(2);
     expect(warnings.every((w) => w.code === 'ANALYZER_FAILED')).toBe(true);
   });

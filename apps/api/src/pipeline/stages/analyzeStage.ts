@@ -97,7 +97,7 @@ export function analyzeStage(deps: AnalyzeStageDeps): StageSpec {
       }
 
       if (cancellation) throw cancellation;
-      if (succeeded === 0) throw new AppError('INTERNAL', 'permanent', 'All analyzers failed');
+      if (succeeded === 0) throw new AppError('ALL_ANALYZERS_FAILED', 'permanent', 'All analyzers failed');
     },
   };
 }
