@@ -34,13 +34,18 @@ export type InstallOptions = { scanId: string; signal: AbortSignal } & (
   | { ecosystem: 'PyPI'; requirements: string[] }
 );
 
+/** One entry of /in/packages.json for the in-container analyzers (sandbox/node/analyze.mjs, sandbox/python/analyze.py). */
+export type AnalyzerPackage = { name: string; importNames: string[] };
+
 export type AnalyzeOptions = {
   scanId: string;
   ecosystem: Ecosystem;
   srcDir: string;
   /** A depsDir returned by install() for the same scan (anything else is refused). */
   depsDir?: string;
-  packages: string[];
+  /** Packages to look for. A bare string means `{ name, importNames: [name] }` (fine for npm; PyPI callers should pass
+   * the import names, e.g. `{ name: 'pyyaml', importNames: ['yaml'] }`). */
+  packages: Array<string | AnalyzerPackage>;
   signal: AbortSignal;
 };
 

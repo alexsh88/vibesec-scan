@@ -92,7 +92,7 @@ other scans, and the availability of the service.
 
 `--network none`, with these mounts: `/src` (the repo checkout, read-only), `/deps` (the phase-A deps dir,
 read-only, and only if it is under this scan's sandbox dir with no link components), `/in/packages.json`
-(read-only) and `/out` (read-write). The container runs our analyzer (`node /opt/vibesec/analyze.mjs` or
+(read-only; `{ ecosystem, packages: [{ name, importNames }] }`) and `/out` (read-write). The container runs our analyzer (`node /opt/vibesec/analyze.mjs` or
 `python /opt/vibesec/analyze.py`), and the host reads `/out/usages.json`, capped at 50 MB.
 
 ## Container flags (every container: install, analyze, proxy, helper)

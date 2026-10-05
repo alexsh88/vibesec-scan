@@ -436,14 +436,17 @@ describe('DockerSandbox.analyze', () => {
   it('runs offline with read-only /src, /deps, /in and a writable /out, and returns parsed usages', async () => {
     const { run, calls } = fake(async (args) => {
       const pk = JSON.parse(await readFile(join(mountSource(args, '/in')!, 'packages.json'), 'utf8'));
-      expect(pk).toEqual(['lodash', '@scope/x']);
+      expect(pk).toEqual({
+        ecosystem: 'npm',
+        packages: [{ name: 'lodash', importNames: ['lodash'] }, { name: '@scope/x', importNames: ['@scope/x', '@scope/x-alias'] }],
+      });
       await writeFile(join(mountSource(args, '/out')!, 'usages.json'), JSON.stringify({ usages: [{ package: 'lodash', file: 'a.js', line: 1 }] }));
       return ok();
     });
     const sb = sandbox(run);
     const depsDir = join(sb.scanRoot(SCAN), 'install-npm-abc', 'out', 'work', 'node_modules');
     await mkdir(depsDir, { recursive: true });
-    const r = await sb.analyze({ scanId: SCAN, ecosystem: 'npm', srcDir: repo, depsDir, packages: ['lodash', '@scope/x'], signal: signal() });
+    const r = await sb.analyze({ scanId: SCAN, ecosystem: 'npm', srcDir: repo, depsDir, packages: ['lodash', { name: '@scope/x', importNames: ['@scope/x', '@scope/x-alias'] }], signal: signal() });
     expect(r).toEqual({ ok: true, usages: { usages: [{ package: 'lodash', file: 'a.js', line: 1 }] } });
 
     const a = calls.find((c) => isWorkloadRun(c.args))!;
@@ -458,6 +461,16 @@ describe('DockerSandbox.analyze', () => {
     expect(a.args.slice(-2)).toEqual(['node', '/opt/vibesec/analyze.mjs']);
     // No proxy / network setup in phase B.
     expect(calls.some((c) => c.args[0] === 'network' || isDetachedRun(c.args))).toBe(false);
+  });
+
+  it('rejects a malformed package list before starting anything', async () => {
+    const { run, calls } = fake();
+    const bad = [{ name: 'x', importNames: 'x' }, { name: '', importNames: [] }, 'y'.repeat(301)] as unknown as string[];
+    for (const p of bad) {
+      expect(await sandbox(run).analyze({ scanId: SCAN, ecosystem: 'npm', srcDir: repo, packages: [p], signal: signal() }))
+        .toMatchObject({ ok: false, code: 'SANDBOX_ANALYZE_FAILED', message: 'invalid package list' });
+    }
+    expect(calls).toHaveLength(0);
   });
 
   it('uses the python image and script for PyPI', async () => {

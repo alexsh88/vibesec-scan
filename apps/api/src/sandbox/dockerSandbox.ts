@@ -5,7 +5,7 @@ import { isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { AppError } from '../errors/AppError';
 import { ProcessError, runProcess, type RunResult } from '../process/runProcess';
 import type {
-  AnalyzeOptions, AnalyzeResult, DockerSandboxOptions, InstallOptions, InstallResult, RunFn, SandboxAvailability,
+  AnalyzeOptions, AnalyzeResult, AnalyzerPackage, DockerSandboxOptions, InstallOptions, InstallResult, RunFn, SandboxAvailability,
 } from './types';
 
 /** Must match TAG in scripts/sandbox-build.mjs. */
@@ -585,9 +585,8 @@ export class DockerSandbox {
     if (opts.depsDir !== undefined && !within(scanRoot, resolve(opts.depsDir))) {
       return { ok: false, code: 'SANDBOX_ANALYZE_FAILED', message: 'depsDir is not a sandbox install of this scan' };
     }
-    if (opts.packages.length > MAX_PACKAGES || opts.packages.some((p) => typeof p !== 'string' || p.length > 300)) {
-      return { ok: false, code: 'SANDBOX_ANALYZE_FAILED', message: 'invalid package list' };
-    }
+    const packages = normalizePackages(opts.packages);
+    if (!packages) return { ok: false, code: 'SANDBOX_ANALYZE_FAILED', message: 'invalid package list' };
     if (opts.depsDir !== undefined) {
       try {
         await assertRealDirChain(scanRoot, resolve(opts.depsDir), false);
@@ -605,7 +604,7 @@ export class DockerSandbox {
     let touched = false;
     try {
       await makeDirs(inDir, outDir);
-      await writeFile(join(inDir, 'packages.json'), JSON.stringify(opts.packages));
+      await writeFile(join(inDir, 'packages.json'), JSON.stringify({ ecosystem: opts.ecosystem, packages }));
       const mounts: BindMount[] = [{ source: resolve(opts.srcDir), target: '/src', readonly: true }];
       if (opts.depsDir !== undefined) mounts.push({ source: resolve(opts.depsDir), target: '/deps', readonly: true });
       mounts.push({ source: inDir, target: '/in', readonly: true }, { source: outDir, target: '/out', readonly: false });
@@ -655,6 +654,21 @@ export class DockerSandbox {
     if (volumes.length) await this.quiet(['volume', 'rm', '-f', ...volumes]);
     await this.removeTree(scanId ?? 'sweep', scanId === undefined ? join(resolve(this.opts.workDir), 'sandbox') : this.scanRoot(scanId));
   }
+}
+
+const validName = (n: unknown): n is string => typeof n === 'string' && n.length > 0 && n.length <= 300;
+
+/** Normalizes the analyzer package list; null when it is malformed or too large. */
+function normalizePackages(list: Array<string | AnalyzerPackage>): AnalyzerPackage[] | null {
+  if (!Array.isArray(list) || list.length > MAX_PACKAGES) return null;
+  const out: AnalyzerPackage[] = [];
+  for (const p of list) {
+    const pkg = typeof p === 'string' ? { name: p, importNames: [p] } : p;
+    if (!validName(pkg?.name) || !Array.isArray(pkg.importNames) || pkg.importNames.length > 50) return null;
+    if (!pkg.importNames.every(validName)) return null;
+    out.push({ name: pkg.name, importNames: [...pkg.importNames] });
+  }
+  return out;
 }
 
 /** Fixed env for node installs: public registries only, proxy for every client, corepack strictly offline. */
