@@ -1,0 +1,194 @@
+import { existsSync } from 'node:fs';
+import { mkdir, readdir, rm, writeFile } from 'node:fs/promises';
+import { join } from 'node:path';
+import { AppError } from '../errors/AppError';
+import { ProcessError, runProcess, type RunResult } from '../process/runProcess';
+import { gitEnv, safeGitFlags } from './gitEnv';
+import { classifyGitFailure, fromProcessError } from './gitErrors';
+
+export type GitServiceOptions = {
+  workDir: string;
+  cloneTimeoutMs: number;
+  stallMs: number;
+  /** Only for local fixtures/tests (ALLOW_LOCAL_REPOS); production allows https only. */
+  allowFileProtocol: boolean;
+  remoteUrlFor?: (owner: string, name: string) => string;
+  gitBinary?: string;
+};
+
+export type GitCallOptions = { token?: string; signal?: AbortSignal; onActivity?: () => void };
+export type TreeEntry = { mode: string; type: 'blob' | 'commit' | 'tree'; blobSha: string; path: string };
+export type DiffEntry = { status: 'A' | 'M' | 'D' | 'R' | 'C' | 'T'; path: string; oldPath?: string };
+
+const SHA_RE = /^[0-9a-f]{40}$/i;
+const PROGRESS_RE = /^(?:remote:\s*)?([A-Za-z][A-Za-z ]+):\s+\d+%\s+\((\d+)\/(\d+)\)/;
+const SHORT_TIMEOUT_MS = 30_000;
+const MAX_TREE_BYTES = 64 * 1024 * 1024;
+const EMPTY_CONFIG = '.gitconfig-empty';
+const RM_OPTS = { recursive: true, force: true, maxRetries: 5, retryDelay: 200 } as const;
+
+export class GitService {
+  private readonly gitBinary: string;
+
+  constructor(private readonly opts: GitServiceOptions) {
+    this.gitBinary = opts.gitBinary ?? 'git';
+  }
+
+  /** Creates the workspace and returns `git --version`; fails fast when git is missing. */
+  async init(): Promise<string> {
+    await mkdir(this.opts.workDir, { recursive: true });
+    await writeFile(join(this.opts.workDir, EMPTY_CONFIG), '');
+    return (await this.git(['--version'], {})).trim();
+  }
+
+  remoteUrl(owner: string, name: string): string {
+    return this.opts.remoteUrlFor?.(owner, name) ?? `https://github.com/${owner}/${name}.git`;
+  }
+
+  scanDir(scanId: string): string {
+    return join(this.opts.workDir, scanId);
+  }
+
+  repoDir(scanId: string): string {
+    return join(this.scanDir(scanId), 'repo');
+  }
+
+  /** Resolves a branch, tag (annotated tags are peeled), `HEAD`, or full SHA to a commit SHA. */
+  async resolveRef(remote: string, ref: string, call: GitCallOptions = {}): Promise<string> {
+    if (SHA_RE.test(ref)) return ref.toLowerCase();
+    // Pass the explicit peel pattern too: with an exact (non-glob) refname, modern git omits the
+    // "refs/tags/<ref>^{}" advertisement unless it is itself requested, so an annotated tag would
+    // otherwise resolve to the tag object's SHA instead of the commit it points at.
+    const out = await this.git(['ls-remote', '--', remote, ref, `${ref}^{}`], { ...call, timeoutMs: SHORT_TIMEOUT_MS });
+    const refs = new Map<string, string>();
+    for (const line of out.split('\n')) {
+      const [sha, name] = line.trim().split('\t');
+      if (sha && name) refs.set(name, sha);
+    }
+    const sha = refs.get(`refs/heads/${ref}`)
+      ?? refs.get(`refs/tags/${ref}^{}`)
+      ?? refs.get(`refs/tags/${ref}`)
+      ?? refs.get(ref);
+    if (!sha) throw new AppError('REF_NOT_FOUND', 'permanent', 'Branch, tag or commit not found in this repository');
+    return sha;
+  }
+
+  /**
+   * Idempotent: reuses an existing checkout at `sha`, otherwise (re)clones with --filter=blob:none and
+   * checks out `sha` detached. A failed clone never leaves a half-populated directory behind.
+   */
+  async ensureCheckout(
+    scanId: string, remote: string, sha: string,
+    call: GitCallOptions & { onProgress?: (phase: string, done: number, total: number) => void } = {},
+  ): Promise<string> {
+    if (call.signal?.aborted) throw new AppError('CANCELLED', 'cancelled', 'Operation was cancelled');
+    if (!SHA_RE.test(sha)) throw new AppError('VALIDATION', 'permanent', 'Invalid commit SHA');
+    const dir = this.repoDir(scanId);
+
+    if (existsSync(join(dir, '.git'))) {
+      const head = await this.headSha(dir).catch(() => null);
+      if (head === sha.toLowerCase()) return dir;
+      await rm(dir, RM_OPTS);
+    }
+
+    await mkdir(this.scanDir(scanId), { recursive: true });
+    const long = { ...call, timeoutMs: this.opts.cloneTimeoutMs };
+    try {
+      await this.git(['clone', '--filter=blob:none', '--no-checkout', '--progress', '--', remote, dir], {
+        ...long,
+        onStderrLine: (line) => {
+          const m = line.match(PROGRESS_RE);
+          if (m) call.onProgress?.(m[1]!.trim(), Number(m[2]), Number(m[3]));
+        },
+      });
+      try {
+        await this.git(['checkout', '--force', '--detach', sha], { ...long, cwd: dir });
+      } catch (err) {
+        if (!(err instanceof AppError) || err.code !== 'REF_NOT_FOUND') throw err;
+        // The commit is not reachable from the advertised refs (e.g. a PR head): fetch it explicitly.
+        await this.git(['fetch', '--filter=blob:none', '--', 'origin', sha], { ...long, cwd: dir });
+        await this.git(['checkout', '--force', '--detach', sha], { ...long, cwd: dir });
+      }
+      return dir;
+    } catch (err) {
+      await rm(dir, RM_OPTS).catch(() => undefined);
+      throw err;
+    }
+  }
+
+  async headSha(dir: string): Promise<string> {
+    return (await this.git(['rev-parse', 'HEAD'], { cwd: dir })).trim().toLowerCase();
+  }
+
+  async listTree(dir: string, sha: string, call: GitCallOptions = {}): Promise<TreeEntry[]> {
+    const out = await this.git(['ls-tree', '-r', '-z', '--full-tree', sha], { ...call, cwd: dir, maxStdoutBytes: MAX_TREE_BYTES });
+    const entries: TreeEntry[] = [];
+    for (const record of out.split('\0')) {
+      if (!record) continue;
+      const tab = record.indexOf('\t');
+      const [mode, type, blobSha] = record.slice(0, tab).split(' ');
+      entries.push({ mode: mode!, type: type as TreeEntry['type'], blobSha: blobSha!, path: record.slice(tab + 1) });
+    }
+    return entries;
+  }
+
+  /** Changed paths between two commits, or null when the base commit is not available locally. */
+  async diffNameStatus(dir: string, baseSha: string, sha: string, call: GitCallOptions = {}): Promise<DiffEntry[] | null> {
+    let out: string;
+    try {
+      out = await this.git(['diff', '--name-status', '-z', '-M', baseSha, sha, '--'], { ...call, cwd: dir });
+    } catch (err) {
+      // An unknown base shows up as "bad object"/"unknown revision": no usable base → caller does a full scan.
+      if (err instanceof AppError && err.kind === 'permanent') return null;
+      throw err;
+    }
+    const parts = out.split('\0').filter((p) => p.length > 0);
+    const entries: DiffEntry[] = [];
+    for (let i = 0; i < parts.length;) {
+      const status = parts[i]!.charAt(0) as DiffEntry['status'];
+      if (status === 'R' || status === 'C') {
+        entries.push({ status, oldPath: parts[i + 1]!, path: parts[i + 2]! });
+        i += 3;
+      } else {
+        entries.push({ status, path: parts[i + 1]! });
+        i += 2;
+      }
+    }
+    return entries;
+  }
+
+  async removeScanDir(scanId: string): Promise<void> {
+    await rm(this.scanDir(scanId), RM_OPTS);
+  }
+
+  /** Removes workspace directories whose scan should not be kept; returns the removed scan ids. */
+  async sweep(keep: (scanId: string) => boolean): Promise<string[]> {
+    if (!existsSync(this.opts.workDir)) return [];
+    const removed: string[] = [];
+    for (const entry of await readdir(this.opts.workDir, { withFileTypes: true })) {
+      if (!entry.isDirectory() || keep(entry.name)) continue;
+      await this.removeScanDir(entry.name).catch(() => undefined);
+      removed.push(entry.name);
+    }
+    return removed;
+  }
+
+  private async git(
+    args: string[],
+    o: GitCallOptions & { cwd?: string; timeoutMs?: number; maxStdoutBytes?: number; onStderrLine?: (line: string) => void },
+  ): Promise<string> {
+    const env = gitEnv({ emptyConfigPath: join(this.opts.workDir, EMPTY_CONFIG), auth: { token: o.token } });
+    let result: RunResult;
+    try {
+      result = await runProcess(this.gitBinary, [...safeGitFlags(this.opts.allowFileProtocol), ...args], {
+        cwd: o.cwd, env, signal: o.signal, timeoutMs: o.timeoutMs ?? SHORT_TIMEOUT_MS, stallMs: this.opts.stallMs,
+        maxStdoutBytes: o.maxStdoutBytes, onStderrLine: o.onStderrLine, onActivity: o.onActivity,
+      });
+    } catch (err) {
+      if (err instanceof ProcessError) throw fromProcessError(err);
+      throw err;
+    }
+    if (result.code !== 0) throw classifyGitFailure(result.stderr, { hasToken: Boolean(o.token) });
+    return result.stdout;
+  }
+}
