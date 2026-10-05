@@ -7,6 +7,7 @@ const HTTP_STATUS: Partial<Record<ErrorCode, number>> = {
   AUTH_REQUIRED: 401,
   AUTH_INVALID: 403,
   NOT_FOUND: 404,
+  NOT_READY: 404,
   REPO_NOT_FOUND: 404,
   REF_NOT_FOUND: 404,
   CONFLICT: 409,
