@@ -283,3 +283,21 @@ describe('analyzeStage coverage', () => {
     expect(coverage.list(scanId)).toEqual([{ analyzer: 'sast', path: 'a.ts', status: 'cached' }]);
   });
 });
+
+describe('analyzeStage coverage of a failed analyzer', () => {
+  it('never persists coverage for an analyzer whose results were not persisted (a later rescan must not trust it)', async () => {
+    const { ctx, findings, indexRepo, scanId, db } = setup(['sast', 'quality']);
+    const coverage = new CoverageRepo(db);
+    const sast = makeAnalyzer({ id: 'sast', category: 'sast', run: async (actx) => { actx.recordCoverage?.('sast', 'a.ts', 'reviewed'); return []; } });
+    const crashed = makeAnalyzer({
+      id: 'quality', category: 'quality',
+      run: async (actx) => { actx.recordCoverage?.('quality', 'a.ts', 'reviewed'); throw new Error('boom after reviewing'); },
+    });
+    const unpersistable = makeAnalyzer({
+      id: 'config', category: 'quality',
+      run: async (actx) => { actx.recordCoverage?.('config', 'a.ts', 'reviewed'); return [{ bogus: true } as unknown as Finding]; },
+    });
+    await analyzeStage({ analyzers: [sast, crashed, unpersistable], findings, indexRepo, git: fakeGit, coverage }).run(ctx);
+    expect(coverage.list(scanId)).toEqual([{ analyzer: 'sast', path: 'a.ts', status: 'reviewed' }]);
+  });
+});

@@ -39,7 +39,7 @@ export type IncrementalDeps = {
   scans: Pick<ScanRepo, 'getRow' | 'findIncrementalBase'>;
   git: Pick<GitService, 'diffNameStatus' | 'fetchCommit'>;
   indexRepo: Pick<IndexRepo, 'imports' | 'entrypoints'>;
-  findings: Pick<FindingRepo, 'analyzerResult'>;
+  findings: Pick<FindingRepo, 'analyzerResult' | 'analyzersWithResults'>;
   coverage: Pick<CoverageRepo, 'list'>;
   llmCalls: Pick<LlmCallRepo, 'byAnalyzer'>;
   maxChangedRatio?: number;
@@ -137,13 +137,16 @@ export async function planIncremental(
     changed, deleted, imports: deps.indexRepo.imports(ctx.scanId), entrypoints: deps.indexRepo.entrypoints(ctx.scanId),
   });
   const baseCoverage = coverageMap(deps.coverage.list(base.id));
+  // Only an analyzer that COMPLETED in the base (it stored its result) lends its coverage: a crashed
+  // analyzer's "reviewed" files have no findings to re-attach, so they must be analyzed again.
+  const completed = deps.findings.analyzersWithResults(base.id);
   const empty = new Map<string, CoverageStatus>();
   return {
     baseScanId: base.id,
     baseCommitSha: base.commit_sha,
     changed, affected, deleted,
-    baseFindings: (analyzer) => deps.findings.analyzerResult(base.id, analyzer),
-    baseCoverage: (analyzer) => baseCoverage.get(analyzer) ?? empty,
+    baseFindings: (analyzer) => (completed.has(analyzer) ? deps.findings.analyzerResult(base.id, analyzer) : []),
+    baseCoverage: (analyzer) => (completed.has(analyzer) ? baseCoverage.get(analyzer) ?? empty : empty),
   };
 }
 

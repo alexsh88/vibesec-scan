@@ -119,6 +119,7 @@ export function analyzeStage(deps: AnalyzeStageDeps): StageSpec {
 
       let succeeded = 0;
       let cancellation: AppError | undefined;
+      const failedIds = new Set<string>();
       for (const settledResult of settled) {
         if (settledResult.status === 'rejected') {
           // runAnalyzer never throws, so this should not happen; handled defensively rather than crashing.
@@ -128,13 +129,17 @@ export function analyzeStage(deps: AnalyzeStageDeps): StageSpec {
         }
         const outcome = settledResult.value;
         if (outcome.ok) { succeeded++; continue; }
+        failedIds.add(outcome.analyzer.id);
         if (outcome.cancelled) { cancellation ??= outcome.appErr; continue; }
         ctx.warn({ code: 'ANALYZER_FAILED', message: `${outcome.analyzer.id} failed: ${outcome.appErr.userMessage}`, stage: 'ANALYZING' });
       }
 
       if (cancellation) throw cancellation;
-      reportCoverage(ctx, [...coverage.values()], deps.coverage);
-      if (deps.incremental) reportReuse(ctx, deps.incremental, plan, files, [...coverage.values()]);
+      // An analyzer whose results were not persisted (it threw, or its output failed validation) leaves
+      // no coverage behind: a later incremental rescan must never "reuse" files it has no findings for.
+      const entries = [...coverage.values()].filter((e) => !failedIds.has(e.analyzer));
+      reportCoverage(ctx, entries, deps.coverage);
+      if (deps.incremental) reportReuse(ctx, deps.incremental, plan, files, entries);
       if (succeeded === 0) throw new AppError('ALL_ANALYZERS_FAILED', 'permanent', 'All analyzers failed');
     },
   };
