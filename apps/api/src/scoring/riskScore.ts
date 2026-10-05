@@ -91,12 +91,15 @@ export function riskScore(s: RiskSignals): RiskResult {
  *     "drop everything" signal, not a nudge the weighting function could cancel out.
  *   - A finding the AI review explicitly refuted (`ai_refuted` / `ai_false_positive` riskFactor) is
  *     never scored above the top of the 'info' band — once a reviewable AI pass has said "this isn't
- *     real", the UI must not still present it as risky, whatever the raw signals say.
+ *     real", the UI must not still present it as risky, whatever the raw signals say. EXCEPT a
+ *     credential verified live against its provider: liveness is ground truth, so no AI verdict caps it.
+ *   - A credential verified live is never scored below the 'high' band (history-only, test-path or
+ *     AI-doubted context may lower the weighting, but a working key is always a high-priority issue).
  *
  * Pure: returns a new `RiskResult` (never mutates `result`). Each applied guard is itself recorded
  * as a `policy:*`-prefixed factor, so the UI can show *why* the score was overridden.
  */
-export function applyPolicyGuards(finding: Pick<Finding, 'ruleId' | 'riskFactors'>, result: RiskResult): RiskResult {
+export function applyPolicyGuards(finding: Pick<Finding, 'ruleId' | 'riskFactors' | 'secret'>, result: RiskResult): RiskResult {
   let score = Math.min(100, Math.max(0, result.score));
   const factors = [...result.factors];
 
@@ -110,15 +113,25 @@ export function applyPolicyGuards(finding: Pick<Finding, 'ruleId' | 'riskFactors
   }
 
   const infoCeiling = SEVERITY_BANDS.low - 1;
+  const isLive = finding.secret?.liveness === 'live';
   const isAiRefuted = finding.riskFactors.some((f) => f.factor === 'ai_refuted' || f.factor === 'ai_false_positive');
   // Malicious always wins: a malicious package is never itself AI-reviewed, but guard the ordering
-  // explicitly so these two rules can never fight over the same score.
-  if (!isMalicious && isAiRefuted && score > infoCeiling) {
+  // explicitly so these two rules can never fight over the same score. A credential the provider
+  // ACCEPTED is ground truth: no AI opinion can hide it.
+  if (!isMalicious && !isLive && isAiRefuted && score > infoCeiling) {
     factors.push({
       factor: 'policy:ai-refuted-ceiling', effect: infoCeiling - score,
       reason: 'AI review refuted this finding; never scored above info',
     });
     score = infoCeiling;
+  }
+
+  if (isLive && score < SEVERITY_BANDS.high) {
+    factors.push({
+      factor: 'policy:live-credential-floor', effect: SEVERITY_BANDS.high - score,
+      reason: 'Credentials verified live are never scored below high',
+    });
+    score = SEVERITY_BANDS.high;
   }
 
   return { score, factors };

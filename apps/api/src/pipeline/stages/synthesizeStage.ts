@@ -28,7 +28,7 @@ export function createSynthesizeStage(deps: SynthesizeStageDeps): StageSpec {
     name: 'SYNTHESIZING',
     fatal: false,
     async run(ctx) {
-      const findings = deps.findings.all(ctx.scanId).map((r) => r.finding);
+      const findings = deps.findings.all(ctx.scanId, { excludeTriage: ['false_positive'] }).map((r) => r.finding);
       const warningCodes = (deps.scans?.getDto(ctx.scanId)?.warnings ?? ctx.scan.warnings).map((w) => w.code);
       const { summary, fallbackReason } = await synthesizeSummary({ llm: deps.llm }, {
         scanId: ctx.scanId,

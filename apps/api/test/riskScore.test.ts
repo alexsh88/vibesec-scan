@@ -113,6 +113,20 @@ describe('applyPolicyGuards', () => {
     expect(result.score).toBe(14);
   });
 
+  it('never lets an AI verdict hide a credential verified live: no info ceiling, and a high-band floor', () => {
+    const live = makeFinding({
+      secret: { type: 'github-pat', redacted: 'ghp_…', liveness: 'live', inHistoryOnly: false },
+      riskFactors: [{ factor: 'ai_false_positive', effect: 0, reason: 'looks like a test value' }],
+    });
+    const capped = applyPolicyGuards(live, { score: 90, factors: [] });
+    expect(capped.score).toBe(90);
+    expect(capped.factors.some((f) => f.factor === 'policy:ai-refuted-ceiling')).toBe(false);
+    const floored = applyPolicyGuards(live, { score: 20, factors: [] });
+    expect(floored.score).toBe(65);
+    expect(severityFromScore(floored.score)).toBe('high');
+    expect(floored.factors).toContainEqual(expect.objectContaining({ factor: 'policy:live-credential-floor', effect: 45 }));
+  });
+
   it('does not touch an ai_refuted finding already at or below the info band', () => {
     const finding = makeFinding({ riskFactors: [{ factor: 'ai_refuted', effect: -60, reason: 'refuted' }] });
     const result = applyPolicyGuards(finding, { score: 5, factors: [] });

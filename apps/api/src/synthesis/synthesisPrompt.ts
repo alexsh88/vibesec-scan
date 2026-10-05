@@ -48,6 +48,8 @@ export type SynthesisInput = {
   coverage?: Partial<Record<CoverageStatus, number>> | undefined;
   /** Scan warning codes so far (degraded analyzers, budget, …). */
   warningCodes?: readonly string[];
+  /** "Now" for triage expiry (ISO; default: the current time). */
+  now?: string | undefined;
   /** Categories the scan looked for; a category with zero findings is only "clean" if it was scanned. */
   scannedCategories?: readonly Category[];
 };

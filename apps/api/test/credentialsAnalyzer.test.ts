@@ -218,6 +218,18 @@ describe('createCredentialsAnalyzer', () => {
     expect(f.riskFactors).toContainEqual(expect.objectContaining({ factor: 'live', effect: 1 }));
   });
 
+  it('an AI false-positive verdict never downgrades a credential verified live (the factor is kept, with no effect)', async () => {
+    const files = await writeRepoFiles({ 'test/fixtures/sample.ts': `export const key = "${fake.stripeTest()}";\n` }); // AI-judged type, FP heuristic path
+    const verifier = stubVerifier(() => ({ liveness: 'live', checkedAt: '2024-01-01T00:00:00.000Z', provider: 'github' }));
+    const analyzer = createCredentialsAnalyzer({ llm: stubLlm(), git: fakeGit(NO_HISTORY), verifier });
+    const findings = await analyzer.run(makeCtx(files, { options: { historyDepth: 0, verifySecrets: true } }));
+    expect(findings).toHaveLength(1);
+    const f = findings[0]!;
+    expect(f.severity).toBe('critical');
+    expect(f.confidence).not.toBe('low');
+    expect(f.riskFactors).toContainEqual(expect.objectContaining({ factor: 'ai_false_positive', effect: 0 }));
+  });
+
   it('a revoked credential is lowered in severity', async () => {
     const files = await writeRepoFiles({ 'src/config.ts': `export const token = "${fake.github()}";\n` }); // base: high
     const verifier = stubVerifier(() => ({ liveness: 'revoked', checkedAt: '2024-01-01T00:00:00.000Z', provider: 'github' }));

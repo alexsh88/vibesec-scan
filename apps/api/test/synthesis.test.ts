@@ -141,6 +141,33 @@ describe('id validation', () => {
   });
 });
 
+describe('deterministic grade floor and triage', () => {
+  it('never lets the model grade a scan better than the rubric applied to its findings', async () => {
+    const live = finding({ category: 'secret', ruleId: 'secret/github-pat', severity: 'critical', secret: { type: 'github-pat', redacted: 'ghp_…', liveness: 'live', inHistoryOnly: false } });
+    const { llm } = stubLlm(() => okOutput({ riskGrade: 'A' }));
+    const { summary } = await synthesizeSummary({ llm }, { scanId: 's1', findings: [live] }, { signal });
+    expect(summary.riskGrade).toBe('F');
+  });
+
+  it('keeps a model grade that is worse than the rubric', async () => {
+    const { llm } = stubLlm(() => okOutput({ riskGrade: 'D' }));
+    const { summary } = await synthesizeSummary({ llm }, { scanId: 's1', findings: [finding({ severity: 'medium' })] }, { signal });
+    expect(summary.riskGrade).toBe('D');
+  });
+
+  it('leaves findings triaged false_positive out of the digest, stats and grade (accepted_risk / wont_fix still count)', async () => {
+    const fp = finding({ severity: 'critical', triage: { status: 'false_positive', reason: 'test fixture', at: '2026-01-01T00:00:00.000Z' } });
+    const expired = finding({ severity: 'high', confidence: 'medium', triage: { status: 'false_positive', reason: 'old', at: '2026-01-01T00:00:00.000Z', expiresAt: '2026-02-01T00:00:00.000Z' } });
+    const accepted = finding({ severity: 'medium', triage: { status: 'accepted_risk', reason: 'known', at: '2026-01-01T00:00:00.000Z' } });
+    const { llm, calls } = stubLlm(() => okOutput({ riskGrade: 'A' }));
+    const { summary } = await synthesizeSummary({ llm }, { scanId: 's1', findings: [fp, expired, accepted], now: '2026-10-01T00:00:00.000Z' }, { signal });
+    expect(String(calls[0]!.prompt)).not.toContain(`"id":"${fp.id}"`);
+    expect(summary.stats.total).toBe(2);
+    expect(summary.riskGrade).toBe('C'); // the expired-FP high counts again; the triaged critical does not
+    expect(fallbackSummary({ scanId: 's1', findings: [fp], now: '2026-10-01T00:00:00.000Z' })).toMatchObject({ riskGrade: 'A', stats: { total: 0 } });
+  });
+});
+
 describe('fallback', () => {
   it.each([
     new AppError('LLM_UNAVAILABLE', 'transient', 'down'),
@@ -262,7 +289,8 @@ describe('SYNTHESIZING stage', () => {
     await stage.run(ctx);
     expect(summaries.get(scanId)?.generatedBy).toBe('llm');
     expect(warnings).toEqual([]);
-    expect(events).toEqual([{ type: 'summary', riskGrade: 'C', headline: 'One high issue', generatedBy: 'llm' }]);
+    // The model said C; a high-confidence high finding floors the grade at D (rubric).
+    expect(events).toEqual([{ type: 'summary', riskGrade: 'D', headline: 'One high issue', generatedBy: 'llm' }]);
   });
 
   it('falls back with a SYNTHESIS_FALLBACK warning when the model is unavailable', async () => {

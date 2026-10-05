@@ -173,11 +173,17 @@ function buildFinding(
   // simply wrong verdict silently dropping a real secret is a worse failure mode than a false
   // positive staying visible at low severity). When it judges the candidate a likely false positive,
   // downgrade it to 'info'/'low' confidence instead of filtering it out.
+  // A credential the provider ACCEPTED (liveness 'live') is ground truth: the AI verdict is still
+  // recorded as a factor (effect 0, so the UI can show the disagreement) but never downgrades it — and
+  // SCORING's policy guard exempts live credentials from the AI-refuted ceiling.
   const aiFalsePositive = isLikelyFalsePositive(verdict);
+  const live = verify.liveness === 'live';
   let severity = computedSeverity;
   let riskFactors = computedRiskFactors;
   let confidence = confidenceFor(candidate.type, verdict);
-  if (aiFalsePositive) {
+  if (aiFalsePositive && live) {
+    riskFactors = [...riskFactors, { factor: 'ai_false_positive', effect: 0, reason: `${verdict!.reason.slice(0, 150)} (overridden: verified live)` }];
+  } else if (aiFalsePositive) {
     const effect = sevIndex('info') - sevIndex(severity);
     riskFactors = [...riskFactors, { factor: 'ai_false_positive', effect, reason: verdict!.reason.slice(0, 200) }];
     severity = 'info';
@@ -194,7 +200,8 @@ function buildFinding(
     : template.explanation;
   // I5: note the lines we folded into this one finding, so the dedupe is visible, not silent.
   if (occurrenceCount > 1) explanation += ` Found on ${occurrenceCount} lines in this file.`;
-  if (aiFalsePositive) explanation += ' AI triage judged this value likely a test/example credential rather than a real secret.';
+  if (aiFalsePositive && live) explanation += ' AI triage judged this value likely a test/example credential, but the provider accepted it: it is live.';
+  else if (aiFalsePositive) explanation += ' AI triage judged this value likely a test/example credential rather than a real secret.';
   const producedBy = JUDGEMENT_TYPES.has(candidate.type) && verdict !== undefined ? ['regex+llm'] : ['regex'];
 
   return {

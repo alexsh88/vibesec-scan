@@ -1,6 +1,6 @@
 import {
-  CATEGORIES, SEVERITIES, ScanSummarySchema,
-  type Category, type Finding, type FixAction, type NextAction, type ScanSummary, type Severity, type SummaryStats, type TopRisk,
+  activeTriage, CATEGORIES, SEVERITIES, ScanSummarySchema,
+  type Category, type Finding, type FixAction, type NextAction, type RiskGrade, type ScanSummary, type Severity, type SummaryStats, type TopRisk,
 } from '@vibesec/shared';
 import { toAppError } from '../errors/AppError';
 import type { LlmClient } from '../llm/LlmClient';
@@ -32,11 +32,43 @@ export function computeStats(findings: readonly Finding[]): SummaryStats {
 }
 
 /**
- * A copied summary (full-scan cache hit) brought up to date with THIS scan's findings after their triage
- * and new/existing/fixed were recomputed: the stats are recounted.
+ * The findings a summary is about: the scan's current findings minus those triaged `false_positive`
+ * (decision still in force at `now`) and minus `fixed` rows. `accepted_risk` / `wont_fix` findings still
+ * count — the risk exists, someone decided to live with it — so they stay in the stats and the grade.
  */
-export function refreshSummary(summary: ScanSummary, findings: readonly Finding[]): ScanSummary {
-  return ScanSummarySchema.parse({ ...summary, stats: computeStats(findings) });
+export function summaryFindings(findings: readonly Finding[], now?: string): Finding[] {
+  return findings.filter((f) => f.scanStatus !== 'fixed' && activeTriage(f, now)?.status !== 'false_positive');
+}
+
+function scopedInput(input: SynthesisInput): SynthesisInput {
+  return { ...input, findings: summaryFindings(input.findings, input.now) };
+}
+
+const GRADE_ORDER: readonly RiskGrade[] = ['A', 'B', 'C', 'D', 'F'];
+export const worseGrade = (a: RiskGrade, b: RiskGrade): RiskGrade => (GRADE_ORDER.indexOf(a) >= GRADE_ORDER.indexOf(b) ? a : b);
+
+/** The rubric (gradeFor) over the non-info findings: the floor a summary's grade can never beat. */
+export function deterministicGrade(findings: readonly Finding[]): RiskGrade {
+  return gradeFor(findings.filter((f) => f.severity !== 'info').map(toDigestEntry));
+}
+
+/**
+ * A copied summary (full-scan cache hit) brought up to date with THIS scan's findings after their triage
+ * and new/existing/fixed were recomputed: stats recounted, references to findings no longer in scope
+ * dropped, and the grade floored by the rubric.
+ */
+export function refreshSummary(summary: ScanSummary, findings: readonly Finding[], now?: string): ScanSummary {
+  const scoped = summaryFindings(findings, now);
+  const ids = new Set(scoped.map((f) => f.id));
+  const topRisks = summary.topRisks
+    .map((r) => ({ ...r, findingIds: r.findingIds.filter((id) => ids.has(id)) }))
+    .filter((r) => r.findingIds.length > 0);
+  const nextActions = summary.nextActions
+    .map((a) => ({ ...a, findingIds: a.findingIds.filter((id) => ids.has(id)) }))
+    .filter((a) => a.fixActionId !== undefined || a.findingIds.length > 0);
+  return ScanSummarySchema.parse({
+    ...summary, topRisks, nextActions, stats: computeStats(scoped), riskGrade: worseGrade(summary.riskGrade, deterministicGrade(scoped)),
+  });
 }
 
 /**
@@ -109,7 +141,8 @@ function positiveObservations(input: SynthesisInput, stats: SummaryStats): strin
   return out.slice(0, 5);
 }
 
-export function fallbackSummary(input: SynthesisInput): ScanSummary {
+export function fallbackSummary(rawInput: SynthesisInput): ScanSummary {
+  const input = scopedInput(rawInput);
   const stats = computeStats(input.findings);
   const relevant = input.findings.filter((f) => f.severity !== 'info')
     .sort((a, b) => b.riskScore - a.riskScore || a.id.localeCompare(b.id));
@@ -156,7 +189,8 @@ export function fallbackSummary(input: SynthesisInput): ScanSummary {
 // LLM synthesis (Opus, findings-only input)
 // ---------------------------------------------------------------------------------------------
 
-export async function synthesizeSummary(deps: SynthesizeDeps, input: SynthesisInput, opts: SynthesizeOpts): Promise<SynthesisResult> {
+export async function synthesizeSummary(deps: SynthesizeDeps, rawInput: SynthesisInput, opts: SynthesizeOpts): Promise<SynthesisResult> {
+  const input = scopedInput(rawInput);
   const digest = buildDigest(input);
   const stats = computeStats(input.findings);
   let output: SynthesisOutput;
@@ -183,7 +217,8 @@ export async function synthesizeSummary(deps: SynthesizeDeps, input: SynthesisIn
   if (!nextActions.length && digest.entries.length) nextActions = fallbackSummary(input).nextActions;
 
   const summary = ScanSummarySchema.parse({
-    scanId: input.scanId, riskGrade: output.riskGrade, headline: output.headline, overview: output.overview,
+    // The model's grade can only make it worse: never better than the rubric applied to the findings.
+    scanId: input.scanId, riskGrade: worseGrade(output.riskGrade, deterministicGrade(input.findings)), headline: output.headline, overview: output.overview,
     topRisks, nextActions, positiveObservations: output.positiveObservations, stats, generatedBy: 'llm', model,
   });
   return { summary };

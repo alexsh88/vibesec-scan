@@ -73,3 +73,14 @@ export const FindingSummarySchema = FindingSchema.pick({
   id: true, category: true, title: true, severity: true, location: true,
 });
 export type FindingSummary = z.infer<typeof FindingSummarySchema>;
+
+/**
+ * The finding's triage decision if it is still in force at `now` (an `expiresAt` in the past means the
+ * decision lapsed: the finding counts as open again everywhere — lists, summary, grade, exports).
+ */
+export function activeTriage(f: Pick<Finding, 'triage'>, now: string = new Date().toISOString()): Triage | undefined {
+  const t = f.triage;
+  if (!t) return undefined;
+  if (t.expiresAt !== undefined && Date.parse(t.expiresAt) <= Date.parse(now)) return undefined;
+  return t;
+}

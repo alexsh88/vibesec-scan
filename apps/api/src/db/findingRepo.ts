@@ -1,4 +1,4 @@
-import { FindingSchema, type Category, type Finding, type Severity } from '@vibesec/shared';
+import { activeTriage, FindingSchema, type Category, type Finding, type Severity, type TriageStatus } from '@vibesec/shared';
 import { AppError } from '../errors/AppError';
 import { SEVERITY_RANK } from '../findings/helpers';
 import type { Db } from './database';
@@ -93,11 +93,19 @@ export class FindingRepo {
    * score, synthesis, exports). `fixed` rows (findings of the previous scan this one no longer has) are
    * left out unless `includeFixed`.
    */
-  all(scanId: string, opts: { includeFixed?: boolean } = {}): FindingRow[] {
+  all(scanId: string, opts: { includeFixed?: boolean; excludeTriage?: readonly TriageStatus[] } = {}): FindingRow[] {
     const where = opts.includeFixed ? '' : ` AND ${NOT_FIXED_SQL}`;
     const rows = this.db.prepare(`SELECT analyzer, data_json FROM findings WHERE scan_id = ?${where} ORDER BY id`)
       .all(scanId) as { analyzer: string; data_json: string }[];
-    return rows.map((r) => ({ analyzer: r.analyzer, finding: JSON.parse(r.data_json) as Finding }));
+    const out = rows.map((r) => ({ analyzer: r.analyzer, finding: JSON.parse(r.data_json) as Finding }));
+    if (!opts.excludeTriage?.length) return out;
+    // Only a decision still in force excludes a finding (an expired triage counts as open).
+    const excluded = new Set(opts.excludeTriage);
+    const now = this.now();
+    return out.filter((r) => {
+      const t = activeTriage(r.finding, now);
+      return !t || !excluded.has(t.status);
+    });
   }
 
   /** Atomically replaces every finding row of a scan (fixed ones included) — the full-scan cache copy. */
