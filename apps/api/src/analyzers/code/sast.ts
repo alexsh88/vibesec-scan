@@ -263,11 +263,17 @@ const RULE_HINT_IDS: Record<string, SastIssue['ruleId']> = {
  * to confirm or refute, exactly like the config analyzer's hints; a hint never becomes a finding by
  * itself. Without them the code path never saw these rules (envExposure only ran on config files).
  */
+function ruleHintIssues(path: string, content: string): Array<RawCodeIssue & { sastRuleId: SastIssue['ruleId'] }> {
+  return clientExposedCredentialIssues([{ path, text: content }]).flatMap((h) => {
+    const sastRuleId = RULE_HINT_IDS[h.ruleId];
+    return sastRuleId ? [{ ...h, sastRuleId }] : [];
+  });
+}
+
 function ruleHintsFor(path: string, content: string): string {
   const lines: string[] = [];
-  for (const h of clientExposedCredentialIssues([{ path, text: content }])) {
-    const ruleId = RULE_HINT_IDS[h.ruleId];
-    if (ruleId) lines.push(`- line ${h.startLine}: ${ruleId} (${h.cwe ?? 'no CWE'}) — ${h.explanation} Code: ${h.snippet}`);
+  for (const h of ruleHintIssues(path, content)) {
+    lines.push(`- line ${h.startLine}: ${h.sastRuleId} (${h.cwe ?? 'no CWE'}) — ${h.explanation} Code: ${h.snippet}`);
   }
   return lines.length ? untrustedText('rule-hints', lines.join('\n')) : '(no rule hints for this file)';
 }
@@ -361,7 +367,7 @@ type WorkItem = { path: string; pass: SastPass };
  */
 function planFiles(
   ctx: AnalyzerContext, triaged: Map<string, FileTriage>, entrypoints: ReadonlySet<string>,
-): { deep: string[]; fast: string[]; notRelevant: string[] } {
+): { deep: string[]; fast: string[]; notRelevant: string[]; zeroRelevance: string[] } {
   const indexed = ctx.files.filter((f) => f.skipReason === null);
   const isTestish = (f: IndexedFile) => f.tags.includes('test') || f.tags.includes('example');
   const usable = new Set(indexed.filter((f) => !isTestish(f)).map((f) => f.path));
@@ -387,13 +393,14 @@ function planFiles(
     .sort();
 
   const fast: string[] = [];
+  const zeroRelevance: string[] = [];
   for (const [path, t] of triaged) {
     if (!usable.has(path) || deepSet.has(path)) continue;
     if (t.relevance >= 1) fast.push(path);
-    else notRelevant.push(path);
+    else zeroRelevance.push(path);
   }
   fast.sort(byRisk);
-  return { deep: [...top, ...policy, ...rest], fast, notRelevant: notRelevant.sort() };
+  return { deep: [...top, ...policy, ...rest], fast, notRelevant: [...notRelevant, ...zeroRelevance].sort(), zeroRelevance: zeroRelevance.sort() };
 }
 
 export function createSastAnalyzer(deps: SastAnalyzerDeps): Analyzer {
@@ -428,7 +435,15 @@ export function createSastAnalyzer(deps: SastAnalyzerDeps): Analyzer {
     const entrySet = new Set(entrypoints.map((e) => e.path));
 
     const plan = planFiles(ctx, triage.files, entrySet);
-    for (const p of plan.notRelevant) record(p, 'not-relevant');
+    // A deterministic rule hint overrides a relevance-0 triage verdict: the file gets a deep review so
+    // Claude can confirm or refute the hint (otherwise the hint would never reach a model).
+    const promoted = new Set<string>();
+    for (const p of plan.zeroRelevance) {
+      const content = await readRepoFile(ctx.repoDir, p);
+      if (content !== null && ruleHintIssues(p, content).length > 0) promoted.add(p);
+    }
+    plan.deep.push(...promoted);
+    for (const p of plan.notRelevant) if (!promoted.has(p)) record(p, 'not-relevant');
 
     // Tier-1 demand projection for the deep pass, shrinking as files finish (see llm/budget.ts).
     const sizeOf = new Map(ctx.files.map((f) => [f.path, f.size]));

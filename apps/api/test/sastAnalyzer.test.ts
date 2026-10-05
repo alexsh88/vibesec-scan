@@ -227,6 +227,18 @@ describe('SAST analyzer — prompt', () => {
     expect(SAST_SYSTEM_PROMPT).toMatch(/rule hints/i);
   });
 
+  it('reviews a relevance-0 file anyway (deep pass) when it has a rule hint; test files stay not-relevant', async () => {
+    const hinted = 'export const k = process.env.NEXT_PUBLIC_STRIPE_SECRET_KEY!;\n';
+    const files = await writeFiles({ 'web/lib/keys.ts': hinted, 'web/lib/plain.ts': 'export const a = 1;\n', 'test/keys.test.ts': hinted }, { 'test/keys.test.ts': ['test'] });
+    const { llm, calls } = stubLlm(async () => ok([]));
+    const coverage = new Map<string, CoverageStatus>();
+    await createSastAnalyzer({
+      llm, triage: triageOf(tri('web/lib/keys.ts', 0), tri('web/lib/plain.ts', 0), tri('test/keys.test.ts', 0)), indexRepo: indexRepoOf(),
+    }).run(makeCtx(files, { coverage }));
+    expect(calls.map((c) => [targetOf(c), c.role])).toEqual([['web/lib/keys.ts', 'deep']]);
+    expect(Object.fromEntries(coverage)).toEqual({ 'web/lib/keys.ts': 'reviewed', 'web/lib/plain.ts': 'not-relevant', 'test/keys.test.ts': 'not-relevant' });
+  });
+
   it('system prompt lists the rule catalogue, rubrics and the injection rule', () => {
     for (const s of ['vibesec/idor', 'vibesec/supabase-missing-rls', 'vibesec/prompt-injection-attempt', 'sast/ssrf', 'critical:', 'Confidence rubric', 'EXACT code']) {
       expect(SAST_SYSTEM_PROMPT).toContain(s);
