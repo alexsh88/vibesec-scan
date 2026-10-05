@@ -6,7 +6,6 @@
 import type { Finding, Severity } from '@vibesec/shared';
 import type { RiskSignals } from './factors';
 import { MALICIOUS_RULE_ID } from './factors';
-import { provisionalScore } from '../findings/helpers';
 
 export type ScoredFactor = { factor: string; effect: number; reason: string };
 export type RiskResult = { score: number /* 0–100 */; factors: ScoredFactor[] };
@@ -26,32 +25,58 @@ export function severityFromScore(score: number): Severity {
   return 'info';
 }
 
+/** Impact anchor per base severity (0–100), before any likelihood/context adjustment. */
+const IMPACT: Record<Severity, number> = { critical: 92, high: 75, medium: 52, low: 28, info: 8 };
+/** Chips smaller than this many points are not shown (they still move the score). */
+const MIN_VISIBLE_EFFECT = 2;
+
 /**
- * TODO(user): the weighting is a deliberate product decision written by the author.
- * Turn the signals into a 0–100 score and the list of factors shown in the UI
- * (e.g. "Live AWS key +25", "Dev dependency −20", "Reachable from a public route +15").
+ * Risk = impact × likelihood, adjusted by context — the model used by contextual-prioritization
+ * products (OX Security: reachability, exploitability, exposure, business impact on top of raw
+ * CVSS; Snyk Risk Score: CVSS impact × likelihood incl. exploit signals, reachability, transitive
+ * depth, malicious packages).
  *
- * Trade-offs to weigh before writing this:
- *   - Additive (sum of signed effects off a base score) vs. multiplicative (e.g. confidence as a
- *     scaling factor on the total) — additive is easier to explain per-factor in the UI, since each
- *     effect is independently meaningful; multiplicative compounds uncertainty across every factor
- *     at once instead of discounting the final total by it.
- *   - Caps: should a refuted or AI-unreviewed finding be capped below a confirmed one of the same
- *     base severity, no matter how many positive factors it accumulates? (`applyPolicyGuards` below
- *     enforces the *hard* floor/ceiling for malicious/refuted findings either way — this is about
- *     the *soft* shape of the weighting underneath, e.g. whether a merely-low-confidence finding
- *     should also be discounted.)
- *   - Malicious packages: pin to critical inside this function too, or leave that entirely to the
- *     policy guard and let this function treat `malicious` as just another large positive factor?
- *   - Confidence as a multiplier on the whole score, vs. only on the factors that are inherently
- *     uncertain (AI-judged ones), vs. not used at all (confidence is already baked into each
- *     analyzer's base severity before this ever runs, so double-counting it here would be easy).
- *   - How many factors to surface in `factors` — every signal that nudged the score at all, or only
- *     the ones large enough to be worth a UI chip (e.g. |effect| above some threshold)?
+ * - Impact: the base-severity anchor, or the advisory CVSS (×10) when higher.
+ * - Likelihood/context: multipliers applied in a fixed order. Each one is converted into the point
+ *   difference it caused, so every factor becomes an explainable UI chip ("Live credential +23").
+ * - Confidence is applied once, here (analyzers set confidence; they don't fold it into severity).
+ * - Hard product rules (malicious ⇒ critical, AI-refuted ⇒ info, 0–100 clamp) are NOT here: they
+ *   live in `applyPolicyGuards`, so a weighting tweak can never break them.
  */
 export function riskScore(s: RiskSignals): RiskResult {
-  // Placeholder until the author writes the weighting: base severity only.
-  return { score: provisionalScore(s.baseSeverity), factors: [] };
+  const factors: ScoredFactor[] = [];
+  let score = s.cvss !== null ? Math.max(IMPACT[s.baseSeverity], s.cvss * 10) : IMPACT[s.baseSeverity];
+  const apply = (factor: string, multiplier: number, reason: string) => {
+    const next = Math.min(100, score * multiplier);
+    const effect = Math.round(next - score);
+    score = next;
+    if (Math.abs(effect) >= MIN_VISIBLE_EFFECT) factors.push({ factor, effect, reason });
+  };
+
+  // Exploitability — credentials
+  if (s.liveness === 'live') apply('live_credential', 1.3, 'Credential verified live against the provider');
+  if (s.liveness === 'revoked') apply('revoked_credential', 0.35, 'Credential rejected by the provider (revoked)');
+  if (s.inHistoryOnly && s.liveness !== 'live') apply('history_only', 0.75, 'Only in git history, not in current code');
+  if (s.clientExposed) apply('client_exposed', 1.2, 'Shipped to browsers via a public env prefix');
+  // Exploitability — dependencies (root vs inner library)
+  if (s.reachability === 'reachable') apply('reachable', 1.15, 'Vulnerable code is called from the application');
+  if (s.reachability === 'unknown' && s.direct === false) apply('transitive_unknown', 0.85, 'Transitive dependency; reachable only through its parent');
+  if (s.reachability === 'unreachable') apply('unreachable', 0.45, 'Package is never imported by application code');
+  if (s.scope === 'dev') apply('dev_dependency', 0.6, 'Development-only dependency, not shipped');
+  // Exposure — code
+  if (s.publicRouteExposure) apply('public_route', 1.2, 'Reachable from a public route');
+  else if (s.entrypointExposure) apply('entrypoint', 1.1, 'Starts at an application entrypoint');
+  // Context
+  if (s.fileContext === 'test' || s.fileContext === 'example' || s.fileContext === 'docs') {
+    apply('non_production_code', 0.4, `Located in ${s.fileContext} code`);
+  } else if (s.fileContext === 'generated') apply('generated_code', 0.7, 'Located in generated/vendored code');
+  // Confidence and AI review
+  if (s.confidence === 'medium') apply('medium_confidence', 0.9, 'Medium confidence');
+  if (s.confidence === 'low') apply('low_confidence', 0.7, 'Low confidence');
+  if (s.skepticWeakened) apply('skeptic_weakened', 0.85, 'Independent AI review found mitigating context');
+  if (s.aiUnreviewed) apply('ai_unreviewed', 0.95, 'AI review returned no verdict');
+
+  return { score: Math.round(score), factors };
 }
 
 /**

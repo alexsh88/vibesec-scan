@@ -135,3 +135,50 @@ describe('applyPolicyGuards', () => {
     expect(input).toEqual({ score: 10, factors: [] });
   });
 });
+
+describe('riskScore weighting (impact × likelihood/context)', () => {
+  const score = (f: Finding, ctx: RiskSignalContext = emptyCtx) => {
+    const r = riskScore(extractRiskSignals(f, ctx));
+    return { ...r, severity: severityFromScore(r.score) };
+  };
+  const dep = (over: Partial<NonNullable<Finding['dependency']>>, base: Severity = 'critical') => makeFinding({
+    category: 'dependency', ruleId: 'dependency/vulnerable-package', baseSeverity: base,
+    dependency: { ecosystem: 'npm', name: 'lodash', version: '4.17.15', scope: 'prod', direct: true, paths: [], advisories: [], reachability: 'imported', ...over },
+  });
+
+  it('a live high credential becomes critical, with an explaining chip', () => {
+    const r = score(makeFinding({ secret: { type: 'aws-access-key', redacted: 'AKIA…', liveness: 'live', inHistoryOnly: false } }));
+    expect(r.severity).toBe('critical');
+    expect(r.factors.find((f) => f.factor === 'live_credential')?.effect).toBeGreaterThan(0);
+  });
+
+  it('a revoked credential drops to low', () => {
+    expect(score(makeFinding({ secret: { type: 'aws-access-key', redacted: 'AKIA…', liveness: 'revoked', inHistoryOnly: false } })).severity).toBe('low');
+  });
+
+  it('root vs inner library: reachable direct > imported > transitive-unknown > unreachable > dev+unreachable', () => {
+    const s = [
+      score(dep({ reachability: 'reachable' })).score,
+      score(dep({ reachability: 'imported' })).score,
+      score(dep({ reachability: 'unknown', direct: false })).score,
+      score(dep({ reachability: 'unreachable' })).score,
+      score(dep({ reachability: 'unreachable', scope: 'dev' })).score,
+    ];
+    expect([...s].sort((a, b) => b - a)).toEqual(s);
+    expect(severityFromScore(s[0]!)).toBe('critical');
+    expect(severityFromScore(s[3]!)).toBe('medium');
+    expect(severityFromScore(s[4]!)).toBe('low');
+  });
+
+  it('a critical finding in test code is not ranked as critical', () => {
+    const r = score(makeFinding({ category: 'sast', ruleId: 'sast/sql-injection', baseSeverity: 'critical', secret: undefined, location: { file: 'test/fixtures/db.test.ts', startLine: 1, endLine: 1, snippet: '', permalink: '' } }));
+    expect(['low', 'medium']).toContain(r.severity);
+    expect(r.factors.map((f) => f.factor)).toContain('non_production_code');
+  });
+
+  it('public-route exposure raises a high code finding', () => {
+    const f = makeFinding({ category: 'sast', ruleId: 'sast/ssrf', baseSeverity: 'high', location: { file: 'src/routes/x.ts', startLine: 1, endLine: 1, snippet: '', permalink: '' } });
+    expect(score(f, { entrypoints: new Set(['src/routes/x.ts']), publicRoutes: new Set(['src/routes/x.ts']) }).score)
+      .toBeGreaterThan(score(f).score);
+  });
+});
