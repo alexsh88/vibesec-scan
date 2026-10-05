@@ -3,6 +3,7 @@ import type { AuditLogger } from '../audit/AuditLogger';
 import type { FindingRepo } from '../db/findingRepo';
 import type { ScanRepo } from '../db/scanRepo';
 import { AppError } from '../errors/AppError';
+import { fingerprintsOf } from '../pipeline/stages/scanStatus';
 import type { Suppression, SuppressionRepo } from './suppressionRepo';
 
 export type TriageInput = { status: TriageStatus; reason: string; expiresAt?: string };
@@ -33,10 +34,14 @@ export class SuppressionService {
   setTriage(scanId: string, findingId: string, input: TriageInput, meta: TriageMeta): Finding {
     const { repoId, finding } = this.resolve(scanId, findingId);
     const at = this.now();
-    this.suppressions.set({
-      repoId, fingerprint: finding.fingerprint, status: input.status, reason: input.reason,
-      createdBy: 'local-user', expiresAt: input.expiresAt ?? null,
-    });
+    // Recorded under every fingerprint the finding stands for (its own + those merged into it by
+    // cross-analyzer dedupe), so the decision sticks whichever analyzer reports the bug next time.
+    for (const fingerprint of fingerprintsOf(finding)) {
+      this.suppressions.set({
+        repoId, fingerprint, status: input.status, reason: input.reason,
+        createdBy: 'local-user', expiresAt: input.expiresAt ?? null,
+      });
+    }
     const triage: Triage = { status: input.status, reason: input.reason, at, ...(input.expiresAt ? { expiresAt: input.expiresAt } : {}) };
     const updated: Finding = { ...finding, triage };
     this.findings.update(scanId, [updated]);
@@ -50,7 +55,7 @@ export class SuppressionService {
 
   clearTriage(scanId: string, findingId: string, meta: TriageMeta): Finding {
     const { repoId, finding } = this.resolve(scanId, findingId);
-    this.suppressions.clear(repoId, finding.fingerprint);
+    for (const fingerprint of fingerprintsOf(finding)) this.suppressions.clear(repoId, fingerprint);
     const previousStatus = finding.triage?.status;
     const updated: Finding = { ...finding };
     delete updated.triage;
@@ -79,7 +84,8 @@ export class SuppressionService {
     if (active.size === 0) return;
     const updates: Finding[] = [];
     for (const { finding } of this.findings.all(scanId)) {
-      const sup = active.get(finding.fingerprint);
+      // Its own fingerprint or one merged into it (crossDedupe), so a merge winner keeps the decision.
+      const sup = fingerprintsOf(finding).map((fp) => active.get(fp)).find((x) => x !== undefined);
       if (!sup) continue;
       const triage: Triage = { status: sup.status, reason: sup.reason, at: sup.createdAt, ...(sup.expiresAt ? { expiresAt: sup.expiresAt } : {}) };
       const current = finding.triage;

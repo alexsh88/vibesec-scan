@@ -118,6 +118,18 @@ describe('applyScanStatus (new / existing / fixed)', () => {
     expect(await applyScanStatus(deps, cur)).toMatchObject({ new: 0, existing: 0, fixed: 0 });
   });
 
+  it('matches findings through mergedFingerprints in both directions (another analyzer winning a merge is not new+fixed)', async () => {
+    const { findings, scan, complete, deps } = setup();
+    const prev = scan({ sha: SHA1 });
+    findings.replaceForAnalyzer(prev, 'sast', [finding(prev, 'taint-fp', { mergedFingerprints: ['sast-fp'] }), finding(prev, 'plain-fp')]);
+    findings.saveAnalyzerResult(prev, 'sast', []);
+    complete(prev);
+    const cur = scan();
+    findings.replaceForAnalyzer(cur, 'sast', [finding(cur, 'sast-fp'), finding(cur, 'other-fp', { mergedFingerprints: ['plain-fp'] })]);
+    findings.saveAnalyzerResult(cur, 'sast', []);
+    expect(await applyScanStatus(deps, cur)).toEqual({ previousScanId: prev, new: 0, existing: 2, fixed: 0 });
+  });
+
   describe('baseline selection (no false "fixed")', () => {
     function withPrevious(prevOpts: ScanOpts, ancestry?: (a: string, b: string) => boolean | null, curOpts: ScanOpts = {}) {
       const s = setup(ancestry);

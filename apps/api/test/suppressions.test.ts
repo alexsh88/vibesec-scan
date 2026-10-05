@@ -116,6 +116,33 @@ describe('Finding triage / suppression', () => {
     expect(got.triage).toMatchObject({ status: 'false_positive', reason: 'fp' });
   });
 
+  it('carries triage across a cross-analyzer merge in either direction (mergedFingerprints)', async () => {
+    await start();
+    const scan1 = (await createScan()).json();
+    await c.runner.whenIdle();
+    // Scan 1: the taint finding won the merge and absorbed the SAST one; the user triages the winner.
+    const winner = finding(scan1.scanId, { fingerprint: 'taint-fp', mergedFingerprints: ['sast-fp'] });
+    const plain = finding(scan1.scanId, { fingerprint: 'plain-fp' });
+    c.findings.replaceForAnalyzer(scan1.scanId, 'secrets', [winner, plain]);
+    for (const f of [winner, plain]) {
+      await app.inject({ method: 'PUT', url: `/api/scans/${scan1.scanId}/findings/${f.id}/triage`, payload: { status: 'false_positive', reason: 'fp' } });
+    }
+
+    const scan2 = (await createScan()).json();
+    await c.runner.whenIdle();
+    // Scan 2: only the SAST finding is reported (no merge), and the plain one became a merge winner.
+    const alone = finding(scan2.scanId, { id: 'alone', fingerprint: 'sast-fp' });
+    const newWinner = finding(scan2.scanId, { id: 'new-winner', fingerprint: 'other-fp', mergedFingerprints: ['plain-fp'] });
+    c.findings.replaceForAnalyzer(scan2.scanId, 'secrets', [alone, newWinner]);
+    c.suppressions.applySuppressions(scan2.scanId);
+    expect(c.findings.get(scan2.scanId, 'alone')?.triage?.status).toBe('false_positive');
+    expect(c.findings.get(scan2.scanId, 'new-winner')?.triage?.status).toBe('false_positive');
+
+    // Clearing the triage clears every fingerprint it was recorded under.
+    await app.inject({ method: 'DELETE', url: `/api/scans/${scan1.scanId}/findings/${winner.id}/triage` });
+    expect(c.suppressions.listByRepo(c.scans.getDto(scan1.scanId)!.repo.id).map((x) => x.fingerprint)).toEqual(['plain-fp']);
+  });
+
   it('does not re-apply an expired suppression to a later scan', async () => {
     await start();
     const scan1 = (await createScan()).json();

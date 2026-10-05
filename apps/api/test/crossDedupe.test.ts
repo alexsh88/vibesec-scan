@@ -134,3 +134,42 @@ describe('crossDedupe', () => {
     expect(r.kept).toHaveLength(2);
   });
 });
+
+describe('crossDedupe: stable identity, no over-merging', () => {
+  const sink = (file: string, line: number) => [
+    { kind: 'source' as const, file: 'src/routes.ts', line: 3, code: 'req.query.q', note: '' },
+    { kind: 'sink' as const, file, line, code: 'db.query(q)', note: '' },
+  ];
+
+  it('records every loser fingerprint on the winner (mergedFingerprints, transitively from earlier merges)', () => {
+    const w = mkFinding({ category: 'taint', producedBy: ['taint:agent'], fingerprint: 'w', taintTrace: sink('src/a.ts', 10) });
+    const l = mkFinding({ fingerprint: 'l', mergedFingerprints: ['older'] });
+    const r = crossDedupe([row('taint', w), row('sast', l)]);
+    expect(r.kept[0]!.mergedFingerprints).toEqual(['l', 'older']);
+  });
+
+  it('picks the same winner whatever the per-scan ids are (ties broken by fingerprint, not id)', () => {
+    const a = mkFinding({ fingerprint: 'aaa' });
+    const b = mkFinding({ fingerprint: 'bbb' });
+    const swapped = [{ ...a, id: 'z-1' }, { ...b, id: 'a-1' }];
+    expect(crossDedupe([row('sast', a), row('sast', b)]).kept[0]!.fingerprint).toBe('aaa');
+    expect(crossDedupe(swapped.map((f) => row('sast', f))).kept[0]!.fingerprint).toBe('aaa');
+  });
+
+  it('assigns each finding to one direct winner: no transitive chain through a wide-range finding', () => {
+    const top = mkFinding({ category: 'taint', producedBy: ['taint:agent'], line: 10, taintTrace: sink('src/a.ts', 10) });
+    const wide = mkFinding({ producedBy: ['sast:llm-fast'], line: 1, endLine: 100 });
+    const far = mkFinding({ producedBy: ['sast:llm'], line: 90 });
+    const r = crossDedupe([row('sast', wide), row('sast', far), row('taint', top)]);
+    expect(r.kept.map((f) => f.id).sort()).toEqual([far.id, top.id].sort());
+    expect(r.removedIds).toEqual([wide.id]);
+  });
+
+  it('never merges two traced flows with different sinks; merges them when the sinks overlap', () => {
+    const t1 = mkFinding({ category: 'taint', producedBy: ['taint:agent'], file: 'src/routes.ts', line: 3, taintTrace: sink('src/db.ts', 4) });
+    const t2 = mkFinding({ category: 'taint', producedBy: ['taint:agent'], file: 'src/routes.ts', line: 3, taintTrace: sink('src/db.ts', 40) });
+    expect(crossDedupe([row('taint', t1), row('taint', t2)]).kept).toHaveLength(2);
+    const t3 = mkFinding({ category: 'taint', producedBy: ['taint:agent'], file: 'src/routes.ts', line: 3, taintTrace: sink('src/db.ts', 4) });
+    expect(crossDedupe([row('taint', t1), row('taint', t3)]).kept).toHaveLength(1);
+  });
+});
