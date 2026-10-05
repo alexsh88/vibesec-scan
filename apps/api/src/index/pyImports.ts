@@ -29,6 +29,13 @@ zlib zoneinfo`
 // These are real (private) stdlib modules, as opposed to an arbitrary leading-underscore import name
 // (e.g. `_cffi_backend`, `_yaml`, `_typeshed`) that merely looks like one — see the `top.startsWith('_')`
 // branch below, which now resolves those as 'unresolved' instead of guessing 'builtin'.
+/**
+ * Stdlib modules removed in Python 3.12/3.13 (distutils, imp, PEP 594 "dead batteries"). Scanned repos often
+ * target older Pythons, so these must not be mistaken for third-party packages.
+ */
+const LEGACY_STDLIB = new Set(`aifc asynchat asyncore audioop cgi cgitb chunk crypt distutils imghdr imp lib2to3 mailcap
+msilib nis nntplib ossaudiodev pipes smtpd sndhdr spwd sunau telnetlib uu xdrlib`.split(/\s+/));
+
 const STDLIB_PRIVATE = new Set(`__future__ _abc _aix_support _android_support _apple_support _ast _ast_unparse _asyncio
 _bisect _blake2 _bz2 _codecs _codecs_cn _codecs_hk _codecs_iso2022 _codecs_jp _codecs_kr _codecs_tw _collections
 _collections_abc _colorize _compat_pickle _contextvars _csv _ctypes _curses _curses_panel _datetime _dbm _decimal
@@ -155,7 +162,7 @@ export function resolvePyImport(fromPath: string, imp: PyImport, ctx: PyResolveC
   const specifier = `${prefix}${imp.module}`;
   if (imp.level > 0) return [{ specifier, kind: 'unresolved', to: null, pkg: null }];
   const top = imp.module.split('.')[0]!;
-  if (STDLIB.has(top) || STDLIB_PRIVATE.has(top)) return [{ specifier, kind: 'builtin', to: null, pkg: null }];
+  if (STDLIB.has(top) || STDLIB_PRIVATE.has(top) || LEGACY_STDLIB.has(top)) return [{ specifier, kind: 'builtin', to: null, pkg: null }];
   if (top.startsWith('_') && !(top in IMPORT_TO_DISTRIBUTION)) {
     // Looks like a private stdlib module but isn't one (not in sys.stdlib_module_names) and has no
     // known PyPI distribution — e.g. _cffi_backend, _yaml, _typeshed. Unknown rather than builtin.

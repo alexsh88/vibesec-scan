@@ -126,6 +126,12 @@ describe('resolvePyImport', () => {
     expect(resolvePyImport('main.py', imp('pickletools'), ctx)).toEqual([{ specifier: 'pickletools', kind: 'builtin', to: null, pkg: null }]);
   });
 
+  it('keeps modules removed from recent Pythons (PEP 594, distutils, imp) as builtin, not packages', () => {
+    for (const name of ['distutils', 'imp', 'asyncore', 'asynchat', 'imghdr', 'cgi', 'telnetlib', 'lib2to3']) {
+      expect(resolvePyImport('main.py', imp(name), ctx)[0]?.kind).toBe('builtin');
+    }
+  });
+
   it('treats a leading-underscore name that is not an actual stdlib module as unresolved, not builtin', () => {
     // Neither is in `sys.stdlib_module_names` nor in IMPORT_TO_DISTRIBUTION, so (unlike the previous
     // hardcoded list, which had no way to distinguish them from real private stdlib modules) they are
