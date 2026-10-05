@@ -50,3 +50,8 @@ export const FALLBACK_ROLE: Record<ModelRole, ModelRole> = { fast: 'deep', deep:
 /** Overload after retries: one tier down (findings from a degraded call get lower confidence). */
 export const DEGRADE_ROLE: Record<ModelRole, ModelRole | null> = { synthesis: 'deep', deep: 'fast', fast: null };
 export const DEFAULT_EFFORT: Record<ModelRole, Effort | undefined> = { fast: undefined, deep: 'medium', synthesis: 'high' };
+/**
+ * Default max_tokens per role. Every attempt reserves its worst case (all of max_tokens as output)
+ * against the scan budget, so a uniform 16k cap made reservations ~3× the realistic cost of fast/deep calls.
+ */
+export const DEFAULT_MAX_TOKENS: Record<ModelRole, number> = { fast: 4_096, deep: 8_192, synthesis: 16_000 };

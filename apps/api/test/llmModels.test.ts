@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { capsOf, costUsd, DEGRADE_ROLE, FALLBACK_ROLE, priceOf } from '../src/llm/models';
+import { capsOf, costUsd, DEFAULT_MAX_TOKENS, DEGRADE_ROLE, FALLBACK_ROLE, priceOf } from '../src/llm/models';
 
 describe('model pricing', () => {
   it('computes cost from usage including cache reads and writes', () => {
@@ -28,5 +28,11 @@ describe('role maps', () => {
   it('falls back on refusal to a different tier and degrades on overload one tier down', () => {
     expect(FALLBACK_ROLE).toEqual({ fast: 'deep', deep: 'synthesis', synthesis: 'deep' });
     expect(DEGRADE_ROLE).toEqual({ synthesis: 'deep', deep: 'fast', fast: null });
+  });
+});
+
+describe('per-role output caps', () => {
+  it('caps max_tokens by role so worst-case budget reservations stay realistic', () => {
+    expect(DEFAULT_MAX_TOKENS).toEqual({ fast: 4_096, deep: 8_192, synthesis: 16_000 });
   });
 });

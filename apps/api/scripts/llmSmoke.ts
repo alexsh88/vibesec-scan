@@ -24,7 +24,8 @@ async function main(): Promise<void> {
         scanId: null, analyzer: 'smoke', purpose: 'smoke', promptVersion: 'smoke-v1', role,
         system: 'You are a terse assistant that answers in JSON.',
         prompt: 'Set ok to true and echo the single word "vibesec".',
-        schema: Echo, maxTokens: 1_024, signal: AbortSignal.timeout(90_000),
+        // Same output cap and low effort on every tier: adaptive thinking shares max_tokens, so 1k could truncate.
+        schema: Echo, maxTokens: 4_096, effort: 'low', signal: AbortSignal.timeout(90_000),
       });
       console.log(`${role.padEnd(9)} ${r.model.padEnd(18)} ${JSON.stringify(r.output)}  in=${r.usage.inputTokens} out=${r.usage.outputTokens} $${r.costUsd.toFixed(5)}`);
       if (!r.output.ok || r.output.echo.toLowerCase() !== 'vibesec') failures++;

@@ -6,7 +6,7 @@ import { AppError, toAppError } from '../errors/AppError';
 import { CircuitBreaker } from '../resilience/circuitBreaker';
 import { RETRY_POLICIES, withRetry, type RetryDeps } from '../resilience/retry';
 import type { BudgetTracker, SettleBudget } from './budget';
-import { capsOf, costUsd, DEFAULT_EFFORT, DEGRADE_ROLE, FALLBACK_ROLE, type Effort, type ModelRole, type TokenUsage } from './models';
+import { capsOf, costUsd, DEFAULT_EFFORT, DEFAULT_MAX_TOKENS, DEGRADE_ROLE, FALLBACK_ROLE, type Effort, type ModelRole, type TokenUsage } from './models';
 import { buildRequestParts, estimateTokens } from './prompt';
 import type { RateLimiter, Semaphore } from './rateLimiter';
 import { requestHash, type LlmRequest, type LlmTransport } from './transport';
@@ -52,26 +52,39 @@ export type LlmClientDeps = {
   scans: Pick<ScanRepo, 'addCost'>;
   breaker?: CircuitBreaker;
   retryDeps?: RetryDeps;
+  /** Fired only for attempts with a cost > 0, coalesced to at most once per USAGE_EMIT_INTERVAL_MS per scan. */
   onUsage?: (scanId: string, totals: LlmTotals) => void;
+  /** Runs fn in one DB transaction (container: `(fn) => db.transaction(fn)()`); defaults to calling fn directly. */
+  atomically?: <T>(fn: () => T) => T;
   now?: () => number;
 };
 
 type Sent = { message: Anthropic.Message; model: string; callId: string; usage: TokenUsage; costUsd: number };
 
-const DEFAULT_MAX_TOKENS = 16_000;
+const USAGE_EMIT_INTERVAL_MS = 1_000;
 const ZERO: TokenUsage = { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 };
 
 export class LlmClient {
   private readonly breaker: CircuitBreaker;
   private readonly now: () => number;
+  private readonly atomically: <T>(fn: () => T) => T;
+  /** Per scan: when the last cost event was emitted, and the pending trailing emit (if any). */
+  private readonly lastUsageEmit = new Map<string, number>();
+  private readonly pendingUsageEmit = new Map<string, NodeJS.Timeout>();
 
   constructor(private readonly deps: LlmClientDeps) {
     this.breaker = deps.breaker ?? new CircuitBreaker('Anthropic API', { failureThreshold: 5, resetMs: 30_000, unavailableCode: 'LLM_UNAVAILABLE' });
     this.now = deps.now ?? Date.now;
+    this.atomically = deps.atomically ?? ((fn) => fn());
   }
 
   get mode(): LlmTransport['mode'] {
     return this.deps.transport.mode;
+  }
+
+  /** How many times the Anthropic circuit breaker has opened since startup. */
+  get breakerTrips(): number {
+    return this.breaker.trips;
   }
 
   async structured<T>(call: StructuredCall<T>): Promise<StructuredResult<T>> {
@@ -145,7 +158,7 @@ export class LlmClient {
     const caps = capsOf(model);
     return {
       model, system, messages,
-      maxTokens: call.maxTokens ?? DEFAULT_MAX_TOKENS,
+      maxTokens: call.maxTokens ?? DEFAULT_MAX_TOKENS[role],
       thinking: caps.adaptiveThinking,
       effort: caps.effort ? (call.effort ?? DEFAULT_EFFORT[role]) : undefined,
       schema: call.schema,
@@ -164,7 +177,8 @@ export class LlmClient {
       const estimateUsd = costUsd(req.model, { inputTokens: estimate, outputTokens: req.maxTokens, cacheReadTokens: 0, cacheWriteTokens: 0 });
       const sent = await this.breaker.run(() => withRetry(async (attempt) => {
         // Reserve per attempt so concurrent in-flight calls cannot jointly overshoot the scan budget.
-        const settle: SettleBudget = call.scanId ? this.deps.budget.reserve(call.scanId, estimateUsd) : () => {};
+        // Waits (abortably) while only other in-flight reservations block; throws once committed spend can't fit.
+        const settle: SettleBudget = call.scanId ? await this.deps.budget.reserve(call.scanId, estimateUsd, call.signal) : () => {};
         try {
           await this.deps.limiter.acquire(estimate, call.signal);
           call.onActivity?.();
@@ -205,18 +219,41 @@ export class LlmClient {
       cacheWriteTokens: message.usage.cache_creation_input_tokens ?? 0,
     } : ZERO;
     const cost = costUsd(model, usage);
-    const callId = this.deps.calls.insert({
-      scanId: call.scanId, analyzer: call.analyzer, purpose: call.purpose, model, promptVersion: call.promptVersion, inputHash,
-      ...usage, costUsd: cost, latencyMs: this.now() - started, stopReason: message?.stop_reason ?? null, attempt, errorCode,
-    });
-    // Budget first: its lazy load reads scans.cost_usd, so adding there first would double-count.
-    // settle() frees this attempt's reservation and commits the actual cost (0 on failure).
+    // Budget first: settle() frees this attempt's reservation and commits the actual cost (0 on failure).
+    // It must precede scans.addCost because the budget's lazy load reads scans.cost_usd (adding there
+    // first would double-count), and it runs even if the DB write below fails — conservative on purpose:
+    // the money was spent at the API, so in-memory spend must never under-count it.
     settle(cost);
-    if (call.scanId) {
-      if (cost > 0) this.deps.scans.addCost(call.scanId, cost);
-      this.deps.onUsage?.(call.scanId, this.deps.calls.totals(call.scanId));
-    }
+    // The call row and the scan's running cost commit together or not at all.
+    const callId = this.atomically(() => {
+      const id = this.deps.calls.insert({
+        scanId: call.scanId, analyzer: call.analyzer, purpose: call.purpose, model, promptVersion: call.promptVersion, inputHash,
+        ...usage, costUsd: cost, latencyMs: this.now() - started, stopReason: message?.stop_reason ?? null, attempt, errorCode,
+      });
+      if (call.scanId && cost > 0) this.deps.scans.addCost(call.scanId, cost);
+      return id;
+    });
+    if (call.scanId && cost > 0) this.emitUsage(call.scanId);
     return { message: message as Anthropic.Message, model, callId, usage, costUsd: cost };
+  }
+
+  /** Leading emit, then at most one trailing emit (with the then-latest totals) per interval per scan. */
+  private emitUsage(scanId: string): void {
+    const onUsage = this.deps.onUsage;
+    if (!onUsage || this.pendingUsageEmit.has(scanId)) return;
+    const elapsed = this.now() - (this.lastUsageEmit.get(scanId) ?? -Infinity);
+    const fire = (): void => {
+      this.pendingUsageEmit.delete(scanId);
+      this.lastUsageEmit.set(scanId, this.now());
+      onUsage(scanId, this.deps.calls.totals(scanId));
+    };
+    if (elapsed >= USAGE_EMIT_INTERVAL_MS) {
+      fire();
+      return;
+    }
+    const timer = setTimeout(fire, USAGE_EMIT_INTERVAL_MS - elapsed);
+    timer.unref?.();
+    this.pendingUsageEmit.set(scanId, timer);
   }
 
   private parse<T>(schema: z.ZodType<T>, message: Anthropic.Message): { ok: true; value: T } | { ok: false; issues: string } {

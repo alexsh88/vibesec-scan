@@ -173,6 +173,9 @@ describe('HTTP API', () => {
     });
     expect(diag.llm.totals.costUsd).toBeCloseTo(r.costUsd, 9);
     expect(diag.llm.reservedUsd).toBe(0);
+    expect(diag.llm.breakerTrips).toBe(0);
+    // Mock transport reports no cache reads → ratio 0 (never NaN on an empty denominator either).
+    expect(diag.llm.cacheHitRatio).toBe(0);
   });
 
   it('returns 404 diagnostics for an unknown scan', async () => {

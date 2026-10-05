@@ -49,6 +49,7 @@ export function createContainer(config: Config, overrides: { pipeline?: Pipeline
     limiter: new RateLimiter({ requestsPerMinute: config.llmRequestsPerMinute, inputTokensPerMinute: config.llmInputTokensPerMinute }),
     semaphore: new Semaphore(config.llmConcurrency),
     budget, calls: llmCalls, scans,
+    atomically: (fn) => db.transaction(fn)(),
     onUsage: (scanId, t) => lifecycle.emit(scanId, {
       type: 'cost', inputTokens: t.inputTokens, outputTokens: t.outputTokens, cacheReadTokens: t.cacheReadTokens, usd: t.costUsd,
     }),

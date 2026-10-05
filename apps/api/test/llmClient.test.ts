@@ -19,7 +19,7 @@ const msg = (model: string, text: string, stop: Anthropic.Message['stop_reason']
   stop_sequence: null, usage: { input_tokens: 1_000, output_tokens: 100, cache_read_input_tokens: 500, cache_creation_input_tokens: 0 },
 }) as unknown as Anthropic.Message;
 
-function setup(steps: Step[], opts: { budgetUsd?: number; semaphore?: Semaphore } = {}) {
+function setup(steps: Step[], opts: { budgetUsd?: number; semaphore?: Semaphore; now?: () => number } = {}) {
   const db = memoryDb();
   const scans = new ScanRepo(db);
   const repo = scans.upsertRepo({ owner: 'acme', name: 'app', isPrivate: false });
@@ -42,12 +42,13 @@ function setup(steps: Step[], opts: { budgetUsd?: number; semaphore?: Semaphore 
   const client = new LlmClient({
     transport, models: { fast: 'claude-haiku-4-5', deep: 'claude-sonnet-5', synthesis: 'claude-opus-5' },
     limiter, semaphore: opts.semaphore ?? new Semaphore(4), budget, calls, scans, onUsage, retryDeps: { sleep: async () => {} },
+    atomically: (fn) => db.transaction(fn)(), now: opts.now,
   });
   const call = (over: Partial<StructuredCall<z.infer<typeof Out>>> = {}): StructuredCall<z.infer<typeof Out>> => ({
     scanId, analyzer: 'sast', purpose: 'review-file', promptVersion: 'v1', role: 'deep',
     system: 'You review code.', prompt: 'review', schema: Out, signal: new AbortController().signal, ...over,
   });
-  return { client, call, calls, scans, scanId, seen, transport, penalize, onUsage, budget };
+  return { client, call, calls, scans, scanId, seen, transport, penalize, onUsage, budget, db };
 }
 
 const ok = (verdict = 'vulnerable') => ({ text: JSON.stringify({ verdict, reason: 'sql injection' }) });
@@ -141,9 +142,9 @@ describe('LlmClient.structured', () => {
     expect(transport.send).toHaveBeenCalledOnce();
   });
 
-  it('reserves worst-case cost per attempt so concurrent calls cannot overspend the budget', async () => {
+  it('reserves worst-case cost per attempt; a call blocked only by in-flight reservations waits, then runs', async () => {
     // Worst case per call: deep = claude-sonnet-5, output $10/1M × 4_000 max tokens = $0.04, plus a few
-    // input tokens at $2/1M ≈ $0.0001. A $0.10 budget fits two such reservations, never a third.
+    // input tokens at $2/1M ≈ $0.0001. A $0.10 budget fits two such reservations, never a third at once.
     const { client, call, transport, budget, scanId } = setup([], { budgetUsd: 0.1 });
     const gates: Array<() => void> = [];
     vi.mocked(transport.send).mockImplementation(async (req: LlmRequest) => {
@@ -157,15 +158,100 @@ describe('LlmClient.structured', () => {
     expect(budget.reservedUsd(scanId)).toBeGreaterThan(0.08);
     expect(budget.reservedUsd(scanId)).toBeLessThan(0.1);
 
-    await expect(client.structured(c)).rejects.toMatchObject({ code: 'BUDGET_EXHAUSTED', kind: 'budget' });
-    expect(transport.send).toHaveBeenCalledTimes(2);
+    const third = client.structured(c);
+    await new Promise((r) => setTimeout(r, 20));
+    expect(transport.send).toHaveBeenCalledTimes(2); // waiting on the in-flight reservations, not failed
+    expect(budget.reservedUsd(scanId)).toBeLessThan(0.1);
 
-    gates.forEach((release) => release());
+    gates.splice(0).forEach((release) => release());
     const results = await Promise.all([first, second]);
     // Actual usage per call: (1000×2 + 100×10 + 500×0.2)/1e6 = $0.0031 — far below the reserved worst case.
     expect(results.map((r) => r.costUsd)).toEqual([expect.closeTo(0.0031, 9), expect.closeTo(0.0031, 9)]);
+    await vi.waitFor(() => expect(transport.send).toHaveBeenCalledTimes(3));
+    gates.splice(0).forEach((release) => release());
+    await expect(third).resolves.toMatchObject({ costUsd: expect.closeTo(0.0031, 9) });
     expect(budget.reservedUsd(scanId)).toBe(0);
-    expect(budget.spentUsd(scanId)).toBeCloseTo(0.0062, 9);
+    expect(budget.spentUsd(scanId)).toBeCloseTo(0.0093, 9);
+  });
+
+  it('fails with BUDGET_EXHAUSTED when committed spend alone leaves no room for the worst case', async () => {
+    const { client, call, transport, budget, scanId } = setup([ok()], { budgetUsd: 0.1 });
+    budget.add(scanId, 0.07); // 0.07 + ~0.0401 worst case > 0.10 with nothing in flight → waiting cannot help
+    await expect(client.structured(call({ maxTokens: 4_000 }))).rejects.toMatchObject({ code: 'BUDGET_EXHAUSTED', kind: 'budget' });
+    expect(transport.send).not.toHaveBeenCalled();
+  });
+
+  it('lets 8 concurrent deep calls finish on the last $1 of a $5 budget (no spurious BUDGET_EXHAUSTED)', async () => {
+    // Review scenario: $4 committed; each call's worst case at 16_000 max tokens ≈ $0.16 (so the
+    // reservations do not all fit at once) but each actually costs ≈ $0.05.
+    const { client, call, transport, budget, scanId } = setup([], { budgetUsd: 5, semaphore: new Semaphore(8) });
+    budget.add(scanId, 4);
+    vi.mocked(transport.send).mockImplementation(async (req: LlmRequest) => {
+      await new Promise((r) => setTimeout(r, 5));
+      const m = msg(req.model, JSON.stringify({ verdict: 'safe', reason: 'ok' }));
+      // (1000×2 + 4_800×10 + 500×0.2)/1e6 = $0.0501
+      return { ...m, usage: { ...m.usage, output_tokens: 4_800 } } as Anthropic.Message;
+    });
+    const results = await Promise.all(Array.from({ length: 8 }, () => client.structured(call({ maxTokens: 16_000 }))));
+    expect(results).toHaveLength(8);
+    expect(results.every((r) => Math.abs(r.costUsd - 0.0501) < 1e-9)).toBe(true);
+    expect(budget.spentUsd(scanId)).toBeCloseTo(4 + 8 * 0.0501, 9);
+    expect(budget.reservedUsd(scanId)).toBe(0);
+  });
+
+  it('uses per-role default max_tokens for the role actually sent (after degrade)', async () => {
+    const { client, call, seen } = setup([transient(), transient(), transient(), transient(), transient(), ok()]);
+    await client.structured(call({ role: 'deep' }));
+    expect(seen[0]).toMatchObject({ model: 'claude-sonnet-5', maxTokens: 8_192 });
+    expect(seen.at(-1)).toMatchObject({ model: 'claude-haiku-4-5', maxTokens: 4_096 });
+    const s = setup([ok()]);
+    await s.client.structured(s.call({ role: 'synthesis' }));
+    expect(s.seen[0]).toMatchObject({ maxTokens: 16_000 });
+    const explicit = setup([ok()]);
+    await explicit.client.structured(explicit.call({ maxTokens: 1_234 }));
+    expect(explicit.seen[0]).toMatchObject({ maxTokens: 1_234 });
+  });
+
+  it('coalesces cost events to at most one per second per scan, ending with the full totals', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    try {
+      const { client, call, onUsage, scanId, calls } = setup([], { now: () => 1_000_000 });
+      for (let i = 0; i < 5; i++) await client.structured(call());
+      expect(onUsage).toHaveBeenCalledTimes(1); // leading emit; the rest coalesce into one trailing emit
+      vi.advanceTimersByTime(1_000);
+      expect(onUsage).toHaveBeenCalledTimes(2);
+      expect(onUsage).toHaveBeenLastCalledWith(scanId, expect.objectContaining({ calls: 5 }));
+      expect(onUsage.mock.lastCall![1]).toEqual(calls.totals(scanId));
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('does not emit cost events for zero-cost (failed) attempts', async () => {
+    const { client, call, onUsage, calls, scanId } = setup([{ error: new AppError('LLM_UNAVAILABLE', 'permanent', 'x') }]);
+    await expect(client.structured(call())).rejects.toMatchObject({ kind: 'permanent' });
+    expect(calls.totals(scanId)).toMatchObject({ calls: 1, failedCalls: 1 });
+    expect(onUsage).not.toHaveBeenCalled();
+  });
+
+  it('records the call row and the scan cost atomically; the budget still counts a cost whose insert failed', async () => {
+    // Conservative by design: the budget is settled with the actual cost BEFORE the DB transaction, so a
+    // failed write never lets in-memory spend under-count money really spent at the API.
+    const { client, call, calls, scans, scanId, budget, db } = setup([ok()]);
+    const realInsert = calls.insert.bind(calls);
+    vi.spyOn(calls, 'insert').mockImplementation((c) => {
+      realInsert(c); // the row is written, then the insert fails → the transaction must roll it back
+      throw new Error('disk full');
+    });
+    await expect(client.structured(call())).rejects.toMatchObject({ code: 'INTERNAL' });
+    expect((db.prepare('SELECT COUNT(*) AS n FROM llm_calls').get() as { n: number }).n).toBe(0);
+    expect(scans.getDto(scanId)!.costUsd).toBe(0);
+    expect(budget.spentUsd(scanId)).toBeCloseTo(0.0031, 9);
+    expect(budget.reservedUsd(scanId)).toBe(0);
+  });
+
+  it('exposes circuit-breaker trips', () => {
+    expect(setup([]).client.breakerTrips).toBe(0);
   });
 
   it('frees the reservation of a failed attempt', async () => {
