@@ -1,7 +1,9 @@
 import type { FastifyInstance } from 'fastify';
 import type { Container } from '../../container';
+import { CoverageRepo } from '../../db/coverageRepo';
 
 export function diagnosticsRoutes(app: FastifyInstance, c: Container): void {
+  const coverage = new CoverageRepo(c.db);
   app.get<{ Params: { id: string } }>('/api/scans/:id/diagnostics', async (req) => {
     const scan = c.service.get(req.params.id); // 404 for unknown scans
     const started = scan.startedAt ? Date.parse(scan.startedAt) : null;
@@ -14,9 +16,11 @@ export function diagnosticsRoutes(app: FastifyInstance, c: Container): void {
       durationMs: started !== null && finished !== null ? finished - started : null,
       warnings: scan.warnings,
       index: c.indexRepo.stats(scan.id),
+      /** Per-file AI-review coverage: counts by status (overall and per analyzer) + every budget-skipped file. */
+      coverage: coverage.summary(scan.id),
       llm: {
         mode: c.llm.mode,
-        budgetUsd: c.config.scanBudgetUsd,
+        budgetUsd: scan.options.budgetUsd ?? c.config.scanBudgetUsd,
         totals,
         byAnalyzer: c.llmCalls.byAnalyzer(scan.id),
         reservedUsd: c.budget.reservedUsd(scan.id),

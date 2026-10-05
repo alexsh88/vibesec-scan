@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { describe, expect, it, vi } from 'vitest';
 import type { Category, Finding, ScanEvent } from '@vibesec/shared';
 import type { Analyzer } from '../src/analyzers/types';
+import { CoverageRepo } from '../src/db/coverageRepo';
 import { FindingRepo } from '../src/db/findingRepo';
 import { IndexRepo } from '../src/db/indexRepo';
 import { ScanRepo, type ScanWarning } from '../src/db/scanRepo';
@@ -72,7 +73,7 @@ function setup(categories: Category[] = ['secret']) {
     warn: (w) => { warnings.push(w); },
     touch: () => {},
   };
-  return { ctx, findings, indexRepo, warnings, events, controller, scanId };
+  return { ctx, findings, indexRepo, warnings, events, controller, scanId, db };
 }
 
 describe('analyzeStage', () => {
@@ -234,5 +235,51 @@ describe('analyzeStage', () => {
     expect(warnings).toHaveLength(1);
     expect(warnings[0]!.message).not.toContain('token=super-secret-value');
     expect(warnings[0]!.message).toContain('credentials');
+  });
+});
+
+describe('analyzeStage coverage', () => {
+  it('collects per-file coverage from every analyzer, persists it and warns BUDGET_COVERAGE_PARTIAL with counts', async () => {
+    const { ctx, findings, indexRepo, warnings, scanId, db } = setup(['sast', 'quality']);
+    const coverage = new CoverageRepo(db);
+    const sast = makeAnalyzer({
+      id: 'sast', category: 'sast',
+      run: async (actx) => {
+        actx.recordCoverage?.('triage', 'a.ts', 'reviewed');
+        actx.recordCoverage?.('sast', 'a.ts', 'reviewed');
+        actx.recordCoverage?.('sast', 'b.ts', 'budget-skipped');
+        return [];
+      },
+    });
+    const quality = makeAnalyzer({
+      id: 'quality', category: 'quality',
+      run: async (actx) => {
+        actx.recordCoverage?.('quality', 'a.ts', 'failed');
+        actx.recordCoverage?.('quality', 'a.ts', 'budget-skipped'); // last write wins
+        actx.recordCoverage?.('quality', 'b.ts', 'budget-skipped');
+        return [];
+      },
+    });
+    await analyzeStage({ analyzers: [sast, quality], findings, indexRepo, git: fakeGit, coverage }).run(ctx);
+
+    const summary = coverage.summary(scanId);
+    expect(summary.totals).toMatchObject({ reviewed: 2, 'budget-skipped': 3, failed: 0 });
+    expect(summary.byAnalyzer.sast).toMatchObject({ reviewed: 1, 'budget-skipped': 1 });
+    expect(summary.budgetSkipped).toEqual([
+      { analyzer: 'quality', path: 'a.ts' }, { analyzer: 'quality', path: 'b.ts' }, { analyzer: 'sast', path: 'b.ts' },
+    ]);
+    expect(warnings).toEqual([expect.objectContaining({ code: 'BUDGET_COVERAGE_PARTIAL', stage: 'ANALYZING' })]);
+    expect(warnings[0]!.message).toContain('3 file review(s) were skipped (quality: 2, sast: 1)');
+    expect(warnings[0]!.message).toContain('budgetUsd');
+  });
+
+  it('does not warn when nothing was budget-skipped, and replaces a previous run', async () => {
+    const { ctx, findings, indexRepo, warnings, scanId, db } = setup(['sast']);
+    const coverage = new CoverageRepo(db);
+    coverage.replaceForScan(scanId, [{ analyzer: 'sast', path: 'old.ts', status: 'budget-skipped' }]);
+    const sast = makeAnalyzer({ id: 'sast', category: 'sast', run: async (actx) => { actx.recordCoverage?.('sast', 'a.ts', 'cached'); return []; } });
+    await analyzeStage({ analyzers: [sast], findings, indexRepo, git: fakeGit, coverage }).run(ctx);
+    expect(warnings).toEqual([]);
+    expect(coverage.list(scanId)).toEqual([{ analyzer: 'sast', path: 'a.ts', status: 'cached' }]);
   });
 });

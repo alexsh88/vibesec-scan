@@ -1,4 +1,5 @@
 import type { Analyzer } from '../analyzers/types';
+import type { CoverageRepo } from '../db/coverageRepo';
 import type { FindingRepo } from '../db/findingRepo';
 import type { IndexRepo } from '../db/indexRepo';
 import type { GitService } from '../git/GitService';
@@ -20,6 +21,7 @@ export type ScanPipelineDeps = Omit<ResolveDeps, 'git'> & Omit<IndexDeps, 'git' 
   /** When both `analyzers` and `findings` are given, the real ANALYZING stage replaces the stub's. */
   analyzers?: readonly Analyzer[];
   findings?: FindingRepo;
+  coverage?: CoverageRepo;
 };
 
 const REAL_STAGES = new Set<StageName>(['RESOLVING', 'CLONING', 'INDEXING']);
@@ -30,7 +32,7 @@ export function createScanPipeline(deps: ScanPipelineDeps): Pipeline {
   const excluded = hasRealAnalyzing ? new Set<StageName>([...REAL_STAGES, 'ANALYZING']) : REAL_STAGES;
   const rest = (deps.stub ?? createStubPipeline()).stages.filter((s) => !excluded.has(s.name));
   const analyzing: StageSpec[] = (analyzers !== undefined && findings !== undefined)
-    ? [analyzeStage({ analyzers, findings, indexRepo: deps.indexRepo, git: deps.git })]
+    ? [analyzeStage({ analyzers, findings, indexRepo: deps.indexRepo, git: deps.git, ...(deps.coverage ? { coverage: deps.coverage } : {}) })]
     : [];
   return {
     stages: [resolveStage(deps), cloneStage(deps), indexStage(deps), ...analyzing, ...rest],

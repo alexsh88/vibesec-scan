@@ -1,5 +1,6 @@
 import { FindingSummarySchema, type Finding } from '@vibesec/shared';
-import type { Analyzer, AnalyzerContext } from '../../analyzers/types';
+import type { Analyzer, AnalyzerContext, CoverageEntry, CoverageStatus } from '../../analyzers/types';
+import type { CoverageRepo } from '../../db/coverageRepo';
 import type { FindingRepo } from '../../db/findingRepo';
 import type { IndexRepo } from '../../db/indexRepo';
 import { AppError, toAppError } from '../../errors/AppError';
@@ -12,6 +13,8 @@ export type AnalyzeStageDeps = {
   findings: FindingRepo;
   indexRepo: Pick<IndexRepo, 'files'>;
   git: Pick<GitService, 'repoDir'>;
+  /** Persists per-file AI-review coverage (budget-skipped files are listed in diagnostics). */
+  coverage?: Pick<CoverageRepo, 'replaceForScan'>;
 };
 
 type AnalyzerOutcome =
@@ -77,6 +80,10 @@ export function analyzeStage(deps: AnalyzeStageDeps): StageSpec {
       const files = deps.indexRepo.files(ctx.scanId, { includeSkipped: true });
       const repo = { owner: ctx.scan.repo.owner, name: ctx.scan.repo.name };
       const token = ctx.secrets.token;
+      const coverage = new Map<string, CoverageEntry>();
+      const recordCoverage = (analyzer: string, path: string, status: CoverageStatus) => {
+        coverage.set(`${analyzer}\0${path}`, { analyzer, path, status });
+      };
 
       const settled = await Promise.allSettled(
         enabled.map((analyzer) => {
@@ -94,6 +101,7 @@ export function analyzeStage(deps: AnalyzeStageDeps): StageSpec {
             // No free-text log/progress ScanEvent exists today (only structured `progress` with done/total);
             // a no-op until one does. See report for this deviation.
             progress: () => {},
+            recordCoverage,
           };
           return runAnalyzer(analyzer, actx, deps, ctx);
         }),
@@ -115,7 +123,28 @@ export function analyzeStage(deps: AnalyzeStageDeps): StageSpec {
       }
 
       if (cancellation) throw cancellation;
+      reportCoverage(ctx, [...coverage.values()], deps.coverage);
       if (succeeded === 0) throw new AppError('ALL_ANALYZERS_FAILED', 'permanent', 'All analyzers failed');
     },
   };
+}
+
+/**
+ * Persists the coverage and, when the dollar budget left any file without its AI review, warns
+ * BUDGET_COVERAGE_PARTIAL with the counts (the full list is in GET /api/scans/:id/diagnostics).
+ */
+function reportCoverage(ctx: PipelineContext, entries: CoverageEntry[], repo: AnalyzeStageDeps['coverage']): void {
+  repo?.replaceForScan(ctx.scanId, entries);
+  const skipped = entries.filter((e) => e.status === 'budget-skipped');
+  if (skipped.length === 0) return;
+  const perAnalyzer = new Map<string, number>();
+  for (const e of skipped) perAnalyzer.set(e.analyzer, (perAnalyzer.get(e.analyzer) ?? 0) + 1);
+  const reviewed = entries.filter((e) => e.status === 'reviewed' || e.status === 'reviewed-fast' || e.status === 'cached').length;
+  const breakdown = [...perAnalyzer.entries()].sort((a, b) => b[1] - a[1]).map(([a, n]) => `${a}: ${n}`).join(', ');
+  ctx.warn({
+    code: 'BUDGET_COVERAGE_PARTIAL',
+    message: `The AI budget ran out before every file got its deep review: ${skipped.length} file review(s) were skipped (${breakdown}); ${reviewed} were completed. `
+      + 'Raise budgetUsd for this scan or rescan (unchanged files are served from cache) — the skipped files are listed in the scan diagnostics.',
+    stage: 'ANALYZING',
+  });
 }
