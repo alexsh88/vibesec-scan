@@ -36,4 +36,8 @@ export type StageSpec = {
   run(ctx: PipelineContext): Promise<void>;
 };
 
-export type Pipeline = { stages: StageSpec[] };
+export type Pipeline = {
+  stages: StageSpec[];
+  /** Best-effort cleanup, called once after the scan reaches a terminal state (never for a resumable scan). */
+  onScanFinished?(scanId: string): Promise<void>;
+};

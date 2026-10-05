@@ -1,4 +1,5 @@
 import { setTimeout as sleep } from 'node:timers/promises';
+import { isTerminalState } from '@vibesec/shared';
 import type { AuditInput, AuditLogger } from '../audit/AuditLogger';
 import type { Config } from '../config';
 import type { Checkpoint, ScanRepo } from '../db/scanRepo';
@@ -302,6 +303,16 @@ export class JobRunner implements ScanQueue {
         else this.finishWithError(scanId, outcome.raw, job, deadline.signal, checkpoint, currentStage);
       } catch (err) {
         logInternal('failed to finalize scan; it stays resumable', scanId, err);
+      }
+
+      // Best-effort cleanup once the scan is terminal (e.g. delete the checkout). Never affects the outcome.
+      const finalState = scans.getDto(scanId)?.state;
+      if (pipeline.onScanFinished && finalState && isTerminalState(finalState)) {
+        try {
+          await pipeline.onScanFinished(scanId);
+        } catch (err) {
+          logInternal('scan cleanup failed', scanId, err);
+        }
       }
     } finally {
       clearInterval(heartbeat);
