@@ -2,6 +2,12 @@ import { AuditLogger } from './audit/AuditLogger';
 import { createCredentialsAnalyzer } from './analyzers/credentials/credentialsAnalyzer';
 import { credentialsFpMockResponder } from './analyzers/credentials/fpFilter';
 import { SecretVerifier } from './analyzers/credentials/verifiers';
+import { createDependenciesAnalyzer } from './analyzers/dependencies/dependenciesAnalyzer';
+import { OsvClient } from './analyzers/dependencies/osv/osvClient';
+import { dependencyReachabilityMockResponder } from './analyzers/dependencies/reachabilityJudge';
+import { RegistryClient } from './analyzers/dependencies/registry';
+import { AdvisoryCacheRepo } from './db/advisoryCacheRepo';
+import { DockerSandbox } from './sandbox/dockerSandbox';
 import type { Config } from './config';
 import { openDatabase, type Db } from './db/database';
 import { EventRepo } from './db/eventRepo';
@@ -29,10 +35,22 @@ export type Container = {
   lifecycle: ScanLifecycle; runner: JobRunner; service: ScanService;
   git: GitService; github: GitHubClient; indexRepo: IndexRepo; gitVersion: string | null;
   llm: LlmClient; llmCalls: LlmCallRepo; budget: BudgetTracker; findings: FindingRepo; fixPlans: FixPlanRepo;
+  /** Docker sandbox for dependency install/usage analysis; null/absent when disabled. */
+  sandbox?: ContainerSandbox | null;
+};
+
+export type ContainerSandbox = Pick<DockerSandbox, 'availability' | 'install' | 'analyze' | 'sweep'>;
+
+export type ContainerOverrides = {
+  pipeline?: Pipeline;
+  /** Replaces global fetch for every outbound HTTP client (credential verifier, OSV, npm/PyPI registry). */
+  fetch?: typeof fetch;
+  /** Replaces the Docker sandbox; null disables it regardless of config.sandbox.enabled. */
+  sandbox?: ContainerSandbox | null;
 };
 
 /** Composition root: the only place that wires concrete implementations together. */
-export function createContainer(config: Config, overrides: { pipeline?: Pipeline; fetch?: typeof fetch } = {}): Container {
+export function createContainer(config: Config, overrides: ContainerOverrides = {}): Container {
   const db = openDatabase(config.dbPath);
   const scans = new ScanRepo(db);
   const bus = new EventBus(new EventRepo(db));
@@ -51,7 +69,7 @@ export function createContainer(config: Config, overrides: { pipeline?: Pipeline
   const llmCalls = new LlmCallRepo(db);
   const budget = new BudgetTracker(config.scanBudgetUsd, (scanId) => scans.getDto(scanId)?.costUsd ?? 0);
   const llm = new LlmClient({
-    transport: createTransport(config, [credentialsFpMockResponder]),
+    transport: createTransport(config, [credentialsFpMockResponder, dependencyReachabilityMockResponder]),
     models: config.models,
     limiter: new RateLimiter({ requestsPerMinute: config.llmRequestsPerMinute, inputTokensPerMinute: config.llmInputTokensPerMinute }),
     semaphore: new Semaphore(config.llmConcurrency),
@@ -63,12 +81,31 @@ export function createContainer(config: Config, overrides: { pipeline?: Pipeline
   });
 
   const verifier = new SecretVerifier({ audit, ...(overrides.fetch ? { fetch: overrides.fetch } : {}) });
-  const analyzers = [createCredentialsAnalyzer({ llm, git, verifier })];
+  const fetchOverride = overrides.fetch ? { fetch: overrides.fetch } : {};
+  const osv = new OsvClient({ cache: new AdvisoryCacheRepo(db), ...fetchOverride });
+  const registry = new RegistryClient(fetchOverride);
+  const sandbox: ContainerSandbox | null = overrides.sandbox !== undefined
+    ? overrides.sandbox
+    : config.sandbox.enabled
+      ? new DockerSandbox({
+        workDir: config.workDir, imagePrefix: config.sandbox.imagePrefix, installTimeoutMs: config.sandbox.installTimeoutMs,
+        analyzeTimeoutMs: config.sandbox.analyzeTimeoutMs, maxDepsBytes: config.sandbox.maxDepsBytes,
+      })
+      : null;
+  const analyzers = [
+    createCredentialsAnalyzer({ llm, git, verifier }),
+    createDependenciesAnalyzer({ osv, registry, sandbox, indexRepo, llm, fixPlans, sandboxEnabled: sandbox !== null }),
+  ];
 
   const pipeline = overrides.pipeline ?? createScanPipeline({
     git, github, scans, indexRepo, indexer, maxRepoBytes: config.maxRepoBytes, maxFiles: config.maxFiles,
     analyzers, findings,
-    onFinished: (scanId) => { budget.forget(scanId); verifier.forget(scanId); },
+    onFinished: (scanId) => {
+      budget.forget(scanId);
+      verifier.forget(scanId);
+      // Best-effort: the analyzer already sweeps in its own finally; this covers cancelled/crashed scans.
+      if (sandbox) void sandbox.sweep(scanId).catch(() => undefined);
+    },
   });
 
   const runner = new JobRunner({
@@ -77,5 +114,5 @@ export function createContainer(config: Config, overrides: { pipeline?: Pipeline
     config,
   });
   const service = new ScanService({ db, scans, lifecycle, audit, queue: runner, queueCapacity: config.queueCapacity });
-  return { config, db, scans, bus, audit, lifecycle, runner, service, git, github, indexRepo, gitVersion: null, llm, llmCalls, budget, findings, fixPlans };
+  return { config, db, scans, bus, audit, lifecycle, runner, service, git, github, indexRepo, gitVersion: null, llm, llmCalls, budget, findings, fixPlans, sandbox };
 }

@@ -28,6 +28,8 @@ async function main(): Promise<void> {
   const live = new Set(c.scans.listNonTerminal().map((s) => s.id));
   const removed = await c.git.sweep((scanId) => live.has(scanId));
   if (removed.length) app.log.info({ removed: removed.length }, 'removed stale scan workspaces');
+  // Best-effort: leftover sandbox containers/networks/volumes/staging dirs from a previous run.
+  if (c.sandbox) await c.sandbox.sweep().catch((err: unknown) => app.log.warn({ err }, 'sandbox sweep failed'));
   c.runner.startWatchdog();
   app.log.info({ scanMode: config.scanMode }, 'vibesec api ready');
 
