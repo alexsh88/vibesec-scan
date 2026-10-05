@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { extractJsImports, parsePathConfig, resolveJsImport, type JsResolveContext } from '../src/index/jsImports';
+import { extractJsImports, parsePathConfig, resolveJsImport, stripJsComments, type JsResolveContext } from '../src/index/jsImports';
 
 describe('extractJsImports', () => {
   it('finds static, re-export, side-effect, require and dynamic imports with line numbers', () => {
@@ -62,6 +62,31 @@ describe('extractJsImports', () => {
   it('does not treat quote characters inside a regex literal as starting a string', () => {
     const src = "const re = /[\"']/;\nimport './q.js';";
     expect(extractJsImports(src)).toEqual([{ specifier: './q.js', line: 2 }]);
+  });
+
+  it('does not start a regex scan on a JSX closing tag, so a following block comment is stripped correctly', () => {
+    const src = "const el = <div></div>;{/* import x from 'commented'\n*/}\nimport './real';";
+    expect(extractJsImports(src)).toEqual([{ specifier: './real', line: 3 }]);
+  });
+});
+
+describe('stripJsComments performance', () => {
+  it('strips 1MB of division-heavy code in roughly linear time', () => {
+    const unit = 'a / b ';
+    const src = unit.repeat(Math.ceil(1_000_000 / unit.length));
+    const start = performance.now();
+    stripJsComments(src);
+    const elapsed = performance.now() - start;
+    expect(elapsed).toBeLessThan(500);
+  });
+
+  it('strips 1MB of JSX-like markup in roughly linear time', () => {
+    const unit = '<div>{x}</div>\n';
+    const src = unit.repeat(Math.ceil(1_000_000 / unit.length));
+    const start = performance.now();
+    stripJsComments(src);
+    const elapsed = performance.now() - start;
+    expect(elapsed).toBeLessThan(500);
   });
 });
 

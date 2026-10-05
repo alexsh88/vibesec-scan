@@ -60,6 +60,21 @@ describe('skipReasonForPath', () => {
   ] as const)('%s → %s', (path, mode, type, reason) => expect(skipReasonForPath(path, mode, type)).toBe(reason));
 });
 
+describe('skipReasonForPath with manifestDirs', () => {
+  it('treats a contextual vendor dir as vendor when its parent directory has a manifest file', () => {
+    const manifestDirs = new Set(['client', 'frontend', 'backend', 'packages/@scope/pkg']);
+    expect(skipReasonForPath('client/build/index.html', '100644', 'blob', manifestDirs)).toBe('vendor');
+    expect(skipReasonForPath('frontend/vendor/jquery.js', '100644', 'blob', manifestDirs)).toBe('vendor');
+    expect(skipReasonForPath('backend/vendor/autoload.php', '100644', 'blob', manifestDirs)).toBe('vendor');
+    expect(skipReasonForPath('packages/@scope/pkg/dist/index.js', '100644', 'blob', manifestDirs)).toBe('vendor');
+  });
+
+  it('does not mark a contextual dir as vendor when its parent directory has no manifest file', () => {
+    const manifestDirs = new Set(['other']);
+    expect(skipReasonForPath('src/features/build/pipeline.ts', '100644', 'blob', manifestDirs)).toBeNull();
+  });
+});
+
 describe('skipReasonForContent', () => {
   const text = (s: string) => Buffer.from(s, 'utf8');
 

@@ -1,5 +1,5 @@
 import { lstat, open, readFile } from 'node:fs/promises';
-import { join, posix } from 'node:path';
+import { join, posix, resolve, sep } from 'node:path';
 import { AppError } from '../errors/AppError';
 import type { GitService } from '../git/GitService';
 import { categoryOf, isLockfile, languageOf, skipReasonForContent, skipReasonForPath, tagsOf } from './classify';
@@ -13,6 +13,18 @@ export type IndexRunOptions = { signal?: AbortSignal; touch?: () => void; onProg
 
 const HEAD_BYTES = 8_192;
 const CONCURRENCY = 32;
+const MANIFEST_BASENAMES = new Set(['package.json', 'pyproject.toml', 'setup.py', 'composer.json', 'go.mod', 'Cargo.toml']);
+
+/** Directories (repo-relative, '' for the root) that directly contain a project manifest file. */
+function manifestDirsOf(tree: readonly { path: string }[]): Set<string> {
+  const dirs = new Set<string>();
+  for (const entry of tree) {
+    if (!MANIFEST_BASENAMES.has(posix.basename(entry.path))) continue;
+    const dir = posix.dirname(entry.path);
+    dirs.add(dir === '.' ? '' : dir);
+  }
+  return dirs;
+}
 
 export class RepoIndexer {
   constructor(private readonly git: Pick<GitService, 'listTree'>, private readonly opts: RepoIndexerOptions) {}
@@ -26,12 +38,16 @@ export class RepoIndexer {
       .filter((e) => e.type === 'blob' || e.type === 'commit')
       .sort((a, b) => (a.path < b.path ? -1 : 1));
     const abs = (p: string) => join(dir, ...p.split('/'));
+    const resolvedDirPrefix = resolve(dir) + sep;
+    /** Safety backstop: a tree path must resolve to somewhere strictly inside `dir`. */
+    const isWithinDir = (p: string) => resolve(abs(p)).startsWith(resolvedDirPrefix);
 
     // 1. Path-level decisions, deterministically in path order (including the maxFiles cut-off).
+    const manifestDirs = manifestDirsOf(tree);
     let considered = 0;
     let truncated = false;
     const pathSkips = tree.map((entry) => {
-      const reason = skipReasonForPath(entry.path, entry.mode, entry.type);
+      const reason = skipReasonForPath(entry.path, entry.mode, entry.type, manifestDirs);
       if (reason || isLockfile(entry.path)) return reason;
       if (considered >= this.opts.maxFiles) {
         truncated = true;
@@ -50,8 +66,15 @@ export class RepoIndexer {
       let skipReason = pathSkips[i] ?? null;
       let size = 0;
       if (skipReason === null) {
-        size = (await lstat(abs(entry.path)).catch(() => null))?.size ?? 0;
-        skipReason = skipReasonForContent(entry.path, size, await readHead(abs(entry.path)), this.opts.maxFileBytes);
+        if (!isWithinDir(entry.path)) {
+          // Resolves outside the checkout dir (e.g. a path-traversal-like tree entry): treat as unsafe.
+          skipReason = 'symlink';
+        } else {
+          const stat = await lstat(abs(entry.path)).catch(() => null);
+          if (!stat) throw new AppError('INTERNAL', 'permanent', `The checkout is incomplete (missing ${entry.path})`);
+          size = stat.size;
+          skipReason = skipReasonForContent(entry.path, size, await readHead(abs(entry.path)), this.opts.maxFileBytes);
+        }
       }
       files[i] = { path: entry.path, blobSha: entry.blobSha, size, language, category, tags: tagsOf(entry.path), skipReason };
       if (i % 200 === 0) {

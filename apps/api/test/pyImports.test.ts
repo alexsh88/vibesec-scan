@@ -117,8 +117,21 @@ describe('resolvePyImport', () => {
 
   it('treats platform-specific and private stdlib modules as builtin, mapping _pytest to the pytest distribution', () => {
     expect(resolvePyImport('main.py', imp('msvcrt'), ctx)).toEqual([{ specifier: 'msvcrt', kind: 'builtin', to: null, pkg: null }]);
-    expect(resolvePyImport('main.py', imp('_typeshed'), ctx)).toEqual([{ specifier: '_typeshed', kind: 'builtin', to: null, pkg: null }]);
+    expect(resolvePyImport('main.py', imp('_thread'), ctx)).toEqual([{ specifier: '_thread', kind: 'builtin', to: null, pkg: null }]);
     expect(resolvePyImport('main.py', imp('_pytest.fixtures'), ctx)[0]).toMatchObject({ kind: 'package', pkg: 'pytest' });
+  });
+
+  it('classifies a stdlib module missing from the old hardcoded list as builtin', () => {
+    expect(resolvePyImport('main.py', imp('cmd'), ctx)).toEqual([{ specifier: 'cmd', kind: 'builtin', to: null, pkg: null }]);
+    expect(resolvePyImport('main.py', imp('pickletools'), ctx)).toEqual([{ specifier: 'pickletools', kind: 'builtin', to: null, pkg: null }]);
+  });
+
+  it('treats a leading-underscore name that is not an actual stdlib module as unresolved, not builtin', () => {
+    // Neither is in `sys.stdlib_module_names` nor in IMPORT_TO_DISTRIBUTION, so (unlike the previous
+    // hardcoded list, which had no way to distinguish them from real private stdlib modules) they are
+    // no longer misclassified as builtin.
+    expect(resolvePyImport('main.py', imp('_typeshed'), ctx)).toEqual([{ specifier: '_typeshed', kind: 'unresolved', to: null, pkg: null }]);
+    expect(resolvePyImport('main.py', imp('_cffi_backend'), ctx)).toEqual([{ specifier: '_cffi_backend', kind: 'unresolved', to: null, pkg: null }]);
   });
 
   it('never produces a package name with a leading or trailing dash', () => {

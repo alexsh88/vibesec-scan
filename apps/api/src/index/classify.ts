@@ -12,12 +12,16 @@ const ALWAYS_VENDOR_DIRS = new Set([
 const CONTEXTUAL_VENDOR_DIRS = new Set(['vendor', 'dist', 'build', 'out', '.cache', 'coverage']);
 const MONOREPO_ROOTS = new Set(['apps', 'packages', 'services', 'libs', 'modules']);
 
-function isVendorSegment(segments: readonly string[], index: number): boolean {
+function isVendorSegment(segments: readonly string[], index: number, manifestDirs?: ReadonlySet<string>): boolean {
   const segment = segments[index] ?? '';
   if (ALWAYS_VENDOR_DIRS.has(segment)) return true;
   if (!CONTEXTUAL_VENDOR_DIRS.has(segment)) return false;
   // First path segment, or directly under <monorepoRoot>/<pkg>/.
-  return index === 0 || (index === 2 && MONOREPO_ROOTS.has(segments[0] ?? ''));
+  if (index === 0 || (index === 2 && MONOREPO_ROOTS.has(segments[0] ?? ''))) return true;
+  // Or directly under any directory that itself contains a project manifest (package.json, pyproject.toml,
+  // setup.py, composer.json, go.mod, Cargo.toml) — covers cases the fixed-depth rules above miss, such as
+  // client/build, frontend/vendor, backend/vendor (composer) and scoped monorepo packages' dist dirs.
+  return manifestDirs !== undefined && manifestDirs.has(segments.slice(0, index).join('/'));
 }
 
 const LOCKFILES = new Set([
@@ -96,12 +100,14 @@ export function tagsOf(path: string): FileTag[] {
   return tags;
 }
 
-/** Decides from the tree entry alone (no file read). */
-export function skipReasonForPath(path: string, mode: string, type: string): SkipReason | null {
+/** Decides from the tree entry alone (no file read). `manifestDirs` (directories directly containing a
+ *  project manifest file) extends the contextual-vendor-dir rule to monorepo layouts the fixed-depth
+ *  rules alone don't cover. */
+export function skipReasonForPath(path: string, mode: string, type: string, manifestDirs?: ReadonlySet<string>): SkipReason | null {
   if (type === 'commit') return 'submodule';
   if (mode === '120000') return 'symlink';
   const ancestors = path.split('/').slice(0, -1);
-  if (ancestors.some((_, index) => isVendorSegment(ancestors, index))) return 'vendor';
+  if (ancestors.some((_, index) => isVendorSegment(ancestors, index, manifestDirs))) return 'vendor';
   if (BINARY_EXT.has(extOf(path))) return 'binary';
   if (/\.min\.(js|css)$/i.test(path)) return 'minified';
   return null;

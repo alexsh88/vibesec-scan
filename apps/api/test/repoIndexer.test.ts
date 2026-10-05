@@ -1,4 +1,4 @@
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, rm, unlink } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
@@ -98,5 +98,18 @@ describe('RepoIndexer', () => {
     ac.abort();
     await expect(new RepoIndexer(git, { maxFiles: 10, maxFileBytes: 1_024 }).index(dir, repo.shas[0]!, { signal: ac.signal }))
       .rejects.toMatchObject({ code: 'CANCELLED' });
+  });
+
+  it('rejects with INTERNAL when a tracked, non-skipped file is missing from the checkout', async () => {
+    const missingDir = await git.ensureCheckout('idx-missing', repo.url, repo.shas[0]!);
+    await unlink(join(missingDir, 'src', 'db.ts'));
+    const indexer = new RepoIndexer(git, { maxFiles: 1_000, maxFileBytes: 1_024 });
+    await expect(indexer.index(missingDir, repo.shas[0]!)).rejects.toMatchObject({ code: 'INTERNAL' });
+  }, 60_000);
+
+  it('skips an entry as a symlink-like backstop when its path would resolve outside the checkout dir', async () => {
+    const fakeGit = { listTree: async () => [{ mode: '100644', type: 'blob' as const, blobSha: '0'.repeat(40), path: '../escape.txt' }] };
+    const index = await new RepoIndexer(fakeGit, { maxFiles: 1_000, maxFileBytes: 1_024 }).index(dir, repo.shas[0]!);
+    expect(index.files[0]).toMatchObject({ path: '../escape.txt', skipReason: 'symlink' });
   });
 });
