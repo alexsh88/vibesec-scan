@@ -63,6 +63,73 @@ describe('RateLimiter', () => {
     ac.abort();
     await expect(rl.acquire(1, ac.signal)).rejects.toMatchObject({ code: 'CANCELLED' });
   });
+
+  it('treats non-finite or negative estimates as zero instead of hanging forever', async () => {
+    const c = clock();
+    const rl = new RateLimiter({ requestsPerMinute: 1_000, inputTokensPerMinute: 100, now: c.now, sleep: c.sleep });
+    await rl.acquire(NaN);
+    await rl.acquire(Infinity);
+    await rl.acquire(-50);
+    expect(c.sleeps).toEqual([]); // all resolved immediately; no NaN poisoning hung the loop
+
+    // Buckets must not be poisoned with NaN: `tokens` is still a real number, so acquiring
+    // the full remaining bucket succeeds immediately (it would hang forever on NaN compares).
+    await rl.acquire(100);
+    expect(c.sleeps).toEqual([]);
+
+    // ...and once the bucket really is exhausted, a normal acquire correctly waits for refill.
+    await rl.acquire(1);
+    expect(c.sleeps.length).toBeGreaterThan(0);
+  });
+
+  it('rethrows a non-abort sleep failure unchanged instead of relabelling it CANCELLED', async () => {
+    const c = clock();
+    const boom = new Error('boom');
+    const rl = new RateLimiter({
+      requestsPerMinute: 1,
+      inputTokensPerMinute: 1_000,
+      now: c.now,
+      sleep: async () => { throw boom; },
+    });
+    await rl.acquire(1); // consumes the only request slot, so the next acquire must wait (and sleep)
+    await expect(rl.acquire(1)).rejects.toThrow('boom');
+  });
+
+  it('serializes acquisitions strictly FIFO so a large request is not starved behind small ones', async () => {
+    const c = clock();
+    const rl = new RateLimiter({ requestsPerMinute: 10_000, inputTokensPerMinute: 1_000, now: c.now, sleep: c.sleep });
+    await rl.acquire(1_000); // drain the token bucket completely
+
+    const order: string[] = [];
+    const big = rl.acquire(900).then(() => { order.push('big'); });
+    const smalls = Array.from({ length: 20 }, (_, i) => rl.acquire(50).then(() => { order.push(`small-${i}`); }));
+
+    await Promise.all([big, ...smalls]);
+
+    expect(order[0]).toBe('big');
+    expect(order.slice(1)).toEqual(Array.from({ length: 20 }, (_, i) => `small-${i}`));
+  });
+
+  it('rejects an aborted queued waiter promptly without blocking the rest, which still complete in order', async () => {
+    const c = clock();
+    const rl = new RateLimiter({ requestsPerMinute: 10_000, inputTokensPerMinute: 100, now: c.now, sleep: c.sleep });
+    await rl.acquire(100); // drain
+
+    const order: string[] = [];
+    const ac = new AbortController();
+
+    const w0 = rl.acquire(10).then(() => order.push('w0'));
+    const w1 = rl.acquire(10, ac.signal).then(() => order.push('w1'));
+    const w2 = rl.acquire(10).then(() => order.push('w2'));
+    const w3 = rl.acquire(10).then(() => order.push('w3'));
+
+    ac.abort(); // abort w1 while it is still queued behind w0, before its turn arrives
+
+    await expect(w1).rejects.toMatchObject({ code: 'CANCELLED' });
+    await Promise.all([w0, w2, w3]);
+
+    expect(order).toEqual(['w0', 'w2', 'w3']);
+  });
 });
 
 describe('Semaphore', () => {

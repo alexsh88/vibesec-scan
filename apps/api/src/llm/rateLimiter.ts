@@ -20,6 +20,8 @@ export class RateLimiter {
   private penaltyUntil = 0;
   private readonly now: () => number;
   private readonly sleep: (ms: number, signal?: AbortSignal) => Promise<void>;
+  /** Serializes waiters strictly FIFO: each acquire() only runs once the previous one has settled. */
+  private tail: Promise<void> = Promise.resolve();
 
   constructor(private readonly opts: RateLimiterOptions) {
     this.now = opts.now ?? Date.now;
@@ -29,12 +31,22 @@ export class RateLimiter {
     this.last = this.now();
   }
 
-  async acquire(estimatedInputTokens: number, signal?: AbortSignal): Promise<void> {
+  /** Acquires capacity in strict call order, so a large request can't be starved behind a stream of small ones. */
+  acquire(estimatedInputTokens: number, signal?: AbortSignal): Promise<void> {
+    const run = this.tail.then(() => this.acquireNow(estimatedInputTokens, signal));
+    this.tail = run.catch(() => undefined);
+    return run;
+  }
+
+  private async acquireNow(estimatedInputTokens: number, signal?: AbortSignal): Promise<void> {
+    // Non-finite or negative estimates (NaN, Infinity, -5, ...) would otherwise poison the
+    // buckets with NaN, making every `tokens >= needTokens` comparison false and hanging forever.
+    const estimate = Number.isFinite(estimatedInputTokens) && estimatedInputTokens > 0 ? estimatedInputTokens : 0;
     for (;;) {
       if (signal?.aborted) throw cancelled();
       this.refill();
       const { reqCap, tokCap } = this.capacities();
-      const needTokens = Math.min(Math.max(estimatedInputTokens, 0), tokCap);
+      const needTokens = Math.min(estimate, tokCap);
       if (this.requests >= 1 && this.tokens >= needTokens) {
         this.requests -= 1;
         this.tokens -= needTokens;
@@ -44,8 +56,10 @@ export class RateLimiter {
       const tokWait = this.tokens >= needTokens ? 0 : ((needTokens - this.tokens) / tokCap) * MINUTE;
       try {
         await this.sleep(Math.max(Math.ceil(Math.max(reqWait, tokWait)), 1), signal);
-      } catch {
-        throw cancelled();
+      } catch (err) {
+        // Only an abort becomes CANCELLED; any other sleep failure propagates unchanged.
+        if (signal?.aborted || (err instanceof Error && err.name === 'AbortError')) throw cancelled();
+        throw err;
       }
     }
   }

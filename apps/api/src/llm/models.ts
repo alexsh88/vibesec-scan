@@ -13,8 +13,23 @@ const PRICING: Record<string, Price> = {
   'claude-fable-5-1': { input: 10, output: 50, cacheWrite: 12.5, cacheRead: 0.25 },
 };
 
+const KNOWN_PRICES = Object.values(PRICING);
+/**
+ * Field-wise maximum across every known model's rates, used for unknown models. A single
+ * row (e.g. Opus 5) isn't conservative enough: a future model could beat Opus 5 on input/output
+ * but not be the row we picked. Taking the max of each field independently guarantees the
+ * fallback never under-prices any dimension relative to a known model, so budget tracking never
+ * under-counts spend against an unlisted model - the only failure mode worth avoiding here.
+ */
+const CONSERVATIVE_PRICE: Price = {
+  input: Math.max(...KNOWN_PRICES.map((p) => p.input)),
+  output: Math.max(...KNOWN_PRICES.map((p) => p.output)),
+  cacheWrite: Math.max(...KNOWN_PRICES.map((p) => p.cacheWrite)),
+  cacheRead: Math.max(...KNOWN_PRICES.map((p) => p.cacheRead)),
+};
+
 export function priceOf(model: string): Price {
-  return PRICING[model] ?? PRICING['claude-opus-5']!;
+  return PRICING[model] ?? CONSERVATIVE_PRICE;
 }
 
 export function costUsd(model: string, u: TokenUsage): number {

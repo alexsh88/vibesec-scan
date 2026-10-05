@@ -8,8 +8,10 @@ describe('model pricing', () => {
     expect(usd).toBeCloseTo(2 + 1 + 0.1 + 0.5, 6);
   });
 
-  it('prices unknown models conservatively (Opus 5 rates)', () => {
-    expect(priceOf('some-future-model')).toEqual(priceOf('claude-opus-5'));
+  it('prices unknown models conservatively (field-wise max across the PRICING table)', () => {
+    // Max of each field independently across all known models (currently Fable 5.1 rates for
+    // input/output/cacheWrite, Opus 5's rate for cacheRead) - never under-count spend against budget.
+    expect(priceOf('some-future-model')).toEqual({ input: 10, output: 50, cacheWrite: 12.5, cacheRead: 0.5 });
   });
 });
 
