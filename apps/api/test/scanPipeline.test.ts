@@ -7,6 +7,7 @@ import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { ScanOptionsSchema } from '@vibesec/shared';
 import { AuditLogger } from '../src/audit/AuditLogger';
 import { EventRepo } from '../src/db/eventRepo';
+import { FindingRepo } from '../src/db/findingRepo';
 import { IndexRepo } from '../src/db/indexRepo';
 import { ScanRepo } from '../src/db/scanRepo';
 import { AppError } from '../src/errors/AppError';
@@ -134,4 +135,38 @@ describe('scan pipeline (real git)', () => {
     expect((await run(id)).state).toBe('COMPLETED');
     expect(indexRepo.files(id).map((f) => f.path)).toContain('only-first.txt');
   }, 60_000);
+});
+
+describe('createScanPipeline ANALYZING stage selection', () => {
+  function minimalDeps() {
+    const db = memoryDb();
+    const scans = new ScanRepo(db);
+    const indexRepo = new IndexRepo(db);
+    const fakeGit = {
+      remoteUrl: () => '', resolveRef: async () => '0'.repeat(40), ensureCheckout: async () => '0'.repeat(40),
+      removeScanDir: async () => {}, repoDir: (id: string) => `/x/${id}`,
+    };
+    const fakeGithub = { getRepo: async () => ({ isPrivate: false, defaultBranch: 'main', sizeBytes: 0, htmlUrl: '', archived: false }) };
+    const fakeIndexer = {
+      index: async () => ({
+        files: [], imports: [], entrypoints: [],
+        stats: { totalFiles: 0, indexedFiles: 0, skipped: {}, byLanguage: {}, imports: 0, entrypoints: 0, truncated: false },
+      }),
+    };
+    return { git: fakeGit, github: fakeGithub, scans, indexRepo, indexer: fakeIndexer, maxRepoBytes: 1, maxFiles: 1 };
+  }
+
+  it('uses the real analyzer stage when both analyzers and findings are given', () => {
+    const deps = minimalDeps();
+    const pipeline = createScanPipeline({ ...deps, analyzers: [], findings: new FindingRepo(memoryDb()) });
+    const analyzing = pipeline.stages.find((s) => s.name === 'ANALYZING');
+    expect(analyzing?.fatal).toBe(true);
+  });
+
+  it('keeps the stub ANALYZING stage when analyzers/findings are not given', () => {
+    const deps = minimalDeps();
+    const pipeline = createScanPipeline(deps);
+    const analyzing = pipeline.stages.find((s) => s.name === 'ANALYZING');
+    expect(analyzing?.fatal).toBe(false);
+  });
 });
