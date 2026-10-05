@@ -54,6 +54,11 @@ const EnvSchema = z.object({
   // max_tokens; this is the per-request total cap for the now-streamed send() (#I-2).
   LLM_TIMEOUT_MS: z.coerce.number().int().positive().default(600_000),
   LLM_RECORDINGS_DIR: z.string().default(join('fixtures', 'llm-recordings')),
+  SANDBOX_ENABLED: z.enum(['true', 'false']).default('true'),
+  SANDBOX_IMAGE_PREFIX: z.string().regex(/^[a-z0-9][a-z0-9._\/-]*$/).default('vibesec'),
+  SANDBOX_INSTALL_TIMEOUT_MS: z.coerce.number().int().positive().default(180_000),
+  SANDBOX_ANALYZE_TIMEOUT_MS: z.coerce.number().int().positive().default(120_000),
+  SANDBOX_MAX_DEPS_MB: z.coerce.number().int().positive().default(1536),
 });
 
 export type Config = {
@@ -65,6 +70,8 @@ export type Config = {
   maxRepoBytes: number; maxFiles: number; maxFileBytes: number; cloneTimeoutMs: number; gitStallMs: number;
   models: { fast: string; deep: string; synthesis: string };
   llmConcurrency: number; llmRequestsPerMinute: number; llmInputTokensPerMinute: number; llmTimeoutMs: number; llmRecordingsDir: string;
+  /** Docker sandbox for dependency install (phase A) and offline usage analysis (phase B). */
+  sandbox: { enabled: boolean; imagePrefix: string; installTimeoutMs: number; analyzeTimeoutMs: number; maxDepsBytes: number };
 };
 
 export function loadConfig(env: Record<string, string | undefined> = process.env): Config {
@@ -105,5 +112,10 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     // Relative overrides (and the relative default) resolve against the repo root, not cwd;
     // an absolute override is used as-is (#M-6).
     llmRecordingsDir: isAbsolute(e.LLM_RECORDINGS_DIR) ? e.LLM_RECORDINGS_DIR : resolve(REPO_ROOT, e.LLM_RECORDINGS_DIR),
+    sandbox: {
+      enabled: e.SANDBOX_ENABLED === 'true', imagePrefix: e.SANDBOX_IMAGE_PREFIX,
+      installTimeoutMs: e.SANDBOX_INSTALL_TIMEOUT_MS, analyzeTimeoutMs: e.SANDBOX_ANALYZE_TIMEOUT_MS,
+      maxDepsBytes: e.SANDBOX_MAX_DEPS_MB * 1024 * 1024,
+    },
   };
 }
