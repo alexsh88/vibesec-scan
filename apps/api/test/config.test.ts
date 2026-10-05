@@ -37,3 +37,26 @@ describe('loadConfig timing invariants (#10)', () => {
     expect(loadConfig({ HEARTBEAT_MS: '1000', STALE_HEARTBEAT_MS: '5000', STUCK_AFTER_MS: '2000' }).heartbeatMs).toBe(1000);
   });
 });
+
+describe('git & workspace config', () => {
+  it('has safe defaults', () => {
+    const c = loadConfig({});
+    expect(c.githubToken).toBeUndefined();
+    expect(c.githubApiUrl).toBe('https://api.github.com');
+    expect(c.workDir).toMatch(/vibesec$/);
+    expect(c.maxRepoBytes).toBe(500 * 1024 * 1024);
+    expect(c.maxFiles).toBe(20_000);
+    expect(c.maxFileBytes).toBe(1024 * 1024);
+    expect(c.cloneTimeoutMs).toBe(120_000);
+    expect(c.gitStallMs).toBe(30_000);
+  });
+
+  it('reads overrides', () => {
+    const c = loadConfig({ GITHUB_TOKEN: 'ghp_x', WORK_DIR: '/tmp/w', MAX_REPO_MB: '10', MAX_FILES: '5', CLONE_TIMEOUT_MS: '5000', GIT_STALL_MS: '1000' });
+    expect(c).toMatchObject({ githubToken: 'ghp_x', workDir: '/tmp/w', maxRepoBytes: 10 * 1024 * 1024, maxFiles: 5, cloneTimeoutMs: 5000, gitStallMs: 1000 });
+  });
+
+  it('rejects a stall window that is not shorter than the clone timeout', () => {
+    expect(() => loadConfig({ CLONE_TIMEOUT_MS: '1000', GIT_STALL_MS: '1000' })).toThrow(/GIT_STALL_MS/);
+  });
+});
