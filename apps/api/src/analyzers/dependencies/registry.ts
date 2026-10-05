@@ -20,41 +20,53 @@ export type RegistryClientOptions = {
   breaker?: CircuitBreaker;
   npmBaseUrl?: string;
   pypiBaseUrl?: string;
+  /** Response bodies larger than this are refused while streaming (default 20 MiB). */
+  maxResponseBytes?: number;
+  /** Cached packages (projections only, never whole documents; default 300). */
+  cacheCapacity?: number;
 };
 
 const DEFAULT_TIMEOUT_MS = 10_000;
-const LRU_CAPACITY = 2000;
+const DEFAULT_CAPACITY = 300;
+const DEFAULT_MAX_RESPONSE_BYTES = 20 * 1024 * 1024;
+const CACHE_TTL_MS = 60 * 60 * 1000;
 
+/** Bounded LRU with a per-entry TTL. */
 class Lru<V> {
-  private readonly map = new Map<string, V>();
-  constructor(private readonly capacity: number) {}
+  private readonly map = new Map<string, { at: number; value: V }>();
+  constructor(private readonly capacity: number, private readonly ttlMs: number, private readonly now: () => Date) {}
 
   get(key: string): V | undefined {
-    const v = this.map.get(key);
-    if (v === undefined) return undefined;
+    const e = this.map.get(key);
+    if (e === undefined) return undefined;
     this.map.delete(key);
-    this.map.set(key, v);
-    return v;
+    if (this.now().getTime() - e.at >= this.ttlMs) return undefined;
+    this.map.set(key, e);
+    return e.value;
   }
 
   set(key: string, value: V): void {
     if (this.map.has(key)) this.map.delete(key);
-    else if (this.map.size >= this.capacity) {
+    while (this.map.size >= this.capacity) {
       const oldest = this.map.keys().next().value;
-      if (oldest !== undefined) this.map.delete(oldest);
+      if (oldest === undefined) break;
+      this.map.delete(oldest);
     }
-    this.map.set(key, value);
+    this.map.set(key, { at: this.now().getTime(), value });
   }
 }
 
-// npm: lowercase, <=214 chars, no leading '.'/'_', optional "@scope/name".
-const NPM_UNSCOPED_RE = /^[a-z0-9][a-z0-9._-]*$/;
+/** What is kept per npm package: the version list and, per version, only its dependency ranges. */
+type NpmProjection = { versions: string[]; deps: Map<string, Map<string, string>> };
+
+// npm: <=214 chars, no leading '.'/'_', optional "@scope/name". Uppercase is allowed: legacy packages
+// (e.g. JSONStream) still have it, and the character set alone rules out path injection.
+const NPM_UNSCOPED_RE = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
 // PEP 508 "Name" production.
 const PEP508_NAME_RE = /^([A-Za-z0-9]|[A-Za-z0-9][A-Za-z0-9._-]*[A-Za-z0-9])$/;
 
 function isValidNpmName(name: string): boolean {
   if (name.length === 0 || name.length > 214) return false;
-  if (name !== name.toLowerCase()) return false;
   if (name.startsWith('@')) {
     const rest = name.slice(1);
     const slash = rest.indexOf('/');
@@ -133,9 +145,18 @@ export class RegistryClient {
   private readonly breaker: CircuitBreaker;
   private readonly npmBaseUrl: string;
   private readonly pypiBaseUrl: string;
-  private readonly cache = new Lru<unknown>(LRU_CAPACITY);
+  private readonly maxResponseBytes: number;
+  private readonly npmCache: Lru<NpmProjection>;
+  private readonly pypiVersionsCache: Lru<string[]>;
+  private readonly pypiRequiresCache: Lru<string[]>;
 
   constructor(opts: RegistryClientOptions = {}) {
+    const now = opts.now ?? (() => new Date());
+    const capacity = opts.cacheCapacity ?? DEFAULT_CAPACITY;
+    this.npmCache = new Lru(capacity, CACHE_TTL_MS, now);
+    this.pypiVersionsCache = new Lru(capacity, CACHE_TTL_MS, now);
+    this.pypiRequiresCache = new Lru(capacity * 10, CACHE_TTL_MS, now);
+    this.maxResponseBytes = opts.maxResponseBytes ?? DEFAULT_MAX_RESPONSE_BYTES;
     this.fetchImpl = opts.fetch ?? fetch;
     this.timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
     this.retryDeps = opts.retryDeps;
@@ -146,22 +167,14 @@ export class RegistryClient {
 
   async versions(eco: Ecosystem, name: string, signal: AbortSignal): Promise<string[]> {
     assertValidName(eco, name);
-    if (eco === 'npm') {
-      const doc = await this.npmDoc(name, signal);
-      return Object.keys(doc.versions ?? {});
-    }
-    const doc = await this.pypiProject(name, signal);
-    return Object.keys(doc.releases ?? {});
+    if (eco === 'npm') return [...(await this.npmProjection(name, signal)).versions];
+    return [...(await this.pypiVersions(name, signal))];
   }
 
   async dependencyRange(eco: Ecosystem, name: string, version: string, child: string, signal: AbortSignal): Promise<string | null> {
     assertValidName(eco, name);
     assertValidName(eco, child);
-    if (eco === 'npm') {
-      const doc = await this.npmDoc(name, signal);
-      const verInfo = doc.versions?.[version];
-      return verInfo?.dependencies?.[child] ?? null;
-    }
+    if (eco === 'npm') return (await this.npmProjection(name, signal)).deps.get(version)?.get(child) ?? null;
     const requiresDist = await this.pypiRequiresDist(name, version, signal);
     const target = normalizePypiName(child);
     for (const entry of requiresDist) {
@@ -171,33 +184,41 @@ export class RegistryClient {
     return null;
   }
 
-  private async npmDoc(name: string, signal: AbortSignal): Promise<NpmAbbrevDoc> {
-    const key = `npm:doc:${name}`;
-    const cached = this.cache.get(key) as NpmAbbrevDoc | undefined;
+  /** npm abbreviated doc → projection (version list + per-version dependency ranges); the doc itself is dropped. */
+  private async npmProjection(name: string, signal: AbortSignal): Promise<NpmProjection> {
+    const cached = this.npmCache.get(name);
     if (cached) return cached;
     const url = `${this.npmBaseUrl}/${encodeNpmName(name)}`;
     const json = await this.request(url, { accept: 'application/vnd.npm.install-v1+json' }, signal);
     const parsed = NpmAbbrevDocSchema.safeParse(json);
     if (!parsed.success) throw new AppError('INTERNAL', 'transient', 'npm registry returned an unexpected response', { cause: parsed.error });
-    this.cache.set(key, parsed.data);
-    return parsed.data;
+    const doc: NpmAbbrevDoc = parsed.data;
+    const deps = new Map<string, Map<string, string>>();
+    for (const [version, info] of Object.entries(doc.versions ?? {})) {
+      const d = info.dependencies;
+      if (d && Object.keys(d).length > 0) deps.set(version, new Map(Object.entries(d)));
+    }
+    const projection: NpmProjection = { versions: Object.keys(doc.versions ?? {}), deps };
+    this.npmCache.set(name, projection);
+    return projection;
   }
 
-  private async pypiProject(name: string, signal: AbortSignal): Promise<PypiProjectDoc> {
-    const key = `pypi:project:${name}`;
-    const cached = this.cache.get(key) as PypiProjectDoc | undefined;
+  private async pypiVersions(name: string, signal: AbortSignal): Promise<string[]> {
+    const cached = this.pypiVersionsCache.get(name);
     if (cached) return cached;
     const url = `${this.pypiBaseUrl}/pypi/${encodeURIComponent(name)}/json`;
     const json = await this.request(url, {}, signal);
     const parsed = PypiProjectDocSchema.safeParse(json);
     if (!parsed.success) throw new AppError('INTERNAL', 'transient', 'PyPI returned an unexpected response', { cause: parsed.error });
-    this.cache.set(key, parsed.data);
-    return parsed.data;
+    const doc: PypiProjectDoc = parsed.data;
+    const versions = Object.keys(doc.releases ?? {});
+    this.pypiVersionsCache.set(name, versions);
+    return versions;
   }
 
   private async pypiRequiresDist(name: string, version: string, signal: AbortSignal): Promise<string[]> {
-    const key = `pypi:version:${name}@${version}`;
-    const cached = this.cache.get(key) as string[] | undefined;
+    const key = `${name}@${version}`;
+    const cached = this.pypiRequiresCache.get(key);
     if (cached) return cached;
     const url = `${this.pypiBaseUrl}/pypi/${encodeURIComponent(name)}/${encodeURIComponent(version)}/json`;
     let list: string[];
@@ -210,8 +231,34 @@ export class RegistryClient {
       if (appErr.code === 'NOT_FOUND') list = [];
       else throw appErr;
     }
-    this.cache.set(key, list);
+    this.pypiRequiresCache.set(key, list);
     return list;
+  }
+
+  /** Reads the body as a stream and aborts as soon as it exceeds maxResponseBytes (a full npm document of a
+   *  popular package is tens of MB; a hostile mirror could send far more). */
+  private async readCapped(res: Response): Promise<string> {
+    const tooBig = () => new AppError('INTERNAL', 'permanent', `Registry response exceeds ${Math.round(this.maxResponseBytes / 1048576)} MB`);
+    const declared = Number(res.headers.get('content-length'));
+    if (Number.isFinite(declared) && declared > this.maxResponseBytes) {
+      await res.body?.cancel().catch(() => undefined);
+      throw tooBig();
+    }
+    if (!res.body) return '';
+    const reader = res.body.getReader();
+    const chunks: Uint8Array[] = [];
+    let total = 0;
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > this.maxResponseBytes) {
+        await reader.cancel().catch(() => undefined);
+        throw tooBig();
+      }
+      chunks.push(value);
+    }
+    return Buffer.concat(chunks).toString('utf8');
   }
 
   private async request(url: string, headers: Record<string, string>, signal: AbortSignal): Promise<unknown> {
@@ -232,8 +279,9 @@ export class RegistryClient {
 
     if (res.status === 404) throw new AppError('NOT_FOUND', 'permanent', 'Package not found in registry');
     if (res.ok) {
+      const text = await this.readCapped(res);
       try {
-        return await res.json();
+        return JSON.parse(text) as unknown;
       } catch (err) {
         throw new AppError('INTERNAL', 'transient', 'Registry returned an unparseable response', { cause: err });
       }

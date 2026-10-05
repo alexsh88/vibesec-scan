@@ -31,7 +31,6 @@ describe('RegistryClient.versions (npm)', () => {
   it('rejects an invalid npm name without ever calling fetch', async () => {
     const { rc, fetchMock } = client([]);
     await expect(rc.versions('npm', '../etc/passwd', new AbortController().signal)).rejects.toMatchObject({ code: 'VALIDATION' });
-    await expect(rc.versions('npm', 'UpperCase', new AbortController().signal)).rejects.toMatchObject({ code: 'VALIDATION' });
     await expect(rc.versions('npm', '.hidden', new AbortController().signal)).rejects.toMatchObject({ code: 'VALIDATION' });
     expect(fetchMock).not.toHaveBeenCalled();
   });
@@ -111,5 +110,69 @@ describe('RegistryClient.dependencyRange (PyPI)', () => {
   it('treats a null requires_dist as no dependencies', async () => {
     const { rc } = client([json(200, pypiVersion(null))]);
     await expect(rc.dependencyRange('PyPI', 'django', '4.0.0', 'baz', new AbortController().signal)).resolves.toBeNull();
+  });
+});
+
+describe('RegistryClient — bounded memory (projections, byte cap, TTL, capacity)', () => {
+  const sig = () => new AbortController().signal;
+
+  it('accepts legacy uppercase npm names but still refuses path injection', async () => {
+    const { rc, fetchMock } = client([json(200, npmDoc({ '1.0.0': {} })), json(200, npmDoc({ '1.0.0': {} }))]);
+    await expect(rc.versions('npm', 'JSONStream', sig())).resolves.toEqual(['1.0.0']);
+    expect((fetchMock.mock.calls[0] as unknown as [string])[0]).toBe('https://registry.npmjs.org/JSONStream');
+    await expect(rc.versions('npm', '@Scope/Pkg', sig())).resolves.toEqual(['1.0.0']);
+    for (const bad of ['../x', 'a/b', '@s/../x', '@s/a/b', 'x?y', 'x#y', 'x%2f', ' x', '.x', '_x', '@/x']) {
+      await expect(rc.versions('npm', bad, sig()), bad).rejects.toMatchObject({ code: 'VALIDATION' });
+    }
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it('refuses a response body over the byte cap (streamed, not buffered whole)', async () => {
+    let pulled = 0;
+    const big = new ReadableStream<Uint8Array>({
+      pull(ctrl) {
+        pulled++;
+        if (pulled > 1000) { ctrl.close(); return; }
+        ctrl.enqueue(new Uint8Array(1024).fill(0x20));
+      },
+    });
+    const fetchMock = vi.fn(async () => new Response(big, { status: 200 }));
+    const rc = new RegistryClient({ fetch: fetchMock as unknown as typeof fetch, maxResponseBytes: 8 * 1024, retryDeps: { sleep: async () => {} } });
+    await expect(rc.versions('npm', 'huge', sig())).rejects.toMatchObject({ message: expect.stringMatching(/exceeds/) });
+    expect(pulled).toBeLessThan(50);
+  });
+
+  it('refuses up front when content-length announces more than the cap', async () => {
+    const fetchMock = vi.fn(async () => new Response('{}', { status: 200, headers: { 'content-length': String(100 * 1024 * 1024) } }));
+    const rc = new RegistryClient({ fetch: fetchMock as unknown as typeof fetch, retryDeps: { sleep: async () => {} } });
+    await expect(rc.versions('npm', 'huge', sig())).rejects.toMatchObject({ message: expect.stringMatching(/exceeds/) });
+  });
+
+  it('one fetch serves both versions() and dependencyRange() (the cache keeps projections, not the document)', async () => {
+    const { rc, fetchMock } = client([json(200, npmDoc({ '1.0.0': { dependencies: { qs: '^6.0.0' } }, '1.1.0': {} }))]);
+    expect(await rc.versions('npm', 'express', sig())).toEqual(['1.0.0', '1.1.0']);
+    expect(await rc.dependencyRange('npm', 'express', '1.0.0', 'qs', sig())).toBe('^6.0.0');
+    expect(await rc.dependencyRange('npm', 'express', '1.1.0', 'qs', sig())).toBeNull();
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('entries expire after 1 h', async () => {
+    let now = new Date('2026-01-01T00:00:00Z');
+    const responses = [json(200, npmDoc({ '1.0.0': {} })), json(200, npmDoc({ '1.0.0': {}, '2.0.0': {} }))];
+    const fetchMock = vi.fn(async () => responses.shift() ?? json(500, {}));
+    const rc = new RegistryClient({ fetch: fetchMock as unknown as typeof fetch, now: () => now });
+    expect(await rc.versions('npm', 'x', sig())).toEqual(['1.0.0']);
+    now = new Date(now.getTime() + 59 * 60_000);
+    expect(await rc.versions('npm', 'x', sig())).toEqual(['1.0.0']);
+    now = new Date(now.getTime() + 2 * 60_000);
+    expect(await rc.versions('npm', 'x', sig())).toEqual(['1.0.0', '2.0.0']);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it('is capacity-bounded (LRU)', async () => {
+    const fetchMock = vi.fn(async () => json(200, npmDoc({ '1.0.0': {} })));
+    const rc = new RegistryClient({ fetch: fetchMock as unknown as typeof fetch, cacheCapacity: 2 });
+    for (const n of ['a', 'b', 'c', 'a']) await rc.versions('npm', n, sig());
+    expect(fetchMock).toHaveBeenCalledTimes(4);
   });
 });
