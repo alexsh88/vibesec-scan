@@ -25,6 +25,7 @@ const PROGRESS_RE = /^(?:remote:\s*)?([A-Za-z][A-Za-z ]+):\s+\d+%\s+\((\d+)\/(\d
 const SHORT_TIMEOUT_MS = 30_000;
 const LS_REMOTE_TIMEOUT_MS = 20_000;
 const MAX_TREE_BYTES = 64 * 1024 * 1024;
+const MAX_LOG_PATCH_BYTES = 64 * 1024 * 1024;
 const EMPTY_CONFIG = '.gitconfig-empty';
 /** Private, empty HOME for git: the operator's ~/.netrc, _netrc and per-user config are never visible. */
 const GIT_HOME = '.home';
@@ -169,6 +170,46 @@ export class GitService {
       }
     }
     return entries;
+  }
+
+  /**
+   * Unified-0 patches of the last `depth` commits reachable from HEAD (newest first), with a NUL-prefixed
+   * `\0COMMIT <sha>` marker line before each commit's patch so a parser can't be fooled by file content.
+   * depth <= 0 returns `{ text: '', truncated: false }` without running git. `token` is only needed for a
+   * partial clone's lazy blob fetch of a private repo and is applied the same way `ensureCheckout` applies it
+   * (an `http.extraHeader` scoped to github.com, never argv/URL). Output is capped at MAX_LOG_PATCH_BYTES;
+   * runProcess's output_limit failure discards whatever stdout it already buffered (ProcessError only carries
+   * a stderr tail, not partial stdout), so there is nothing partial to salvage from a single attempt that hits
+   * the cap. Instead, on that specific failure, this retries with a halved depth until the patch fits or depth
+   * reaches 1, and reports `truncated: true` whenever a retry was needed.
+   */
+  async logPatch(
+    repoDir: string, depth: number, signal?: AbortSignal, token?: string,
+  ): Promise<{ text: string; truncated: boolean }> {
+    if (!Number.isFinite(depth) || depth <= 0) return { text: '', truncated: false };
+    const requested = Math.floor(depth);
+    return this.logPatchAttempt(repoDir, requested, requested, signal, token);
+  }
+
+  private async logPatchAttempt(
+    repoDir: string, depth: number, requested: number, signal?: AbortSignal, token?: string,
+  ): Promise<{ text: string; truncated: boolean }> {
+    const args = [
+      'log', '-n', String(depth), '-p', '--unified=0', '--no-color', '--no-ext-diff', '--no-textconv',
+      '--no-renames', '--diff-filter=AM', '--format=format:%x00COMMIT %H',
+    ];
+    try {
+      const text = await this.git(args, {
+        cwd: repoDir, signal, token, timeoutMs: this.opts.cloneTimeoutMs, maxStdoutBytes: MAX_LOG_PATCH_BYTES,
+      });
+      return { text, truncated: depth < requested };
+    } catch (err) {
+      if (err instanceof AppError && err.code === 'REPO_TOO_LARGE' && depth > 1) {
+        return this.logPatchAttempt(repoDir, Math.max(1, Math.floor(depth / 2)), requested, signal, token);
+      }
+      if (err instanceof AppError && err.code === 'REPO_TOO_LARGE') return { text: '', truncated: true };
+      throw err;
+    }
   }
 
   async removeScanDir(scanId: string): Promise<void> {

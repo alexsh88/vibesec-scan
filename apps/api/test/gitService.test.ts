@@ -201,4 +201,39 @@ describe('GitService', () => {
     await git.removeScanDir(keep);
     expect(existsSync(git.scanDir(keep))).toBe(false);
   }, 60_000);
+
+  it('logPatch returns unified-0 patches newest-first, honors diff-filter=AM, and skips git entirely at depth 0', async () => {
+    const historyRepo = await createFixtureRepo([
+      { files: { 'history.txt': 'line1\n' } }, // commit A: file added
+      { files: { 'history.txt': 'line1\nline2\n' } }, // commit B: line added
+      { files: { 'history.txt': null } }, // commit C: file deleted (diff-filter=AM excludes it entirely)
+    ]);
+    try {
+      const dir = await git.ensureCheckout('scan-history', historyRepo.url, historyRepo.shas[2]!);
+      const [addSha, lineSha, deleteSha] = historyRepo.shas as [string, string, string];
+
+      const full = await git.logPatch(dir, 10);
+      expect(full.truncated).toBe(false);
+      const addIdx = full.text.indexOf(`\0COMMIT ${addSha}`);
+      const lineIdx = full.text.indexOf(`\0COMMIT ${lineSha}`);
+      expect(addIdx).toBeGreaterThanOrEqual(0);
+      expect(lineIdx).toBeGreaterThanOrEqual(0);
+      expect(lineIdx).toBeLessThan(addIdx); // newest first: "line added" before "file added"
+      expect(full.text).not.toContain(deleteSha); // pure deletion never appears
+      expect(full.text).toContain('+line1');
+      expect(full.text).toContain('+line2');
+
+      const one = await git.logPatch(dir, 1);
+      expect(one.truncated).toBe(false);
+      expect(one.text).toContain(lineSha);
+      expect(one.text).not.toContain(addSha);
+      expect(one.text).not.toContain(deleteSha);
+
+      expect(await git.logPatch(dir, 0)).toEqual({ text: '', truncated: false });
+      // depth 0 never spawns git: a cwd that doesn't exist would otherwise make the process fail.
+      expect(await git.logPatch(join(dir, 'does-not-exist'), 0)).toEqual({ text: '', truncated: false });
+    } finally {
+      await historyRepo.cleanup();
+    }
+  }, 60_000);
 });
