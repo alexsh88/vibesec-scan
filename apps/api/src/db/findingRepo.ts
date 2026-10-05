@@ -11,8 +11,9 @@ export type FindingRow = { analyzer: string; finding: Finding };
 const NOT_FIXED_SQL = `json_extract(data_json, '$.scanStatus') IS NOT 'fixed'`;
 
 export type FindingFilter = {
-  category?: Category;
-  severity?: Severity;
+  /** Comma-free; the route layer splits `?category=sast,taint` before this is called. Empty/absent = no filter. */
+  category?: readonly Category[];
+  severity?: readonly Severity[];
   file?: string;
   q?: string;
   triage?: TriageFilter;
@@ -22,21 +23,49 @@ export type FindingFilter = {
   limit?: number;
 };
 
-/** Counts of the scan's current findings (fixed ones excluded), plus the new/existing/fixed split. */
+/** What `counts`' `filtered` variant is scoped to — every `FindingFilter` field except `severity`
+ *  (deliberately: see `FindingCounts.filtered`) and the pagination-only `cursor`/`limit`. */
+export type FindingCountsFilter = Pick<FindingFilter, 'category' | 'file' | 'q' | 'triage' | 'scanStatus'>;
+
+/**
+ * `total`/`bySeverity`/`byCategory`/`byScanStatus` are scan-wide and ignore every filter (fixed rows
+ * excluded, except in `byScanStatus` which is the new/existing/fixed split itself) — what tab badges,
+ * the severity-picker counts and the status segmented control read, so they don't shift as the user
+ * filters.
+ *
+ * `filtered` is the same three breakdowns scoped to the request's category/file/q/triage/scanStatus —
+ * everything `list` filters on except `severity`, which is left open on purpose so
+ * `filtered.bySeverity` reports the severity mix the current view would have *without* its own
+ * severity filter (e.g. `filtered.bySeverity.info` is "how many info-severity findings this tab's
+ * other filters match", i.e. what the "N low-signal findings hidden" affordance reads).
+ */
 export type FindingCounts = {
   total: number;
   bySeverity: Partial<Record<Severity, number>>;
   byCategory: Partial<Record<Category, number>>;
   byScanStatus: Record<ScanStatus, number>;
+  filtered: { total: number; bySeverity: Partial<Record<Severity, number>>; byCategory: Partial<Record<Category, number>> };
 };
 
 type DataRow = { data_json: string };
 type SeverityCountRow = { severity: Severity; c: number };
 type CategoryCountRow = { category: Category; c: number };
 
-/** Escapes LIKE metacharacters so `q` is matched literally, then the caller wraps it in `%...%`. */
+/** Escapes LIKE metacharacters so a value is matched literally, then the caller wraps it as needed. */
 function escapeLike(value: string): string {
   return value.replace(/\\/g, '\\\\').replace(/%/g, '\\%').replace(/_/g, '\\_');
+}
+
+/**
+ * `file` is an exact match unless it ends with `/` (a directory prefix, e.g. `src/auth/`) or contains
+ * `*` (a caller-spelled wildcard, e.g. `*.test.ts`) — either turns it into a LIKE match. The value's
+ * own LIKE metacharacters are escaped first so a literal `%` or `_` in a real path can't act as one;
+ * `*` is substituted for an (unescaped) LIKE `%` afterwards, since `escapeLike` never touches `*`.
+ */
+function fileClause(value: string): { sql: string; value: string } {
+  if (value.endsWith('/')) return { sql: `file LIKE ? ESCAPE '\\'`, value: `${escapeLike(value)}%` };
+  if (value.includes('*')) return { sql: `file LIKE ? ESCAPE '\\'`, value: escapeLike(value).split('*').join('%') };
+  return { sql: 'file = ?', value };
 }
 
 /** M2: a decoded cursor must be a real, boundable offset. Anything else (garbage base64, NaN, a
@@ -202,6 +231,49 @@ export class FindingRepo {
   }
 
   /**
+   * WHERE clauses + bound params shared by `list` and `counts`' `filtered` variant: always scoped to
+   * `scanId`, every other field additive (AND). `scanStatus` omitted means "not fixed" (the scan's
+   * current findings), same default as `list`.
+   */
+  private matchClauses(scanId: string, f: {
+    category?: readonly Category[]; severity?: readonly Severity[]; file?: string; q?: string;
+    triage?: TriageFilter; scanStatus?: ScanStatus;
+  }): { clauses: string[]; params: unknown[] } {
+    const clauses = ['scan_id = ?'];
+    const params: unknown[] = [scanId];
+    if (f.category?.length) { clauses.push(`category IN (${f.category.map(() => '?').join(', ')})`); params.push(...f.category); }
+    if (f.severity?.length) { clauses.push(`severity IN (${f.severity.map(() => '?').join(', ')})`); params.push(...f.severity); }
+    if (f.file) {
+      const fc = fileClause(f.file);
+      clauses.push(fc.sql);
+      params.push(fc.value);
+    }
+    if (f.q) {
+      clauses.push(`(title LIKE ? ESCAPE '\\' OR file LIKE ? ESCAPE '\\' OR rule_id LIKE ? ESCAPE '\\')`);
+      const like = `%${escapeLike(f.q)}%`;
+      params.push(like, like, like);
+    }
+    // Triage isn't its own column (it lives on the finding JSON so it round-trips with the rest of the
+    // finding); filtering via json_extract keeps `all` (the default) a plain no-op clause.
+    // A triage whose expiresAt has passed no longer suppresses: the finding is open again.
+    const lapsed = `(json_extract(data_json, '$.triage.expiresAt') IS NOT NULL AND julianday(json_extract(data_json, '$.triage.expiresAt')) <= julianday(?))`;
+    if (f.triage === 'open') {
+      clauses.push(`(json_extract(data_json, '$.triage.status') IS NULL OR ${lapsed})`);
+      params.push(this.now());
+    } else if (f.triage === 'suppressed') {
+      clauses.push(`(json_extract(data_json, '$.triage.status') IS NOT NULL AND NOT ${lapsed})`);
+      params.push(this.now());
+    }
+    if (f.scanStatus) {
+      clauses.push(`json_extract(data_json, '$.scanStatus') = ?`);
+      params.push(f.scanStatus);
+    } else {
+      clauses.push(NOT_FIXED_SQL);
+    }
+    return { clauses, params };
+  }
+
+  /**
    * M6 (accepted limitation): pagination here is plain offset-based. If findings are still being
    * inserted for a scan that is actively running, a row can shift between pages fetched a moment
    * apart (a new finding sorting ahead of the current offset pushes everything down one slot, so a
@@ -211,33 +283,7 @@ export class FindingRepo {
   list(scanId: string, filter: FindingFilter): { items: Finding[]; nextCursor: string | null } {
     const limit = Math.min(Math.max(filter.limit ?? 50, 1), 200);
     const offset = decodeCursor(filter.cursor);
-    const clauses = ['scan_id = ?'];
-    const params: unknown[] = [scanId];
-    if (filter.category) { clauses.push('category = ?'); params.push(filter.category); }
-    if (filter.severity) { clauses.push('severity = ?'); params.push(filter.severity); }
-    if (filter.file) { clauses.push('file = ?'); params.push(filter.file); }
-    if (filter.q) {
-      clauses.push(`(title LIKE ? ESCAPE '\\' OR file LIKE ? ESCAPE '\\' OR rule_id LIKE ? ESCAPE '\\')`);
-      const like = `%${escapeLike(filter.q)}%`;
-      params.push(like, like, like);
-    }
-    // Triage isn't its own column (it lives on the finding JSON so it round-trips with the rest of the
-    // finding); filtering via json_extract keeps `all` (the default) a plain no-op clause.
-    // A triage whose expiresAt has passed no longer suppresses: the finding is open again.
-    const lapsed = `(json_extract(data_json, '$.triage.expiresAt') IS NOT NULL AND julianday(json_extract(data_json, '$.triage.expiresAt')) <= julianday(?))`;
-    if (filter.triage === 'open') {
-      clauses.push(`(json_extract(data_json, '$.triage.status') IS NULL OR ${lapsed})`);
-      params.push(this.now());
-    } else if (filter.triage === 'suppressed') {
-      clauses.push(`(json_extract(data_json, '$.triage.status') IS NOT NULL AND NOT ${lapsed})`);
-      params.push(this.now());
-    }
-    if (filter.scanStatus) {
-      clauses.push(`json_extract(data_json, '$.scanStatus') = ?`);
-      params.push(filter.scanStatus);
-    } else {
-      clauses.push(NOT_FIXED_SQL);
-    }
+    const { clauses, params } = this.matchClauses(scanId, filter);
     const rows = this.db.prepare(
       `SELECT data_json FROM findings WHERE ${clauses.join(' AND ')}
        ORDER BY severity_rank, risk_score DESC, file, start_line, id
@@ -248,8 +294,8 @@ export class FindingRepo {
     return { items, nextCursor: hasMore ? encodeCursor(offset + limit) : null };
   }
 
-  /** Counts over the scan's current findings (fixed rows excluded), plus the new/existing/fixed split. */
-  counts(scanId: string): FindingCounts {
+  /** See `FindingCounts` for exactly what's unfiltered vs. scoped to `filter` (via `.filtered`). */
+  counts(scanId: string, filter: FindingCountsFilter = {}): FindingCounts {
     const current = `scan_id = ? AND ${NOT_FIXED_SQL}`;
     const total = (this.db.prepare(`SELECT COUNT(*) as c FROM findings WHERE ${current}`).get(scanId) as { c: number }).c;
     const bySeverity: Partial<Record<Severity, number>> = {};
@@ -265,6 +311,18 @@ export class FindingRepo {
       `SELECT json_extract(data_json, '$.scanStatus') AS s, COUNT(*) as c FROM findings WHERE scan_id = ? GROUP BY s`,
     ).all(scanId) as Array<{ s: string; c: number }>;
     for (const row of statusRows) if (row.s === 'new' || row.s === 'existing' || row.s === 'fixed') byScanStatus[row.s] = row.c;
-    return { total, bySeverity, byCategory, byScanStatus };
+
+    const { clauses, params } = this.matchClauses(scanId, filter);
+    const where = clauses.join(' AND ');
+    const fTotal = (this.db.prepare(`SELECT COUNT(*) as c FROM findings WHERE ${where}`).get(...params) as { c: number }).c;
+    const fBySeverity: Partial<Record<Severity, number>> = {};
+    for (const row of this.db.prepare(`SELECT severity, COUNT(*) as c FROM findings WHERE ${where} GROUP BY severity`).all(...params) as SeverityCountRow[]) {
+      fBySeverity[row.severity] = row.c;
+    }
+    const fByCategory: Partial<Record<Category, number>> = {};
+    for (const row of this.db.prepare(`SELECT category, COUNT(*) as c FROM findings WHERE ${where} GROUP BY category`).all(...params) as CategoryCountRow[]) {
+      fByCategory[row.category] = row.c;
+    }
+    return { total, bySeverity, byCategory, byScanStatus, filtered: { total: fTotal, bySeverity: fBySeverity, byCategory: fByCategory } };
   }
 }

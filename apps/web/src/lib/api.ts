@@ -172,6 +172,8 @@ export type FindingCounts = {
   bySeverity: Partial<Record<Severity, number>>;
   byCategory: Partial<Record<Category, number>>;
   byScanStatus: Record<Finding['scanStatus'], number>;
+  /** Same breakdowns scoped to the request's filters, except severity (left open on purpose). */
+  filtered: { total: number; bySeverity: Partial<Record<Severity, number>>; byCategory: Partial<Record<Category, number>> };
 };
 
 export type FindingFilters = {

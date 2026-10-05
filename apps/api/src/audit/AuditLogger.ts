@@ -31,7 +31,7 @@ type AuditRow = {
 };
 
 export type AuditListFilter = {
-  action?: AuditAction; targetType?: string; targetId?: string;
+  action?: AuditAction; targetType?: string; targetId?: string; scanId?: string;
   from?: string; to?: string; beforeSeq?: number; limit?: number;
 };
 
@@ -100,6 +100,7 @@ export class AuditLogger {
     if (f.action) { where.push('action = ?'); args.push(f.action); }
     if (f.targetType) { where.push('target_type = ?'); args.push(f.targetType); }
     if (f.targetId) { where.push('target_id = ?'); args.push(f.targetId); }
+    if (f.scanId) { where.push('scan_id = ?'); args.push(f.scanId); }
     if (f.from) { where.push('at >= ?'); args.push(f.from); }
     if (f.to) { where.push('at <= ?'); args.push(f.to); }
     if (f.beforeSeq != null) { where.push('seq < ?'); args.push(f.beforeSeq); }

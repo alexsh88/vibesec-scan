@@ -5,9 +5,14 @@ import type { Container } from '../../container';
 import { AppError } from '../../errors/AppError';
 import { requestMeta } from './scans';
 
+/** `?category=sast,taint` / `?severity=critical,high` — comma-separated, each value validated against the enum. */
+const splitList = (s: string) => s.split(',').map((v) => v.trim()).filter(Boolean);
+const CategoryListSchema = z.string().max(200).transform(splitList).pipe(z.array(CategorySchema).min(1)).optional();
+const SeverityListSchema = z.string().max(200).transform(splitList).pipe(z.array(SeveritySchema).min(1)).optional();
+
 const FindingQuerySchema = z.object({
-  category: CategorySchema.optional(),
-  severity: SeveritySchema.optional(),
+  category: CategoryListSchema,
+  severity: SeverityListSchema,
   file: z.string().max(1000).optional(),
   q: z.string().max(200).optional(),
   triage: z.enum(['open', 'suppressed', 'all']).default('all'),
@@ -34,7 +39,10 @@ export function findingRoutes(app: FastifyInstance, c: Container): void {
     c.service.get(req.params.id); // 404 for unknown scans
     const query = FindingQuerySchema.parse(req.query);
     const { items, nextCursor } = c.findings.list(req.params.id, query);
-    const counts = c.findings.counts(req.params.id);
+    // `counts.filtered` mirrors this request's category/file/q/triage/scanStatus (never severity —
+    // see FindingCounts), so the client can read e.g. `filtered.bySeverity.info` for this tab's
+    // hidden-info count without a second round trip.
+    const counts = c.findings.counts(req.params.id, { category: query.category, file: query.file, q: query.q, triage: query.triage, scanStatus: query.scanStatus });
     return { items, nextCursor, counts };
   });
 

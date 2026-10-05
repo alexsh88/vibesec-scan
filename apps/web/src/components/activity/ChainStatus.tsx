@@ -5,8 +5,8 @@ import { formatInt } from '@/lib/format';
 import { cn } from '@/lib/utils';
 
 /**
- * "Audit log intact" — GET /api/audit/verify walks the whole hash chain. Every call appends an
- * `audit.verified` entry (global, not scan-scoped), so it runs once per visit + on demand only.
+ * "Audit log intact" — GET /api/audit/verify walks the whole hash chain. The call is side-effect
+ * free (it does not itself append to the log), so it is safe to run on every visit and on demand.
  */
 export function ChainStatus() {
   const q = useQuery({

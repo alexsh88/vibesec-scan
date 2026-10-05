@@ -76,4 +76,14 @@ describe('AuditLogger', () => {
     expect(page2.items.map((e) => e.targetId)).toEqual(['s1']);
     expect(page2.nextCursor).toBeNull();
   });
+
+  it('filters by scanId', () => {
+    const { audit } = setup();
+    audit.append({ action: 'scan.created', targetType: 'scan', targetId: 's1', scanId: 's1' });
+    audit.append({ action: 'finding.triaged', targetType: 'finding', targetId: 'f1', scanId: 's1' });
+    audit.append({ action: 'scan.created', targetType: 'scan', targetId: 's2', scanId: 's2' });
+    expect(audit.list({ scanId: 's1' }).items.map((e) => e.action)).toEqual(['finding.triaged', 'scan.created']);
+    expect(audit.list({ scanId: 's2' }).items.map((e) => e.targetId)).toEqual(['s2']);
+    expect(audit.list({ scanId: 'nope' }).items).toHaveLength(0);
+  });
 });

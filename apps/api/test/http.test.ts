@@ -98,13 +98,27 @@ describe('HTTP API', () => {
     expect(events.at(-1)?.event).toBe('done');
   });
 
-  it('exposes the audit log and verifies it', async () => {
+  it('exposes the audit log, filters by scanId, and verifies it without growing the log', async () => {
     await start();
-    await createScan();
+    const { scanId } = (await createScan()).json();
+    const other = (await app.inject({ method: 'POST', url: '/api/scans', payload: { repoUrl: 'https://github.com/acme/other' } })).json().scanId;
     const list = await app.inject({ method: 'GET', url: '/api/audit?action=scan.created' });
-    expect(list.json().items).toHaveLength(1);
+    expect(list.json().items).toHaveLength(2);
+    const scoped = await app.inject({ method: 'GET', url: `/api/audit?scanId=${scanId}` });
+    expect(scoped.json().items.map((e: { targetId: string }) => e.targetId)).toEqual([scanId]);
+    expect(scoped.json().items.every((e: { targetId: string }) => e.targetId !== other)).toBe(true);
+
+    const before = (await app.inject({ method: 'GET', url: '/api/audit' })).json().items.length;
     const verify = await app.inject({ method: 'GET', url: '/api/audit/verify' });
     expect(verify.json()).toMatchObject({ ok: true });
+    // Plain verify is side-effect free: no audit.verified entry is appended, so the log doesn't grow.
+    expect((await app.inject({ method: 'GET', url: '/api/audit' })).json().items.length).toBe(before);
+
+    const recorded = await app.inject({ method: 'GET', url: '/api/audit/verify?record=1' });
+    expect(recorded.json()).toMatchObject({ ok: true });
+    const after = await app.inject({ method: 'GET', url: '/api/audit' });
+    expect(after.json().items.length).toBe(before + 1);
+    expect(after.json().items[0]).toMatchObject({ action: 'audit.verified' });
   });
 
   it('#1: answers 503 during shutdown without persisting a scan', async () => {
@@ -199,12 +213,46 @@ describe('HTTP API', () => {
     ]);
     const list = (await app.inject({ method: 'GET', url: `/api/scans/${scanId}/findings` })).json();
     expect(list.items.map((f: { id: string }) => f.id)).toEqual(['f2', 'f1']);
-    expect(list.counts).toEqual({ total: 2, bySeverity: { critical: 1, high: 1 }, byCategory: { secret: 2 }, byScanStatus: { new: 2, existing: 0, fixed: 0 } });
+    expect(list.counts).toEqual({
+      total: 2, bySeverity: { critical: 1, high: 1 }, byCategory: { secret: 2 }, byScanStatus: { new: 2, existing: 0, fixed: 0 },
+      filtered: { total: 2, bySeverity: { critical: 1, high: 1 }, byCategory: { secret: 2 } },
+    });
     expect((await app.inject({ method: 'GET', url: `/api/scans/${scanId}/findings?severity=critical` })).json().items).toHaveLength(1);
+    // Comma-separated severity/category lists (Task 3): each value validated, SQL IN(...) under the hood.
+    const multi = (await app.inject({ method: 'GET', url: `/api/scans/${scanId}/findings?severity=critical,high` })).json();
+    expect(multi.items.map((f: { id: string }) => f.id)).toEqual(['f2', 'f1']);
+    expect((await app.inject({ method: 'GET', url: `/api/scans/${scanId}/findings?category=secret,sast` })).json().items).toHaveLength(2);
+    expect((await app.inject({ method: 'GET', url: `/api/scans/${scanId}/findings?category=sast` })).json().items).toHaveLength(0);
+    expect((await app.inject({ method: 'GET', url: `/api/scans/${scanId}/findings?severity=critical,urgent` })).statusCode).toBe(400);
     expect((await app.inject({ method: 'GET', url: `/api/scans/${scanId}/findings/f1` })).json().title).toBe('High one');
     expect((await app.inject({ method: 'GET', url: `/api/scans/${scanId}/findings/nope` })).statusCode).toBe(404);
     expect((await app.inject({ method: 'GET', url: `/api/scans/${scanId}/findings?severity=urgent` })).statusCode).toBe(400);
     expect((await app.inject({ method: 'GET', url: `/api/scans/missing/findings` })).statusCode).toBe(404);
+  });
+
+  it('filters findings by file prefix/glob and reports filtered counts scoped to triage + scanStatus', async () => {
+    await start();
+    const { scanId } = (await createScan()).json();
+    await c.runner.whenIdle();
+    const base = {
+      scanId, category: 'sast' as const, ruleId: 'sast/x', baseSeverity: 'high' as const, riskScore: 70, riskFactors: [],
+      confidence: 'high' as const, explanation: 'e', impact: 'i', remediation: { summary: 'r' }, scanStatus: 'new' as const,
+    };
+    c.findings.replaceForAnalyzer(scanId, 'sast', [
+      { ...base, id: 'g1', fingerprint: 'a', title: 'login', severity: 'high', location: { file: 'src/auth/login.ts', startLine: 1, endLine: 1, snippet: 's', permalink: 'p' } },
+      { ...base, id: 'g2', fingerprint: 'b', title: 'verify', severity: 'info', location: { file: 'src/auth/token/verify.ts', startLine: 1, endLine: 1, snippet: 's', permalink: 'p' } },
+      { ...base, id: 'g3', fingerprint: 'c', title: 'db', severity: 'medium', location: { file: 'src/db.ts', startLine: 1, endLine: 1, snippet: 's', permalink: 'p' } },
+    ]);
+    const prefix = await app.inject({ method: 'GET', url: `/api/scans/${scanId}/findings?file=${encodeURIComponent('src/auth/')}` });
+    expect(prefix.json().items.map((f: { id: string }) => f.id).sort()).toEqual(['g1', 'g2']);
+    const glob = await app.inject({ method: 'GET', url: `/api/scans/${scanId}/findings?file=${encodeURIComponent('*.ts')}` });
+    expect(glob.json().items).toHaveLength(3);
+    const exact = await app.inject({ method: 'GET', url: `/api/scans/${scanId}/findings?file=${encodeURIComponent('src/db.ts')}` });
+    expect(exact.json().items.map((f: { id: string }) => f.id)).toEqual(['g3']);
+
+    // counts.filtered respects this request's category — bySeverity.info is scoped to the sast tab, not scan-wide.
+    const scoped = await app.inject({ method: 'GET', url: `/api/scans/${scanId}/findings?category=sast` });
+    expect(scoped.json().counts.filtered).toEqual({ total: 3, bySeverity: { high: 1, info: 1, medium: 1 }, byCategory: { sast: 3 } });
   });
 
   it('serves the fix plan of a scan (empty when none stored, 404 for unknown scans)', async () => {

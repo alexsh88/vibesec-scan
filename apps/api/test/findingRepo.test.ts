@@ -46,8 +46,10 @@ describe('FindingRepo', () => {
       finding(scanId, { severity: 'high', riskScore: 80, title: 'higher one', category: 'config' }),
     ]);
     expect(repo.list(scanId, {}).items.map((f) => f.title)).toEqual(['critical one', 'higher one', 'high one', 'low one']);
-    expect(repo.list(scanId, { severity: 'high' }).items).toHaveLength(2);
-    expect(repo.list(scanId, { category: 'config' }).items.map((f) => f.title)).toEqual(['higher one']);
+    expect(repo.list(scanId, { severity: ['high'] }).items).toHaveLength(2);
+    expect(repo.list(scanId, { severity: ['critical', 'low'] }).items.map((f) => f.title)).toEqual(['critical one', 'low one']);
+    expect(repo.list(scanId, { category: ['config'] }).items.map((f) => f.title)).toEqual(['higher one']);
+    expect(repo.list(scanId, { category: ['secret', 'config'] }).items.map((f) => f.title)).toEqual(['critical one', 'higher one', 'high one', 'low one']);
     expect(repo.list(scanId, { file: 'src/db.ts' }).items.map((f) => f.title)).toEqual(['critical one']);
     expect(repo.list(scanId, { q: 'LOW' }).items.map((f) => f.title)).toEqual(['low one']);
     expect(repo.list(scanId, { q: '100%_' }).items).toEqual([]);
@@ -60,7 +62,50 @@ describe('FindingRepo', () => {
   it('counts by severity and category', () => {
     const { repo, scanId } = setup();
     repo.replaceForAnalyzer(scanId, 'x', [finding(scanId, { severity: 'critical' }), finding(scanId), finding(scanId, { category: 'sast' })]);
-    expect(repo.counts(scanId)).toEqual({ total: 3, bySeverity: { critical: 1, high: 2 }, byCategory: { secret: 2, sast: 1 }, byScanStatus: { new: 3, existing: 0, fixed: 0 } });
+    expect(repo.counts(scanId)).toEqual({
+      total: 3, bySeverity: { critical: 1, high: 2 }, byCategory: { secret: 2, sast: 1 }, byScanStatus: { new: 3, existing: 0, fixed: 0 },
+      filtered: { total: 3, bySeverity: { critical: 1, high: 2 }, byCategory: { secret: 2, sast: 1 } },
+    });
+  });
+
+  it('counts.filtered respects triage + scanStatus but leaves severity open', () => {
+    const { repo, scanId } = setup();
+    repo.replaceForAnalyzer(scanId, 'x', [
+      finding(scanId, { severity: 'info', category: 'sast' }),
+      finding(scanId, { severity: 'high', category: 'sast' }),
+      finding(scanId, { severity: 'info', category: 'secret' }),
+    ]);
+    // Unfiltered: scan-wide, ignores triage/category.
+    expect(repo.counts(scanId).bySeverity).toEqual({ info: 2, high: 1 });
+    // Filtered by category only: the severity breakdown is for that category, not the whole scan —
+    // what the web findings page reads to size the "N low-signal findings" affordance for a tab.
+    expect(repo.counts(scanId, { category: ['sast'] }).filtered).toEqual({
+      total: 2, bySeverity: { info: 1, high: 1 }, byCategory: { sast: 2 },
+    });
+    // Suppress the info/sast finding; `filtered` with triage: 'open' no longer counts it, but the
+    // top-level (unfiltered) bySeverity is untouched.
+    const [infoSast] = repo.all(scanId).filter((r) => r.finding.severity === 'info' && r.finding.category === 'sast').map((r) => r.finding);
+    repo.update(scanId, [{ ...infoSast!, triage: { status: 'false_positive', reason: 'fp', at: new Date().toISOString() } }]);
+    const open = repo.counts(scanId, { category: ['sast'], triage: 'open' });
+    expect(open.filtered.bySeverity).toEqual({ high: 1 });
+    expect(open.bySeverity).toEqual({ info: 2, high: 1 });
+  });
+
+  it('file filters exactly unless the value ends with / or contains *', () => {
+    const { repo, scanId } = setup();
+    repo.replaceForAnalyzer(scanId, 'x', [
+      finding(scanId, { title: 'exact', location: { file: 'src/auth/login.ts', startLine: 1, endLine: 1, snippet: '', permalink: '' } }),
+      finding(scanId, { title: 'nested', location: { file: 'src/auth/token/verify.ts', startLine: 1, endLine: 1, snippet: '', permalink: '' } }),
+      finding(scanId, { title: 'other-dir', location: { file: 'src/db.ts', startLine: 1, endLine: 1, snippet: '', permalink: '' } }),
+      finding(scanId, { title: 'test-file', location: { file: 'src/auth/login.test.ts', startLine: 1, endLine: 1, snippet: '', permalink: '' } }),
+      finding(scanId, { title: 'literal-percent', location: { file: 'src/100%.ts', startLine: 1, endLine: 1, snippet: '', permalink: '' } }),
+    ]);
+    expect(repo.list(scanId, { file: 'src/auth/login.ts' }).items.map((f) => f.title)).toEqual(['exact']);
+    expect(repo.list(scanId, { file: 'src/auth/' }).items.map((f) => f.title).sort()).toEqual(['exact', 'nested', 'test-file']);
+    expect(repo.list(scanId, { file: 'src/auth/login*' }).items.map((f) => f.title).sort()).toEqual(['exact', 'test-file']);
+    expect(repo.list(scanId, { file: '*.test.ts' }).items.map((f) => f.title)).toEqual(['test-file']);
+    // A literal `%` in the path (escaped by escapeLike) never behaves like a wildcard in exact-match mode.
+    expect(repo.list(scanId, { file: 'src/100%.ts' }).items.map((f) => f.title)).toEqual(['literal-percent']);
   });
   it('returns undefined for a finding of another scan', () => {
     const a = setup();
@@ -111,6 +156,6 @@ describe('FindingRepo.all / update', () => {
     repo.update(scanId, [{ ...a, severity: 'critical', riskScore: 95 }], [b.id]);
     expect(repo.get(scanId, a.id)?.severity).toBe('critical');
     expect(repo.get(scanId, b.id)).toBeUndefined();
-    expect(repo.list(scanId, { severity: 'critical' }).items).toHaveLength(1);
+    expect(repo.list(scanId, { severity: ['critical'] }).items).toHaveLength(1);
   });
 });
