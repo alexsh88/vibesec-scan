@@ -1,0 +1,23 @@
+{
+  "schema_version": "1.6.0",
+  "id": "GHSA-v4tt-test-0001",
+  "modified": "2024-06-01T00:00:00Z",
+  "published": "2024-05-15T00:00:00Z",
+  "summary": "Remote code execution in example-pkg",
+  "details": "A critical vulnerability allows unauthenticated remote attackers to execute arbitrary code via a crafted request.",
+  "severity": [
+    { "type": "CVSS_V4", "score": "CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:H/VI:H/VA:H/SC:N/SI:N/SA:N" }
+  ],
+  "affected": [
+    {
+      "package": { "ecosystem": "npm", "name": "example-pkg" },
+      "ranges": [
+        { "type": "SEMVER", "events": [ { "introduced": "0" }, { "fixed": "2.0.0" } ] }
+      ]
+    }
+  ],
+  "references": [
+    { "type": "ADVISORY", "url": "https://github.com/advisories/GHSA-v4tt-test-0001" }
+  ],
+  "database_specific": { "cwe_ids": ["CWE-94"] }
+}

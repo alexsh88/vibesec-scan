@@ -1,0 +1,24 @@
+{
+  "schema_version": "1.6.0",
+  "id": "PYSEC-2021-142",
+  "modified": "2022-03-03T00:00:00Z",
+  "published": "2021-09-14T00:00:00Z",
+  "aliases": ["CVE-2020-14343", "GHSA-8q59-q68h-6hv4"],
+  "summary": "Arbitrary code execution in PyYAML via full_load",
+  "details": "A vulnerability in the PyYAML library exists that could allow arbitrary code execution when loading untrusted YAML via full_load or FullLoader before a fix limited constructible Python objects.",
+  "severity": [
+    { "type": "CVSS_V3", "score": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H" }
+  ],
+  "affected": [
+    {
+      "package": { "ecosystem": "PyPI", "name": "PyYAML", "purl": "pkg:pypi/pyyaml" },
+      "ranges": [
+        { "type": "ECOSYSTEM", "events": [ { "introduced": "0" }, { "fixed": "5.4" } ] }
+      ]
+    }
+  ],
+  "references": [
+    { "type": "ADVISORY", "url": "https://osv.dev/vulnerability/PYSEC-2021-142" }
+  ],
+  "database_specific": { "cwe_ids": ["CWE-20", "CWE-502"] }
+}
