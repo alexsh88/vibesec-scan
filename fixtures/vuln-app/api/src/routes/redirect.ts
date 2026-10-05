@@ -9,6 +9,6 @@ redirectRouter.get('/go', (req, res) => {
 
 redirectRouter.get('/go-safe', (req, res) => {
   const target = req.query.to as string;
-  if (!target.startsWith('/')) return res.status(400).end();
+  if (!target.startsWith('/') || target.startsWith('//') || target.includes('\\')) return res.status(400).end();
   res.redirect(target);
 });
