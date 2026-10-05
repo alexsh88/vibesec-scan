@@ -90,7 +90,9 @@ export type PackageUsage = {
   line: number;
   /** Imported binding / called member, e.g. "merge" for `_.merge(...)`, null for side-effect imports. */
   symbol: string | null;
-  kind: 'import' | 'call' | 'member';
+  /** 'reference': not an import but a by-name use outside code — package.json scripts, tool config files,
+   *  Procfile / Dockerfile CMD / ENTRYPOINT (see references.ts). Imported-level evidence. */
+  kind: 'import' | 'call' | 'member' | 'reference';
 };
 
 export type FixActionKind = 'upgrade-direct' | 'upgrade-parent' | 'override' | 'remove';

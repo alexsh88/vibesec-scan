@@ -73,10 +73,29 @@ describe('assessReachability', () => {
     expect(v.via).toBe('index');
   });
 
-  it('direct dep never imported → unreachable', () => {
-    const v = assessReachability({ graph: g, node: g.nodes.get(unused.key)!, advisories: [adv()], usages: [use('lodash', 'a.ts', 1, null)], usageSource: 'index' });
+  it('direct dep never imported (sandbox analysis) → unreachable', () => {
+    const v = assessReachability({ graph: g, node: g.nodes.get(unused.key)!, advisories: [adv()], usages: [use('lodash', 'a.ts', 1, null)], usageSource: 'sandbox' });
     expect(v.reachability).toBe('unreachable');
     expect(v.reason).toMatch(/never imported|not imported/);
+  });
+
+  it('import-index only: a prod direct dep never imported is unknown (not unreachable); a dev one stays unreachable', () => {
+    const prod = assessReachability({ graph: g, node: g.nodes.get(unused.key)!, advisories: [adv()], usages: [use('lodash', 'a.ts', 1, null)], usageSource: 'index' });
+    expect(prod.reachability).toBe('unknown');
+    expect(prod.reason).toMatch(/import index/);
+    const devNode = { ...g.nodes.get(unused.key)!, scope: 'dev' as const };
+    const dev = assessReachability({ graph: g, node: devNode, advisories: [adv()], usages: [use('lodash', 'a.ts', 1, null)], usageSource: 'index' });
+    expect(dev.reachability).toBe('unreachable');
+  });
+
+  it('a package referenced from scripts/config/entrypoints counts as imported-level evidence', () => {
+    const v = assessReachability({
+      graph: g, node: g.nodes.get(unused.key)!, advisories: [adv()],
+      usages: [{ ecosystem: 'npm', package: 'left-pad', file: 'package.json', line: 4, symbol: null, kind: 'reference' }], usageSource: 'index',
+    });
+    expect(v.reachability).toBe('imported');
+    expect(v.reason).toMatch(/referenced/);
+    expect(v.evidence).toEqual([{ file: 'package.json', line: 4, symbol: null }]);
   });
 
   it('transitive dep whose ancestors are not imported → unreachable, reason names the chain', () => {
@@ -113,7 +132,7 @@ describe('assessReachability', () => {
     const yes = assessReachability({ graph: gb, node: gb.nodes.get(babel.key)!, advisories: [adv()], usages: [use('@babel/core/lib/x', 'a.ts', 1, null)], usageSource: 'index' });
     expect(yes.reachability).toBe('imported');
     const no = assessReachability({ graph: gb, node: gb.nodes.get(babel.key)!, advisories: [adv()], usages: [use('@babel/core-js', 'a.ts', 1, null)], usageSource: 'index' });
-    expect(no.reachability).toBe('unreachable');
+    expect(no.reachability).toBe('unknown'); // not imported; index-only evidence never proves 'unreachable' for a prod direct dep
   });
 
   it('PyPI: usages reported under the distribution or the import name both match', () => {

@@ -38,6 +38,7 @@ import { buildFixPlan, safeUpgradeVersion, type VulnerablePackage } from './fixP
 import { importNamesFor, packageForImport } from './importNames';
 import { normalizePypiName, parseDependencyGraphs, pathsTo } from './lockfiles';
 import type { OsvClient } from './osv/osvClient';
+import { findPackageReferences } from './references';
 import { assessReachability, type Reachability, type ReachabilityVerdict } from './reachability';
 import { applyJudgement, judgeReachability, type JudgeCallSite, type JudgeItem } from './reachabilityJudge';
 import type { RegistryClient } from './registry';
@@ -290,13 +291,18 @@ const REACHABILITY_ADJUST: Record<Reachability, { steps: number; confidence: Con
  * extra penalty: assessReachability already maps it to 'unknown'/'unreachable'.
  */
 export function computeSeverity(
-  base: Severity, reachability: Reachability, scope: 'prod' | 'dev',
+  base: Severity, reachability: Reachability, scope: 'prod' | 'dev', noUsageData = false,
 ): { severity: Severity; confidence: Confidence; riskFactors: RiskFactor[] } {
   const adj = REACHABILITY_ADJUST[reachability];
   const riskFactors: RiskFactor[] = [];
   let current = base;
-  const afterReach = adj.steps === 0 ? current : lowerFloorLow(current, adj.steps);
-  riskFactors.push({ factor: `reachability:${reachability}`, effect: sevIndex(afterReach) - sevIndex(current), reason: adj.text });
+  // 'unknown' because there was NO usage evidence at all (no index, no sandbox) is not a reason to lower.
+  const steps = reachability === 'unknown' && noUsageData ? 0 : adj.steps;
+  const afterReach = steps === 0 ? current : lowerFloorLow(current, steps);
+  riskFactors.push({
+    factor: `reachability:${reachability}`, effect: sevIndex(afterReach) - sevIndex(current),
+    reason: steps === 0 && adj.steps > 0 ? 'No usage data available; severity not lowered' : adj.text,
+  });
   current = afterReach;
   if (scope === 'dev') {
     const next = lowerFloorLow(current, 1);
@@ -352,6 +358,8 @@ type GraphWork = {
   signals: SupplyChainSignal[];
   usages: PackageUsage[] | null;
   usageSource: UsageSource;
+  /** By-name references outside code (scripts, tool config, entrypoints): imported-level evidence. */
+  references: PackageUsage[];
 };
 
 const evidenceOf = (v: ReachabilityVerdict) => v.evidence.slice(0, MAX_EVIDENCE).map((e) => ({ file: e.file, line: e.line }));
@@ -409,7 +417,7 @@ export function createDependenciesAnalyzer(deps: DependenciesAnalyzerDeps): Anal
           const advisories = (advisoriesByKey.get(node.key) ?? []).filter((a) => !a.malicious);
           if (advisories.length > 0) vulnerable.push({ node, advisories });
         }
-        return { graph, vulnerable, signals: supplyChainSignals(graph, advisoriesByKey), usages: null, usageSource: 'index' };
+        return { graph, vulnerable, signals: supplyChainSignals(graph, advisoriesByKey), usages: null, usageSource: 'index', references: [] };
       });
 
       // 3. usage evidence: the import index everywhere; the sandbox (slow) only for graphs with a vulnerable package
@@ -419,7 +427,10 @@ export function createDependenciesAnalyzer(deps: DependenciesAnalyzerDeps): Anal
       } catch {
         edges = null;
       }
-      for (const w of work) w.usages = edges === null ? null : indexUsages(edges, w.graph);
+      for (const w of work) {
+        w.usages = edges === null ? null : indexUsages(edges, w.graph);
+        if (w.vulnerable.length > 0 || w.signals.length > 0) w.references = await findPackageReferences(read, ctx.files, w.graph);
+      }
 
       const sandboxTargets = work.filter((w) => w.vulnerable.length > 0);
       if (deps.sandboxEnabled && deps.sandbox && sandboxTargets.length > 0) {
@@ -468,11 +479,12 @@ export function createDependenciesAnalyzer(deps: DependenciesAnalyzerDeps): Anal
       const judgeItems: JudgeItem[] = [];
       for (const w of work) {
         const keys = new Set([...w.vulnerable.map((v) => v.node.key), ...w.signals.map((s) => s.key)]);
+        const usages = w.usages === null ? null : w.references.length > 0 ? [...w.usages, ...w.references] : w.usages;
         for (const key of keys) {
           const node = w.graph.nodes.get(key);
           if (!node) continue;
           const advisories = advisoriesByKey.get(key) ?? [];
-          const verdict = assessReachability({ graph: w.graph, node, advisories, usages: w.usages, usageSource: w.usageSource });
+          const verdict = assessReachability({ graph: w.graph, node, advisories, usages, usageSource: w.usageSource });
           const vk = `${w.graph.lockfile}|${key}`;
           verdicts.set(vk, verdict);
           const nonMal = advisories.filter((a) => !a.malicious);
@@ -519,7 +531,7 @@ export function createDependenciesAnalyzer(deps: DependenciesAnalyzerDeps): Anal
           const sorted = [...advisories].sort(bySeverityDesc);
           const worst = sorted[0]!;
           const baseSeverity = worst.severity;
-          const { severity, confidence, riskFactors } = computeSeverity(baseSeverity, verdict.reachability, node.scope);
+          const { severity, confidence, riskFactors } = computeSeverity(baseSeverity, verdict.reachability, node.scope, verdict.via === 'none');
           const riskScore = provisionalScore(severity);
           const paths = pathsTo(graph, node.key, MAX_PATHS);
           const fixedIn = coveringFix(graph.ecosystem, node.version, advisories);

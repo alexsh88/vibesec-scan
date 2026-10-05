@@ -8,8 +8,11 @@
 //       a used symbol matches an advisory affectedSymbol         → 'reachable'
 //       otherwise                                                → 'imported'
 //     (the index source carries imports only, no symbols, so it can never prove 'reachable')
+//     (a by-name 'reference' — scripts, tool config, Procfile/Dockerfile entrypoint — counts as imported)
 //   - not imported by app code:
-//       direct dep                                               → 'unreachable' (declared but unused)
+//       direct dep, sandbox analysis                             → 'unreachable' (declared but unused)
+//       direct dep, import index only                            → 'unknown' (the index misses dynamic
+//                                                                   loads; dev dependencies stay 'unreachable')
 //       transitive, no ancestor imported                         → 'unreachable'
 //       transitive, some ancestor imported                       → 'unknown' ("reachable only through
 //                                                                   <ancestor> internals")
@@ -185,8 +188,16 @@ export function assessReachability(input: ReachabilityInput): ReachabilityVerdic
         };
       }
     }
+    if (own.every((u) => u.kind === 'reference')) {
+      const where = [...new Set(own.map((u) => u.file))].slice(0, 3).join(', ');
+      return { reachability: 'imported', evidence: toEvidence(own), via, reason: `${node.name} is not imported but is referenced by name in ${where} (scripts / tool config / entrypoint)${phantom}`, matchedSymbols: [] };
+    }
     const what = usageSource === 'index' ? 'imported (import index has no symbol-level data)' : 'imported, but no advisory-affected symbol is used';
     return { reachability: 'imported', evidence: toEvidence(own), via, reason: `${node.name} is ${what}${phantom}`, matchedSymbols: [] };
+  }
+
+  if (node.direct && usageSource === 'index' && node.scope !== 'dev') {
+    return { reachability: 'unknown', evidence: [], via, reason: `${node.name} is a direct dependency with no import found by the import index (dynamic loads, plugins and CLI use are not visible to it)`, matchedSymbols: [] };
   }
 
   if (node.direct) {

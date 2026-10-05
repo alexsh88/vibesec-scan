@@ -191,6 +191,13 @@ const vulnOf = (fs: Finding[], name: string) => fs.find((f) => f.ruleId === 'dep
 // ---------- tests ----------
 
 describe('computeSeverity (reachability-driven table)', () => {
+  it("'unknown' with no usage evidence at all (no index, no sandbox) never lowers the severity", () => {
+    const r = computeSeverity('critical', 'unknown', 'prod', true);
+    expect(r.severity).toBe('critical');
+    expect(r.riskFactors.find((f) => f.factor === 'reachability:unknown')).toMatchObject({ effect: 0 });
+    expect(computeSeverity('critical', 'unknown', 'prod').severity).toBe('high');
+  });
+
   it.each([
     ['high', 'reachable', 'prod', 'high', 'high'],
     ['high', 'imported', 'prod', 'high', 'medium'],
@@ -313,7 +320,7 @@ describe('createDependenciesAnalyzer', () => {
     const findings = await analyzer.run(makeCtx(files).ctx);
     const typo = findings.find((f) => f.ruleId === 'supply-chain/typosquat');
     expect(typo).toMatchObject({ severity: 'high', confidence: 'medium', title: 'axois looks like a typosquat of axios' });
-    expect(typo!.dependency).toMatchObject({ name: 'axois', advisories: [], reachability: 'unreachable' });
+    expect(typo!.dependency).toMatchObject({ name: 'axois', advisories: [], reachability: 'unknown' }); // index-only: not imported != unused
     expect(typo!.location.file).toBe('package.json');
     const script = findings.find((f) => f.ruleId === 'supply-chain/install-script');
     expect(script).toMatchObject({ severity: 'medium', title: 'fancy-native@1.0.0 runs an install script' });
