@@ -223,6 +223,24 @@ describe('filterCandidates', () => {
       expect(text).toContain('sk-s…890'); // the redacted form is expected to be present
     }
   });
+
+  it('tells the model the redaction is ours and gives non-reversible value features instead', async () => {
+    const pem = candidate({
+      id: 'pk1', type: 'private-key', value: `-----BEGIN RSA PRIVATE KEY-----\n${'Q'.repeat(10)}\n-----END RSA PRIVATE KEY-----`,
+      line: 6, endLine: 32, redacted: '-----BEGIN … PRIVATE KEY-----', snippet: '-----BEGIN RSA PRIVATE KEY-----',
+    });
+    const { transport, seen } = capturingTransport(() => ({ results: [] }));
+    const { client, scanId } = buildRealClient(transport);
+
+    await filterCandidates(client, scanId, [pem], new AbortController().signal);
+
+    const req = seen[0]!;
+    expect(JSON.stringify(req.system)).toContain('Redaction is');
+    const user = JSON.stringify(req.messages);
+    expect(user).toMatch(/valueLength=\\"\d+\\"/);
+    expect(user).toMatch(/entropy=\\"\d+\.\d\\"/);
+    expect(user).toContain('bodyLines=\\"25\\"');
+  });
 });
 
 describe('isLikelyFalsePositive', () => {

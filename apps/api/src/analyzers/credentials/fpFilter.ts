@@ -14,10 +14,10 @@ import { untrustedText } from '../../llm/prompt';
 import type { LlmRequest } from '../../llm/transport';
 import { toAppError } from '../../errors/AppError';
 import { z } from 'zod';
-import type { SecretType } from './rules';
+import { shannonEntropy, type SecretType } from './rules';
 import type { SecretCandidate } from './scanText';
 
-export const FP_FILTER_PROMPT_VERSION = 'credentials-fp-v1';
+export const FP_FILTER_PROMPT_VERSION = 'credentials-fp-v2';
 /** Appears verbatim in the system prompt; `credentialsFpMockResponder` keys on it to decide whether to answer a request. */
 export const FP_FILTER_TASK_MARKER = 'Task: credentials-fp-filter';
 
@@ -50,6 +50,14 @@ const SYSTEM_PROMPT = [
   'documentation example, a placeholder, or a mock/sample value. Weigh the file path (paths under',
   'test/, tests/, spec/, fixtures/, examples/, or docs/ strongly suggest a false positive), the',
   'surrounding snippet, and nearby variable or function names.',
+  '',
+  'IMPORTANT: you never see the actual value. The scanner itself redacted it before sending: "…"',
+  'marks characters WE removed, and private-key bodies are blanked line by line. Redaction is',
+  'therefore NOT evidence of a placeholder. Judge the value with the computed attributes instead:',
+  'valueLength and entropy (Shannon bits per character of the hidden value; random secrets are',
+  'usually above ~4.0, words/placeholders below ~3.0) and, for private keys, bodyLines.',
+  'When the evidence is mixed, prefer isLikelyReal=true: a missed real credential costs far more',
+  'than a false alarm.',
   '',
   'Return exactly one result per candidate id you were given below, and no results for ids you were',
   'not given. Keep each reason under 300 characters.',
@@ -88,6 +96,16 @@ function neutralizeCandidateTag(text: string): string {
  * raw value or pairedSecret) is additionally wrapped with `untrustedText(...)`, which neutralizes
  * `<untrusted_file>`/`<untrusted_text>` tags, on top of the candidate-tag neutralization above.
  */
+/**
+ * Non-reversible features of the hidden value, computed by us, so the model can judge "random
+ * secret vs. placeholder" without seeing it (the redaction itself must not read as a placeholder).
+ */
+function valueFeatures(c: SecretCandidate): string {
+  const parts = [`valueLength="${c.value.length}"`, `entropy="${shannonEntropy(c.value).toFixed(1)}"`];
+  if (c.type === 'private-key') parts.push(`bodyLines="${Math.max(0, c.endLine - c.line - 1)}"`);
+  return parts.join(' ');
+}
+
 function candidateBlock(c: SecretCandidate): string {
   const body = [
     `redacted value: ${neutralizeCandidateTag(c.redacted)}`,
@@ -95,7 +113,7 @@ function candidateBlock(c: SecretCandidate): string {
     neutralizeCandidateTag(c.snippet),
   ].join('\n');
   return [
-    `<candidate id="${escapeAttr(c.id)}" type="${escapeAttr(c.type)}" path="${escapeAttr(c.file)}" line="${c.line}" clientExposed="${c.clientExposed}">`,
+    `<candidate id="${escapeAttr(c.id)}" type="${escapeAttr(c.type)}" path="${escapeAttr(c.file)}" line="${c.line}" clientExposed="${c.clientExposed}" ${valueFeatures(c)}>`,
     untrustedText(`candidate ${c.id}`, body),
     '</candidate>',
   ].join('\n');
