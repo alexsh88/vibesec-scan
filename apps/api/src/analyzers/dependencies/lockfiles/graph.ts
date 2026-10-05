@@ -71,6 +71,11 @@ export class GraphBuilder {
     return true;
   }
 
+  /** True once the edge cap has been hit (parsers can stop wiring early). */
+  atEdgeCap(): boolean {
+    return this.edgeCapWarned;
+  }
+
   /** Looks up an existing node by key without creating one. */
   get(key: string): DepNode | undefined {
     return this.nodes.get(key);

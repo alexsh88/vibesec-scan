@@ -29,8 +29,7 @@ describe('YAML lockfiles: duplicate-key check is not quadratic', () => {
   it('pnpm: 20k flat packages parse in < 3 s', () => {
     const lines = ['lockfileVersion: "9.0"', 'importers:', '  .: {}', 'packages:'];
     for (let i = 0; i < 20_000; i++) lines.push(`  c${i}@1.0.0: {}`);
-    const { value: g, ms } = time(() => parsePnpmLock({ path: 'pnpm-lock.yaml', kind: 'pnpm-lock', manifestDir: '' }, lines.join('
-')));
+    const { value: g, ms } = time(() => parsePnpmLock({ path: 'pnpm-lock.yaml', kind: 'pnpm-lock', manifestDir: '' }, lines.join('\n')));
     expect(g.nodes.size).toBe(20_000);
     expect(ms).toBeLessThan(3000);
   });

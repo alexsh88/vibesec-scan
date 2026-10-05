@@ -98,8 +98,36 @@ function resolvePackageEntry(packages: JsonRecord, startPath: string): { path: s
   return null;
 }
 
-function resolveTarget(packages: JsonRecord, fromKey: string, depName: string): { path: string; entry: JsonRecord } | null {
-  for (const prefix of ancestorPrefixes(fromKey)) {
+/** Per-parse lookup accelerators: which install contexts have nested node_modules at all, and the
+ *  (shared) root-level resolution of each dependency name. Avoids building + hashing two candidate
+ *  path strings per edge on big flat lockfiles. */
+type ResolveCache = { nested: Set<string>; root: Map<string, { path: string; entry: JsonRecord } | null> };
+
+function buildResolveCache(keys: readonly string[]): ResolveCache {
+  const nested = new Set<string>();
+  for (const k of keys) {
+    const idx = k.lastIndexOf('/node_modules/');
+    if (idx !== -1) nested.add(k.slice(0, idx));
+  }
+  return { nested, root: new Map() };
+}
+
+function resolveTarget(
+  packages: JsonRecord, fromKey: string, depName: string, prefixes: readonly string[] = ancestorPrefixes(fromKey), cache?: ResolveCache,
+): { path: string; entry: JsonRecord } | null {
+  for (const prefix of prefixes) {
+    if (cache) {
+      if (prefix === '') {
+        let hit = cache.root.get(depName);
+        if (hit === undefined) {
+          hit = resolvePackageEntry(packages, `node_modules/${depName}`);
+          cache.root.set(depName, hit);
+        }
+        if (hit) return hit;
+        continue;
+      }
+      if (!cache.nested.has(prefix)) continue;
+    }
     const candidate = prefix === '' ? `node_modules/${depName}` : `${prefix}/node_modules/${depName}`;
     const found = resolvePackageEntry(packages, candidate);
     if (found) return found;
@@ -148,19 +176,29 @@ function parsePackagesMap(builder: GraphBuilder, raw: JsonRecord): void {
     for (const dep of directDepsOf(entry)) wireDirect(builder, packages, key, dep);
   }
 
-  // Pass 2c: transitive edges for every real installed/workspace package.
+  // Pass 2c: transitive edges for every real installed/workspace package. Resolved target keys are
+  // memoized by package path (the same leaf is typically depended on by many parents).
+  const keyByPath = new Map<string, string>();
+  const resolveCache = buildResolveCache(keys);
   for (const key of keys) {
     if (key === '') continue;
+    if (builder.atEdgeCap()) break;
     const entry = packages[key];
     if (!isPlainObject(entry) || entry.link === true) continue;
     const { name, version } = nodeIdentity(key, entry);
     const parentKey = depKey(builder.ecosystem, name, version);
-    const deps = [...safeEntries(entry.dependencies), ...safeEntries(entry.optionalDependencies), ...safeEntries(entry.peerDependencies)];
-    for (const [depName] of deps) {
-      const target = resolveTarget(packages, key, depName);
+    const prefixes = ancestorPrefixes(key);
+    const deps = [...safeKeys(entry.dependencies), ...safeKeys(entry.optionalDependencies), ...safeKeys(entry.peerDependencies)];
+    for (const depName of deps) {
+      const target = resolveTarget(packages, key, depName, prefixes, resolveCache);
       if (!target) continue;
-      const identity = nodeIdentity(target.path, target.entry);
-      builder.edge(parentKey, depKey(builder.ecosystem, identity.name, identity.version));
+      let childKey = keyByPath.get(target.path);
+      if (childKey === undefined) {
+        const identity = nodeIdentity(target.path, target.entry);
+        childKey = depKey(builder.ecosystem, identity.name, identity.version);
+        keyByPath.set(target.path, childKey);
+      }
+      builder.edge(parentKey, childKey);
     }
   }
 }
