@@ -21,6 +21,10 @@ export type RunOptions = {
   onStderrLine?: (line: string) => void;
   /** Called on any output; use it to keep the scan watchdog alive. */
   onActivity?: () => void;
+  /** @internal undocumented: how long to wait for `close` after killTree before settling anyway. Default 5_000. */
+  killGraceMs?: number;
+  /** @internal undocumented: override for process-tree kill, for tests. */
+  _killTree?: (child: ChildProcess) => void;
 };
 
 export type RunResult = { code: number; stdout: string; stderr: string };
@@ -46,11 +50,17 @@ export function runProcess(cmd: string, args: readonly string[], opts: RunOption
     let failure: ProcessError | null = null;
     let settled = false;
     let stallTimer: NodeJS.Timeout | undefined;
+    let killGraceTimer: NodeJS.Timeout | undefined;
+    const killTreeImpl = opts._killTree ?? killTree;
 
     const fail = (reason: ProcessFailure, message: string) => {
       if (failure || settled) return;
       failure = new ProcessError(reason, message, stderrTail);
-      killTree(child);
+      killTreeImpl(child);
+      // Belt-and-suspenders: if killTree doesn't produce a `close` event (e.g. a wedged process
+      // on a platform where the kill signal is ignored), don't hang forever waiting for it.
+      killGraceTimer = setTimeout(() => finish(null), opts.killGraceMs ?? 5_000);
+      killGraceTimer.unref();
     };
 
     const totalTimer = setTimeout(() => fail('timeout', `${cmd} timed out after ${opts.timeoutMs} ms`), opts.timeoutMs);
@@ -95,6 +105,7 @@ export function runProcess(cmd: string, args: readonly string[], opts: RunOption
       settled = true;
       clearTimeout(totalTimer);
       clearTimeout(stallTimer);
+      clearTimeout(killGraceTimer);
       opts.signal?.removeEventListener('abort', onAbort);
       if (opts.onStderrLine && lineBuffer) opts.onStderrLine(lineBuffer);
       if (failure) reject(failure);

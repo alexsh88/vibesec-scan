@@ -81,6 +81,13 @@ describe('GitHubClient.getRepo', () => {
     expect((fetchMock.mock.calls[0] as unknown as [string])[0]).toBe('https://api.github.test/repos/acme/my.app');
   });
 
+  it('throws INTERNAL when a 200 response body is not valid JSON, after exhausting retries', async () => {
+    const unparseable = () => new Response('<html>', { status: 200 });
+    const { gh, fetchMock } = client([unparseable(), unparseable(), unparseable(), unparseable()]);
+    await expect(gh.getRepo('acme', 'app', undefined)).rejects.toMatchObject({ code: 'INTERNAL' });
+    expect(fetchMock).toHaveBeenCalledTimes(4);
+  });
+
   it('cancels when the signal is aborted', async () => {
     const ac = new AbortController();
     ac.abort();

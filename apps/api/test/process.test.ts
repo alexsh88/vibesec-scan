@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { ProcessError, runProcess } from '../src/process/runProcess';
 
 const node = process.execPath;
@@ -59,5 +59,19 @@ describe('runProcess', () => {
     const err = await run("process.stdout.write('x'.repeat(200000))", { maxStdoutBytes: 1_000 }).catch((e: unknown) => e);
     expect(err).toBeInstanceOf(ProcessError);
     expect((err as ProcessError).reason).toBe('output_limit');
+  });
+
+  it('settles via the killGraceMs backup timer when killTree never produces a close event', async () => {
+    const killTreeSpy = vi.fn();
+    const started = Date.now();
+    const err = await run('setTimeout(() => {}, 1500)', {
+      timeoutMs: 100,
+      killGraceMs: 200,
+      _killTree: killTreeSpy,
+    }).catch((e: unknown) => e);
+    expect(killTreeSpy).toHaveBeenCalledTimes(1);
+    expect(err).toBeInstanceOf(ProcessError);
+    expect((err as ProcessError).reason).toBe('timeout');
+    expect(Date.now() - started).toBeLessThan(2_000);
   });
 });

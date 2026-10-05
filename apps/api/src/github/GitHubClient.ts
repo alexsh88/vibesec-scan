@@ -73,7 +73,13 @@ export class GitHubClient {
       throw e.kind === 'permanent' ? new AppError('INTERNAL', 'transient', 'Network error while talking to GitHub', { cause: err }) : e;
     }
 
-    if (res.ok) return (await res.json()) as RepoResponse;
+    if (res.ok) {
+      try {
+        return (await res.json()) as RepoResponse;
+      } catch (err) {
+        throw new AppError('INTERNAL', 'transient', 'GitHub returned an unparseable response', { cause: err });
+      }
+    }
 
     const rateLimited = (res.status === 403 || res.status === 429)
       && (res.headers.get('x-ratelimit-remaining') === '0' || res.headers.has('retry-after'));
