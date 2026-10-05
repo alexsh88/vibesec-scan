@@ -59,8 +59,12 @@ function nearLine(f: Finding, line: number, tolerance: number): boolean {
   return f.location.startLine - tolerance <= line && line <= f.location.endLine + tolerance;
 }
 
+/** Taint findings are code findings with a proven trace: VERIFYING's dedupe keeps them in place of SAST. */
+const CODE_CATEGORIES: ReadonlySet<Category> = new Set(['sast', 'taint']);
+
 export function compatible(issue: ExpectedIssue, f: Finding): boolean {
-  return f.category === issue.category || (issue.cwe !== undefined && f.cwe === issue.cwe)
+  const sameFamily = f.category === issue.category || (CODE_CATEGORIES.has(f.category) && CODE_CATEGORIES.has(issue.category));
+  return sameFamily || (issue.cwe !== undefined && f.cwe === issue.cwe)
     || [issue.ruleHint, ...(issue.alsoAccept ?? [])].some((h) => ruleHintMatches(h, f.ruleId));
 }
 
