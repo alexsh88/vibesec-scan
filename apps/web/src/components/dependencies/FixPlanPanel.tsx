@@ -161,7 +161,7 @@ function ActionCard({
             ) : pkgs[0] && pkgs[0].name !== a.package ? (
               <span className="text-muted-foreground"> in {pkgs[0].name}@{pkgs[0].version}</span>
             ) : null}
-            {a.kind === 'upgrade-parent' && vulnerableNames.length > 0 && (
+            {a.kind === 'upgrade-parent' && pkgs.length > 1 && vulnerableNames.length > 0 && (
               <span className="text-muted-foreground">
                 {' '}— pulls in fixed <span className="font-mono text-foreground">{vulnerableNames.slice(0, 3).join(', ')}</span>
                 {vulnerableNames.length > 3 && ` +${vulnerableNames.length - 3}`}
