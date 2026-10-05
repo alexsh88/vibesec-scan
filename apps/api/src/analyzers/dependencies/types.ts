@@ -76,6 +76,9 @@ export type OsvAdvisory = {
   url: string | null;         // best reference (advisory page)
   published: string | null;
   malicious: boolean;         // MAL-* (malicious package)
+  /** OSV listed this id for the package but its details could not be fetched: a placeholder
+   *  (severity 'medium', no ranges/fixes) so the package is never silently reported clean. */
+  detailsUnavailable?: boolean;
 };
 
 /** A source-code usage of a package found by static analysis (index or sandbox phase B). */

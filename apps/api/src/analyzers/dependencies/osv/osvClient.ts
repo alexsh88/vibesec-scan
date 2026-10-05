@@ -13,7 +13,25 @@ import { isValidVersion } from '../versions';
 import { normalizeOsv } from './normalize';
 
 export type OsvPackageInput = { key: string; ecosystem: Ecosystem; name: string; version: string };
-export type OsvAdvisoriesResult = { byKey: Map<string, OsvAdvisory[]>; errors: string[] };
+export type OsvAdvisoriesResult = {
+  /** Advisories per package key; absent for packages whose query failed (see failedKeys). */
+  byKey: Map<string, OsvAdvisory[]>;
+  /** Package keys whose querybatch failed: their vulnerability status is UNKNOWN (not clean). */
+  failedKeys: string[];
+  /** Vuln ids that were listed for some package but whose details could not be fetched (each
+   *  still appears in byKey as a placeholder advisory with detailsUnavailable). */
+  failedIds: string[];
+  errors: string[];
+};
+
+/** Placeholder for a vuln id OSV listed for a package but whose record could not be fetched. */
+export function unavailableAdvisory(id: string): OsvAdvisory {
+  return {
+    id, aliases: [], summary: 'Advisory details unavailable (OSV record could not be fetched)', details: '',
+    severity: 'medium', cvss: null, cvssVector: null, fixedVersions: [], affectedRanges: [], affectedSymbols: [], cwes: [],
+    url: `https://osv.dev/vulnerability/${encodeURIComponent(id)}`, published: null, malicious: id.startsWith('MAL-'), detailsUnavailable: true,
+  };
+}
 
 export type OsvClientDeps = {
   fetch?: typeof fetch;
@@ -60,6 +78,7 @@ export class OsvClient {
   async advisoriesFor(pkgs: readonly OsvPackageInput[], signal: AbortSignal): Promise<OsvAdvisoriesResult> {
     const errors: string[] = [];
     const byKey = new Map<string, OsvAdvisory[]>();
+    const failedKeys: string[] = [];
 
     const candidates = new Map<string, OsvPackageInput>();
     for (const p of pkgs) {
@@ -91,7 +110,10 @@ export class OsvClient {
       } catch (err) {
         const appErr = toAppError(err);
         if (appErr.kind === 'cancelled') throw appErr;
-        for (const p of chunk) errors.push(`OSV querybatch failed for ${p.key}: ${appErr.userMessage}`);
+        for (const p of chunk) {
+          failedKeys.push(p.key);
+          errors.push(`OSV querybatch failed for ${p.key}: ${appErr.userMessage}`);
+        }
       }
     }
 
@@ -106,20 +128,26 @@ export class OsvClient {
       else idsToFetch.push(id);
     }
     await this.fetchVulnDetails(idsToFetch, vulnById, errors, signal);
+    const failedIds = idsToFetch.filter((id) => !vulnById.has(id));
 
     for (const p of candidates.values()) {
-      const ids = idsByKey.get(p.key) ?? [];
+      const ids = idsByKey.get(p.key);
+      if (ids === undefined) continue; // query failed: unknown, reported via failedKeys
       const advisories: OsvAdvisory[] = [];
       for (const id of ids) {
         const raw = vulnById.get(id);
-        if (raw === undefined) continue;
+        if (raw === undefined) {
+          // Known vulnerable per OSV, details missing: never drop it silently.
+          advisories.push(unavailableAdvisory(id));
+          continue;
+        }
         const normalized = normalizeOsv(raw, { ecosystem: p.ecosystem, name: p.name, version: p.version });
         if (normalized) advisories.push(normalized);
       }
       byKey.set(p.key, advisories);
     }
 
-    return { byKey, errors };
+    return { byKey, failedKeys, failedIds, errors };
   }
 
   private async queryBatchChunk(chunk: readonly OsvPackageInput[], signal: AbortSignal): Promise<Map<string, string[]>> {

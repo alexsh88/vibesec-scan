@@ -86,13 +86,15 @@ const BASE_ADVISORIES: Record<string, OsvAdvisory[]> = {
   'minimist@1.2.0': [adv('GHSA-min-1', 'critical', ['1.2.6'])],
 };
 
-function fakeOsv(advisories: Record<string, OsvAdvisory[]> = BASE_ADVISORIES, errors: (keys: string[]) => string[] = () => []) {
+type OsvFailures = { errors?: (keys: string[]) => string[]; failedKeys?: (keys: string[]) => string[]; failedIds?: string[] };
+function fakeOsv(advisories: Record<string, OsvAdvisory[]> = BASE_ADVISORIES, failures: OsvFailures = {}) {
   return {
     advisoriesFor: vi.fn(async (pkgs: ReadonlyArray<{ key: string; name: string; version: string }>, signal: AbortSignal) => {
       if (signal.aborted) throw new AppError('CANCELLED', 'cancelled', 'cancelled');
       const byKey = new Map<string, OsvAdvisory[]>();
       for (const p of pkgs) byKey.set(p.key, advisories[`${p.name}@${p.version}`] ?? []);
-      return { byKey, errors: errors(pkgs.map((p) => p.key)) };
+      const keys = pkgs.map((p) => p.key);
+      return { byKey, errors: failures.errors?.(keys) ?? [], failedKeys: failures.failedKeys?.(keys) ?? [], failedIds: failures.failedIds ?? [] };
     }),
   };
 }
@@ -411,7 +413,7 @@ describe('createDependenciesAnalyzer', () => {
 
   it('OSV partially failing -> DEPENDENCY_ADVISORIES_PARTIAL, findings for what resolved', async () => {
     const files = await baseRepo();
-    const { analyzer } = setup({ osv: fakeOsv(BASE_ADVISORIES, () => ['Failed to fetch OSV advisory GHSA-x: unavailable']) });
+    const { analyzer } = setup({ osv: fakeOsv(BASE_ADVISORIES, { errors: () => ['Failed to fetch OSV advisory GHSA-x: unavailable'], failedIds: ['GHSA-x'] }) });
     const { ctx, warnings } = makeCtx(files);
     const findings = await analyzer.run(ctx);
     expect(warnings.map((w) => w[0])).toContain('DEPENDENCY_ADVISORIES_PARTIAL');
@@ -420,13 +422,35 @@ describe('createDependenciesAnalyzer', () => {
 
   it('OSV completely unavailable -> DEPENDENCY_ADVISORIES_UNAVAILABLE and supply-chain findings only', async () => {
     const files = await baseRepo();
-    const { analyzer, saved } = setup({ osv: fakeOsv(BASE_ADVISORIES, (keys) => keys.map((k) => `OSV querybatch failed for ${k}: OSV API is temporarily unavailable`)) });
+    const { analyzer, saved } = setup({ osv: fakeOsv(BASE_ADVISORIES, { errors: (keys) => keys.map(() => 'something went wrong'), failedKeys: (keys) => keys }) });
     const { ctx, warnings } = makeCtx(files);
     const findings = await analyzer.run(ctx);
     expect(warnings.map((w) => w[0])).toEqual(['DEPENDENCY_ADVISORIES_UNAVAILABLE']);
     expect(findings.length).toBeGreaterThan(0);
     expect(findings.every((f) => f.ruleId.startsWith('supply-chain/'))).toBe(true);
     expect(saved[0]!.actions).toEqual([]);
+  });
+
+  it('OSV errors that are not total outages (no failedKeys) never trigger UNAVAILABLE, whatever their wording', async () => {
+    const files = await baseRepo();
+    const { analyzer } = setup({ osv: fakeOsv(BASE_ADVISORIES, { errors: (keys) => keys.map((k) => `OSV querybatch failed for ${k}: x`) }) });
+    const { ctx, warnings } = makeCtx(files);
+    const findings = await analyzer.run(ctx);
+    expect(warnings.map((w) => w[0])).toEqual(['DEPENDENCY_ADVISORIES_PARTIAL']);
+    expect(vulnOf(findings, 'lodash')).toBeDefined();
+  });
+
+  it('a package whose advisory details failed still gets a finding (details unavailable, medium)', async () => {
+    const files = await baseRepo();
+    const placeholder = adv('GHSA-gone', 'medium', [], { summary: 'Advisory details unavailable', detailsUnavailable: true });
+    const { analyzer } = setup({ osv: fakeOsv({ ...BASE_ADVISORIES, 'minimist@1.2.0': [placeholder] }, { failedIds: ['GHSA-gone'], errors: () => ['Failed to fetch OSV advisory GHSA-gone: down'] }) });
+    const { ctx, warnings } = makeCtx(files);
+    const findings = await analyzer.run(ctx);
+    const f = vulnOf(findings, 'minimist');
+    expect(f).toBeDefined();
+    expect(f!.dependency!.advisories.map((a) => a.id)).toEqual(['GHSA-gone']);
+    expect(f!.explanation).toMatch(/details (are )?unavailable/i);
+    expect(warnings.map((w) => w[0])).toContain('DEPENDENCY_ADVISORIES_PARTIAL');
   });
 
   it('is deterministic: same ids/fingerprints across runs', async () => {

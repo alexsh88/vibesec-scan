@@ -11,8 +11,10 @@
 //     vulnerable-package finding — so one malicious package never yields two critical findings.
 //
 // Degradation (never fails the analyzer for an external dependency being down):
-//   - OSV partially failing  → warning DEPENDENCY_ADVISORIES_PARTIAL, findings for what resolved.
-//   - OSV completely failing → warning DEPENDENCY_ADVISORIES_UNAVAILABLE and supply-chain findings
+//   - OSV partially failing  → warning DEPENDENCY_ADVISORIES_PARTIAL, findings for what resolved;
+//     vuln ids whose details failed still produce findings (placeholder advisories, 'medium').
+//   - OSV completely failing (failedKeys = every queried package) → warning
+//     DEPENDENCY_ADVISORIES_UNAVAILABLE and supply-chain findings
 //     only (install scripts / typosquats / non-registry sources need no OSV). Chosen over throwing so
 //     a scan still reports the signals that are independent of OSV.
 //   - Docker sandbox unavailable / failing → import-index evidence (SANDBOX_UNAVAILABLE / SANDBOX_PARTIAL).
@@ -369,21 +371,17 @@ export function createDependenciesAnalyzer(deps: DependenciesAnalyzerDeps): Anal
           result = await deps.osv.advisoriesFor([...inputs.values()], signal);
         } catch (err) {
           if (isCancellation(err, signal)) throw toAppError(err);
-          result = { byKey: new Map(), errors: [...inputs.keys()].map((k) => `OSV querybatch failed for ${k}: ${toAppError(err).userMessage}`) };
+          result = { byKey: new Map(), failedKeys: [...inputs.keys()], failedIds: [], errors: [`OSV query failed: ${toAppError(err).userMessage}`] };
         }
-        // OsvClient reports per-package batch failures as strings (it never throws for them); every
-        // queried package failing its batch means OSV was unreachable as a whole.
-        const failedKeys = new Set<string>();
-        for (const e of result.errors) {
-          const m = /^OSV querybatch failed for (.+?): /.exec(e);
-          if (m) failedKeys.add(m[1]!);
-        }
-        if (failedKeys.size >= inputs.size) {
+        // Every queried package failing its query means OSV was unreachable as a whole. Packages
+        // whose advisory DETAILS failed still carry placeholder advisories (never silently clean).
+        const failedKeys = new Set(result.failedKeys);
+        if ([...inputs.keys()].every((k) => failedKeys.has(k))) {
           osvAvailable = false;
           ctx.warn('DEPENDENCY_ADVISORIES_UNAVAILABLE', 'Vulnerability advisories (OSV) could not be retrieved; only supply-chain signals are reported for dependencies');
         } else {
           advisoriesByKey = result.byKey;
-          if (result.errors.length > 0) {
+          if (result.errors.length > 0 || failedKeys.size > 0 || result.failedIds.length > 0) {
             ctx.warn('DEPENDENCY_ADVISORIES_PARTIAL', `Advisories could not be retrieved for some dependencies (${result.errors.length} error(s)); results may be incomplete`);
           }
         }
@@ -659,7 +657,11 @@ function vulnExplanation(node: DepNode, advisories: readonly OsvAdvisory[], verd
   const root = node.direct
     ? `${node.name} is a direct${dev} dependency declared in the manifest.`
     : `${node.name} is a transitive${dev} dependency${paths[0] ? `, pulled in via ${paths[0].join(' > ')}` : ''}; fixing it usually means upgrading the direct dependency that brings it in.`;
-  return `Known vulnerabilities in ${node.name}@${node.version}: ${top.join('; ')}.${more} Reachability (${verdict.reachability}): ${verdict.reason}. ${root}`;
+  const missing = advisories.filter((a) => a.detailsUnavailable).map((a) => a.id);
+  const note = missing.length > 0
+    ? ` Note: OSV lists ${missing.join(', ')} for this version but the advisory details are unavailable (fetch failed); severity defaults to medium — re-scan or check osv.dev.`
+    : '';
+  return `Known vulnerabilities in ${node.name}@${node.version}: ${top.join('; ')}.${more} Reachability (${verdict.reachability}): ${verdict.reason}. ${root}${note}`;
 }
 
 function vulnImpact(worst: OsvAdvisory): string {

@@ -210,7 +210,8 @@ describe('OsvClient', () => {
     const cache = new AdvisoryCacheRepo(memoryDb());
     const client = new OsvClient({ fetch: fetchMock as unknown as typeof fetch, cache, retryDeps: { sleep: async () => {} } });
     const { byKey, errors } = await client.advisoriesFor(pkgs, new AbortController().signal);
-    expect(byKey.get(pkgs[0]!.key)?.map((a) => a.id)).toEqual(['GHSA-ok']);
+    expect(byKey.get(pkgs[0]!.key)?.map((a) => a.id)).toEqual(['GHSA-ok', 'GHSA-bad']);
+    expect(byKey.get(pkgs[0]!.key)?.[1]?.detailsUnavailable).toBe(true);
     expect(errors.some((e) => e.includes('GHSA-bad'))).toBe(true);
   });
 
@@ -251,5 +252,38 @@ describe('normalizeOsv — affected intervals', () => {
     const a = normalizeOsv(rec, { ecosystem: 'npm', name: 'x', version: '1.1.0' })!;
     expect(a.affectedRanges).toEqual([{ introduced: '0', fixed: '1.2.0' }, { introduced: '1.3.0', lastAffected: '1.3.1' }]);
     expect(a.affectedVersions).toEqual(['1.1.0']);
+  });
+});
+
+describe('OsvClient — structured failures (never silently "no vulnerabilities")', () => {
+  it('a package whose vuln ids are known but details failed gets placeholder advisories', async () => {
+    const pkgs: Pkg[] = [{ key: 'npm:foo@1.0.0', ecosystem: 'npm', name: 'foo', version: '1.0.0' }];
+    const fetchMock = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
+      if ((init?.method ?? 'GET') === 'POST') return jsonResponse(200, { results: [{ vulns: [{ id: 'GHSA-ok' }, { id: 'GHSA-bad' }, { id: 'MAL-2024-9' }] }] });
+      const id = decodeURIComponent(String(_url).split('/').pop() ?? '');
+      if (id === 'GHSA-ok') return jsonResponse(200, minimalAffectedRecord(id, 'foo', 'npm'));
+      return jsonResponse(500, {});
+    });
+    const client = new OsvClient({ fetch: fetchMock as unknown as typeof fetch, cache: new AdvisoryCacheRepo(memoryDb()), retryDeps: { sleep: async () => {} } });
+    const res = await client.advisoriesFor(pkgs, new AbortController().signal);
+    expect(res.failedKeys).toEqual([]);
+    expect(res.failedIds.sort()).toEqual(['GHSA-bad', 'MAL-2024-9']);
+    const advs = res.byKey.get('npm:foo@1.0.0')!;
+    expect(advs.map((a) => a.id).sort()).toEqual(['GHSA-bad', 'GHSA-ok', 'MAL-2024-9']);
+    const bad = advs.find((a) => a.id === 'GHSA-bad')!;
+    expect(bad).toMatchObject({ severity: 'medium', summary: expect.stringMatching(/details unavailable/i), detailsUnavailable: true, malicious: false });
+    expect(advs.find((a) => a.id === 'MAL-2024-9')).toMatchObject({ malicious: true, detailsUnavailable: true });
+  });
+
+  it('querybatch failure → failedKeys lists every package of the failed chunk', async () => {
+    const pkgs: Pkg[] = [
+      { key: 'npm:a@1.0.0', ecosystem: 'npm', name: 'a', version: '1.0.0' },
+      { key: 'npm:b@1.0.0', ecosystem: 'npm', name: 'b', version: '1.0.0' },
+    ];
+    const fetchMock = vi.fn(async () => jsonResponse(503, {}));
+    const client = new OsvClient({ fetch: fetchMock as unknown as typeof fetch, cache: new AdvisoryCacheRepo(memoryDb()), retryDeps: { sleep: async () => {} } });
+    const res = await client.advisoriesFor(pkgs, new AbortController().signal);
+    expect(res.failedKeys.sort()).toEqual(['npm:a@1.0.0', 'npm:b@1.0.0']);
+    expect(res.byKey.has('npm:a@1.0.0')).toBe(false);
   });
 });

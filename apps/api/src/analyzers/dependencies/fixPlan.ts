@@ -290,7 +290,9 @@ export async function buildFixPlan(input: BuildFixPlanInput): Promise<{ plan: Fi
     const notFixable: { adv: OsvAdvisory; reason: string }[] = [];
     for (const a of v.advisories) {
       if (safeUpgradeVersion(eco, current, [a], childVersions) !== null) { fixable.push(a); continue; }
-      const reason = !mayBeFixable(a)
+      const reason = a.detailsUnavailable
+        ? 'advisory details unavailable (OSV fetch failed)'
+        : !mayBeFixable(a)
         ? 'no fixed version published'
         : childVersions !== undefined ? 'no published release outside the affected ranges' : 'no fixed version above the installed one';
       notFixable.push({ adv: a, reason });
@@ -319,10 +321,12 @@ export async function buildFixPlan(input: BuildFixPlanInput): Promise<{ plan: Fi
     const base = { ecosystem: eco, manifestDir: graph.manifestDir, lockfile: graph.lockfile, dev: node.scope === 'dev', refreshOnly: false };
 
     if (target === null) {
-      if (node.direct && notFixable.length > 0) {
+      // Unknown advisories (details unavailable) never justify "remove": they are only unfixable-for-now.
+      const removable = notFixable.filter((n) => !n.adv.detailsUnavailable);
+      if (node.direct && removable.length > 0) {
         drafts.push({
-          ...base, kind: 'remove', package: node.name, from: current, to: null, resolves: resolvesOf(notFixable.map((n) => n.adv)),
-          notes: [`No fixed version exists for ${notFixable.map((n) => n.adv.id).join(', ')}; replace or remove ${node.name}`],
+          ...base, kind: 'remove', package: node.name, from: current, to: null, resolves: resolvesOf(removable.map((n) => n.adv)),
+          notes: [`No fixed version exists for ${removable.map((n) => n.adv.id).join(', ')}; replace or remove ${node.name}`],
         });
       }
       continue;
