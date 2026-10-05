@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { isTerminalState, type ScanDto, type ScanOptions, type ScanState } from '@vibesec/shared';
 import type { Db } from './database';
 
-export type RepoRecord = { id: string; owner: string; name: string; isPrivate: boolean };
+export type RepoRecord = { id: string; owner: string; name: string; isPrivate: boolean; defaultBranch: string | null };
 
 export type ScanRow = {
   id: string; repo_id: string; ref: string | null; commit_sha: string | null; base_scan_id: string | null;
@@ -17,7 +17,7 @@ export type ScanRow = {
 export type ScanWarning = { code: string; message: string; stage?: string };
 export type Checkpoint = { completedStages: ScanState[]; data: Record<string, unknown> };
 
-type RepoRow = { id: string; owner: string; name: string; is_private: number };
+type RepoRow = { id: string; owner: string; name: string; is_private: number; default_branch: string | null };
 
 const TERMINAL_SQL = `('COMPLETED','COMPLETED_WITH_WARNINGS','FAILED','CANCELLED')`;
 
@@ -44,6 +44,10 @@ export class ScanRepo {
     return row ? toRepo(row) : undefined;
   }
 
+  updateRepoMeta(repoId: string, meta: { isPrivate: boolean; defaultBranch: string }): void {
+    this.db.prepare(`UPDATE repos SET is_private = ?, default_branch = ? WHERE id = ?`).run(meta.isPrivate ? 1 : 0, meta.defaultBranch, repoId);
+  }
+
   insertScan(input: {
     repoId: string; ref: string | null; options: ScanOptions; optionsHash: string;
     idempotencyKey: string | null; hasAuth: boolean;
@@ -67,7 +71,7 @@ export class ScanRepo {
     const repo = this.getRepo(row.repo_id)!;
     return {
       id: row.id,
-      repo,
+      repo: { id: repo.id, owner: repo.owner, name: repo.name, isPrivate: repo.isPrivate },
       ref: row.ref,
       commitSha: row.commit_sha,
       state: row.state,
@@ -172,5 +176,5 @@ export class ScanRepo {
 }
 
 function toRepo(row: RepoRow): RepoRecord {
-  return { id: row.id, owner: row.owner, name: row.name, isPrivate: row.is_private === 1 };
+  return { id: row.id, owner: row.owner, name: row.name, isPrivate: row.is_private === 1, defaultBranch: row.default_branch };
 }
