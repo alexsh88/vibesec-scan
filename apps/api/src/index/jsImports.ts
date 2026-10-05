@@ -39,7 +39,42 @@ export function extractJsImports(source: string): RawImport[] {
   return [...found.entries()].sort((a, b) => a[0] - b[0]).map(([, v]) => v);
 }
 
-/** Removes // and /* *\/ comments, keeping string/template contents and newlines intact. */
+const REGEX_CONTEXT_PUNCT = new Set('([{,;:!&|?+-*%^~=<>');
+const REGEX_CONTEXT_KEYWORDS = new Set([
+  'return', 'typeof', 'instanceof', 'in', 'of', 'new', 'delete', 'void', 'throw', 'case', 'do', 'else', 'yield', 'await',
+]);
+
+/** Whether a '/' appearing right after what's already been emitted starts a regex literal rather than division. */
+function isRegexContext(out: string): boolean {
+  let j = out.length - 1;
+  while (j >= 0 && /\s/.test(out[j]!)) j--;
+  if (j < 0) return true;
+  const ch = out[j]!;
+  if (REGEX_CONTEXT_PUNCT.has(ch)) return true;
+  if (!/[A-Za-z0-9_$]/.test(ch)) return false;
+  let k = j;
+  while (k >= 0 && /[A-Za-z0-9_$]/.test(out[k]!)) k--;
+  return REGEX_CONTEXT_KEYWORDS.has(out.slice(k + 1, j + 1));
+}
+
+/** Scans a possible regex literal starting at src[start] ('/'). Returns the index just past the closing
+ *  unescaped '/' (before flags), or null if a newline or end-of-input is hit first (not a regex literal). */
+function scanRegexLiteral(src: string, start: number): number | null {
+  let inClass = false;
+  let j = start + 1;
+  while (j < src.length) {
+    const c = src[j]!;
+    if (c === '\\' && j + 1 < src.length) { j += 2; continue; }
+    if (c === '\n') return null;
+    if (c === '[') inClass = true;
+    else if (c === ']') inClass = false;
+    else if (c === '/' && !inClass) return j + 1;
+    j++;
+  }
+  return null;
+}
+
+/** Removes // and /* *\/ comments, keeping string/template/regex contents and newlines intact. */
 export function stripJsComments(src: string): string {
   let out = '';
   let i = 0;
@@ -55,6 +90,16 @@ export function stripJsComments(src: string): string {
         i++;
       }
       i += 2;
+    } else if (ch === '/' && isRegexContext(out)) {
+      const end = scanRegexLiteral(src, i);
+      if (end === null) {
+        out += ch;
+        i++;
+      } else {
+        out += src.slice(i, end);
+        i = end;
+        while (i < src.length && /[a-z]/i.test(src[i]!)) { out += src[i]; i++; }
+      }
     } else if (ch === '"' || ch === "'" || ch === '`') {
       const quote = ch;
       out += ch;

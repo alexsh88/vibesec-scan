@@ -38,7 +38,8 @@ export function extractPyImports(source: string): PyImport[] {
     const startLine = i + 1;
     let line = lines[i]!;
 
-    const quotes = line.match(/"""|'''/g) ?? [];
+    const codeOnly = stripComment(line);
+    const quotes = codeOnly.match(/"""|'''/g) ?? [];
     if (inTripleQuote) {
       if (quotes.filter((q) => q === inTripleQuote).length % 2 === 1) inTripleQuote = null;
       continue;
@@ -99,6 +100,10 @@ export function resolvePyImport(fromPath: string, imp: PyImport, ctx: PyResolveC
   let bases: string[];
   if (imp.level > 0) {
     let dir = parent(fromPath);
+    const depth = dir === '' ? 0 : dir.split('/').length;
+    if (imp.level - 1 > depth) {
+      return [{ specifier: `${prefix}${imp.module}`, kind: 'unresolved', to: null, pkg: null }];
+    }
     for (let up = 1; up < imp.level; up++) dir = parent(dir);
     bases = [dir];
   } else {

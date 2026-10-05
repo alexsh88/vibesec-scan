@@ -35,6 +35,34 @@ describe('extractJsImports', () => {
   it('ignores dynamic imports with template expressions', () => {
     expect(extractJsImports('import(`./locale/${lang}.js`)')).toEqual([]);
   });
+
+  it('treats a / that cannot be a division operator as a regex literal, not a comment', () => {
+    const src = "const re = /[/*]/;\nimport './a.js';\nimport './b.js';";
+    expect(extractJsImports(src)).toEqual([
+      { specifier: './a.js', line: 2 },
+      { specifier: './b.js', line: 3 },
+    ]);
+  });
+
+  it('treats an escaped-slash regex literal correctly, not as a string', () => {
+    const src = "const p = /^\\/\\//.test(u); import './after.js';";
+    expect(extractJsImports(src)).toEqual([{ specifier: './after.js', line: 1 }]);
+  });
+
+  it('treats / between operands as division, still stripping a trailing line comment', () => {
+    const src = "const half = total / 2; // note\nimport './x';";
+    expect(extractJsImports(src)).toEqual([{ specifier: './x', line: 2 }]);
+  });
+
+  it('treats / between operands as division even immediately before a block comment', () => {
+    const src = "a = b / c /* c */; import './y';";
+    expect(extractJsImports(src)).toEqual([{ specifier: './y', line: 1 }]);
+  });
+
+  it('does not treat quote characters inside a regex literal as starting a string', () => {
+    const src = "const re = /[\"']/;\nimport './q.js';";
+    expect(extractJsImports(src)).toEqual([{ specifier: './q.js', line: 2 }]);
+  });
 });
 
 describe('parsePathConfig', () => {

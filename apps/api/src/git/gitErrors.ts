@@ -2,6 +2,7 @@ import { AppError } from '../errors/AppError';
 import { ProcessError } from '../process/runProcess';
 import { scrubSecrets } from '../security/scrub';
 
+const RATE_LIMITED = /secondary rate limit|rate limit exceeded|API rate limit|returned error: 429/i;
 const REF_NOT_FOUND = /couldn't find remote ref|Remote branch .+ not found|unknown revision|not a valid object name|reference is not a tree|did not match any file|invalid reference/i;
 const AUTH = /Authentication failed|could not read (Username|Password)|terminal prompts disabled|returned error: 40[13]|HTTP Basic: Access denied|Invalid username or password|Write access to repository not granted/i;
 const REPO_NOT_FOUND = /Repository not found|repository '.+' not found|does not appear to be a git repository|returned error: 404/i;
@@ -10,6 +11,9 @@ const NETWORK = /Could not resolve host|Failed to connect|Connection (timed out|
 /** Maps git's stderr to a typed AppError. The user message never contains raw stderr. */
 export function classifyGitFailure(stderr: string, ctx: { hasToken: boolean }): AppError {
   const details = { stderr: scrubSecrets(stderr.slice(-2_000)) };
+  if (RATE_LIMITED.test(stderr)) {
+    return new AppError('GITHUB_RATE_LIMITED', 'transient', 'GitHub rate limit reached; retrying shortly', { details, retryAfterMs: 30_000 });
+  }
   if (REF_NOT_FOUND.test(stderr)) {
     return new AppError('REF_NOT_FOUND', 'permanent', 'Branch, tag or commit not found in this repository', { details });
   }

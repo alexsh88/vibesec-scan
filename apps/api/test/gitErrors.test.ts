@@ -22,6 +22,18 @@ describe('classifyGitFailure', () => {
     expect(classifyGitFailure('remote: Invalid username or password.\nfatal: Authentication failed', { hasToken: true }).code).toBe('AUTH_INVALID');
   });
 
+  it('classifies GitHub secondary rate limit responses as GITHUB_RATE_LIMITED regardless of token presence', () => {
+    const stderr = "remote: You have exceeded a secondary rate limit. Please wait a few minutes before you try again.\nfatal: unable to access 'https://github.com/a/b.git/': The requested URL returned error: 403";
+    expect(classifyGitFailure(stderr, { hasToken: false })).toMatchObject({ code: 'GITHUB_RATE_LIMITED', kind: 'transient' });
+    expect(classifyGitFailure(stderr, { hasToken: true })).toMatchObject({ code: 'GITHUB_RATE_LIMITED', kind: 'transient' });
+  });
+
+  it('classifies GitHub primary (429) rate limit responses as GITHUB_RATE_LIMITED regardless of token presence', () => {
+    const stderr = "fatal: unable to access 'https://github.com/a/b.git/': The requested URL returned error: 429";
+    expect(classifyGitFailure(stderr, { hasToken: false })).toMatchObject({ code: 'GITHUB_RATE_LIMITED', kind: 'transient' });
+    expect(classifyGitFailure(stderr, { hasToken: true })).toMatchObject({ code: 'GITHUB_RATE_LIMITED', kind: 'transient' });
+  });
+
   it('never puts raw stderr in the user message and scrubs it in details', () => {
     const err = classifyGitFailure('fatal: weird ghp_0123456789abcdefghijABCDEFGHIJ012345', { hasToken: true });
     expect(err.userMessage).not.toContain('ghp_');

@@ -30,6 +30,18 @@ describe('extractPyImports', () => {
       { module: 'utils', level: 1, names: ['helper'], line: 14 },
     ]);
   });
+
+  it('does not treat a triple-quote marker inside a comment as starting a docstring', () => {
+    const src = [
+      'import real_one',
+      'x = 5  # """ looks like a marker',
+      'import should_be_found',
+    ].join('\n');
+    expect(extractPyImports(src)).toEqual([
+      { module: 'real_one', level: 0, names: [], line: 1 },
+      { module: 'should_be_found', level: 0, names: [], line: 3 },
+    ]);
+  });
 });
 
 describe('pythonRoots', () => {
@@ -79,6 +91,19 @@ describe('resolvePyImport', () => {
     ]);
     expect(resolvePyImport('app/views.py', imp('nothing', 1), ctx)).toEqual([
       { specifier: '.nothing', kind: 'unresolved', to: null, pkg: null },
+    ]);
+  });
+
+  it('treats a relative import climbing above the repo root as unresolved', () => {
+    expect(resolvePyImport('a.py', imp('x', 3), ctx)).toEqual([
+      { specifier: '...x', kind: 'unresolved', to: null, pkg: null },
+    ]);
+  });
+
+  it('does not clamp an over-climbing relative import to the root and wrongly resolve a same-named module there', () => {
+    // 'app/__init__.py' exists at the repo root; a naive clamp to '' would wrongly resolve this.
+    expect(resolvePyImport('a.py', imp('app', 3), ctx)).toEqual([
+      { specifier: '...app', kind: 'unresolved', to: null, pkg: null },
     ]);
   });
 
