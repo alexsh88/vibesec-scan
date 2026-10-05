@@ -6,6 +6,7 @@ import type { Container } from '../container';
 import { errorHandler } from './errorHandler';
 import { serializeError } from './logSerializers';
 import { auditRoutes } from './routes/audit';
+import { diagnosticsRoutes } from './routes/diagnostics';
 import { eventRoutes } from './routes/events';
 import { healthRoutes } from './routes/health';
 import { indexRoutes } from './routes/index';
@@ -28,6 +29,7 @@ export async function buildApp(c: Container, opts: { logger?: FastifyServerOptio
 
   scanRoutes(app, c.service);
   indexRoutes(app, c.service, c.indexRepo);
+  diagnosticsRoutes(app, c);
   eventRoutes(app, c.service, c.bus);
   auditRoutes(app, c.audit);
   healthRoutes(app, c);

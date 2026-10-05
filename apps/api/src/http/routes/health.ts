@@ -8,5 +8,6 @@ export function healthRoutes(app: FastifyInstance, c: Container): void {
     docker: 'unknown', // probed by the sandbox module in P5
     queue: { pending: c.runner.pendingCount(), capacity: c.config.queueCapacity },
     git: c.gitVersion,
+    llm: { mode: c.llm.mode, models: c.config.models }, // never include the API key
   }));
 }

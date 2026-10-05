@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it } from 'vitest';
 import type { FastifyInstance } from 'fastify';
+import { z } from 'zod';
 import { loadConfig } from '../src/config';
 import { createContainer, type Container } from '../src/container';
 import { buildApp } from '../src/http/app';
@@ -143,5 +144,39 @@ describe('HTTP API', () => {
   it('returns 404 for the index of an unknown scan', async () => {
     await start();
     expect((await app.inject({ method: 'GET', url: '/api/scans/nope/index' })).statusCode).toBe(404);
+  });
+
+  it('reports LLM mode and models in health', async () => {
+    await start();
+    expect((await app.inject({ method: 'GET', url: '/api/health' })).json()).toMatchObject({
+      llm: { mode: 'mock', models: { fast: 'claude-haiku-4-5', deep: 'claude-sonnet-5', synthesis: 'claude-opus-5' } },
+    });
+  });
+
+  it('streams cost events and exposes per-analyzer LLM diagnostics', async () => {
+    await start();
+    const { scanId } = (await createScan()).json();
+    await c.runner.whenIdle();
+    const r = await c.llm.structured({
+      scanId, analyzer: 'sast', purpose: 'test', promptVersion: 'v1', role: 'deep',
+      system: 'You review code.', prompt: 'review', schema: z.object({ ok: z.boolean() }), signal: new AbortController().signal,
+    });
+    expect(r.output).toEqual({ ok: false });
+    const costEvents = c.bus.replay(scanId, 0).filter((e) => e.event.type === 'cost');
+    expect(costEvents.length).toBe(1);
+    expect(costEvents[0]!.event).toMatchObject({ type: 'cost', usd: r.costUsd });
+
+    const diag = (await app.inject({ method: 'GET', url: `/api/scans/${scanId}/diagnostics` })).json();
+    expect(diag).toMatchObject({
+      scanId,
+      llm: { mode: 'mock', budgetUsd: 5, totals: { calls: 1, failedCalls: 0 }, byAnalyzer: [{ analyzer: 'sast', calls: 1 }] },
+    });
+    expect(diag.llm.totals.costUsd).toBeCloseTo(r.costUsd, 9);
+    expect(diag.llm.reservedUsd).toBe(0);
+  });
+
+  it('returns 404 diagnostics for an unknown scan', async () => {
+    await start();
+    expect((await app.inject({ method: 'GET', url: '/api/scans/nope/diagnostics' })).statusCode).toBe(404);
   });
 });
