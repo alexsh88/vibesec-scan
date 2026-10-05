@@ -8,6 +8,7 @@ import { serializeError } from './logSerializers';
 import { auditRoutes } from './routes/audit';
 import { diagnosticsRoutes } from './routes/diagnostics';
 import { eventRoutes } from './routes/events';
+import { exportRoutes } from './routes/exports';
 import { findingRoutes } from './routes/findings';
 import { fixPlanRoutes } from './routes/fixPlan';
 import { healthRoutes } from './routes/health';
@@ -35,6 +36,7 @@ export async function buildApp(c: Container, opts: { logger?: FastifyServerOptio
   findingRoutes(app, c);
   fixPlanRoutes(app, c);
   summaryRoutes(app, c);
+  exportRoutes(app, c);
   diagnosticsRoutes(app, c);
   eventRoutes(app, c.service, c.bus);
   auditRoutes(app, c.audit);
