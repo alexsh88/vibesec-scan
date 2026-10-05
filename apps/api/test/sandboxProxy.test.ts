@@ -1,7 +1,7 @@
 import { spawn, type ChildProcess } from 'node:child_process';
 import net from 'node:net';
 import { dirname, resolve } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
@@ -125,5 +125,28 @@ describe('sandbox egress proxy', () => {
     const decisions = proxy.logs.map((l) => JSON.parse(l) as { decision?: string; host?: string; reason?: string });
     expect(decisions).toContainEqual(expect.objectContaining({ decision: 'deny', host: 'denied.example', reason: 'host-not-allowlisted' }));
     expect(decisions).toContainEqual(expect.objectContaining({ decision: 'allow', host: 'localhost' }));
+  });
+});
+
+describe('isPrivateAddress (DNS-answer guard)', () => {
+  const load = async () => (await import(pathToFileURL(PROXY).href)) as { isPrivateAddress: (a: string) => boolean };
+
+  it('refuses every non-public range, including v6 encodings of v4 internals', async () => {
+    const { isPrivateAddress } = await load();
+    for (const a of [
+      '10.1.2.3', '127.0.0.1', '169.254.169.254', '172.16.0.1', '192.168.1.1', '100.64.0.1', '0.0.0.0', '224.0.0.1',
+      '198.18.0.1', '198.19.255.255', '192.0.0.8',
+      '::', '::1', '::ffff:127.0.0.1', '::ffff:7f00:1', '::127.0.0.1', '::a00:1',
+      '64:ff9b::a00:1', '64:ff9b::10.0.0.1', '64:ff9b:1::1', '2002:a00:1::1', '2002::',
+      'fc00::1', 'fd12:3456::1', 'fe80::1', 'febf::1', 'fec0::1', 'feff::1', 'ff02::1', '2001:db8::1', '100::1',
+      'not-an-ip', '1::2::3',
+    ]) expect(isPrivateAddress(a), a).toBe(true);
+  });
+
+  it('allows public addresses', async () => {
+    const { isPrivateAddress } = await load();
+    for (const a of ['104.16.0.35', '151.101.0.223', '198.20.0.1', '192.0.1.1', '2606:4700::6810:84e5', '2a04:4e42::223', '::ffff:151.101.0.223']) {
+      expect(isPrivateAddress(a), a).toBe(false);
+    }
   });
 });

@@ -20,6 +20,7 @@
 import { lookup } from 'node:dns';
 import http from 'node:http';
 import net from 'node:net';
+import { pathToFileURL } from 'node:url';
 
 const DEFAULT_ALLOW = ['registry.npmjs.org', 'registry.yarnpkg.com', 'pypi.org', 'files.pythonhosted.org'];
 
@@ -66,17 +67,52 @@ export function decide(host, port) {
   return { allow: true, reason: 'allowlisted' };
 }
 
+/** IPv6 text → eight 16-bit groups (handles "::" and a trailing dotted quad), or null when malformed. */
+function ipv6Groups(addr) {
+  let v = addr.toLowerCase();
+  const pct = v.indexOf('%');
+  if (pct !== -1) v = v.slice(0, pct);
+  const quad = /(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(v);
+  if (quad) {
+    const b = quad.slice(1).map(Number);
+    if (b.some((x) => x > 255)) return null;
+    v = `${v.slice(0, quad.index)}${((b[0] << 8) | b[1]).toString(16)}:${((b[2] << 8) | b[3]).toString(16)}`;
+  }
+  const halves = v.split('::');
+  if (halves.length > 2) return null;
+  const head = halves[0] ? halves[0].split(':') : [];
+  const tail = halves.length === 2 && halves[1] ? halves[1].split(':') : [];
+  const fill = halves.length === 2 ? 8 - head.length - tail.length : 0;
+  if (fill < 0 || (halves.length === 1 && head.length !== 8)) return null;
+  const groups = [...head, ...Array(fill).fill('0'), ...tail].map((g) => (/^[0-9a-f]{1,4}$/.test(g) ? parseInt(g, 16) : NaN));
+  return groups.length === 8 && groups.every((g) => Number.isInteger(g)) ? groups : null;
+}
+
 /** True for addresses an allowlisted public registry must never resolve to. */
 export function isPrivateAddress(addr) {
   if (net.isIPv4(addr)) {
-    const [a, b] = addr.split('.').map(Number);
+    const [a, b, c] = addr.split('.').map(Number);
     return a === 0 || a === 10 || a === 127 || (a === 169 && b === 254) || (a === 172 && b >= 16 && b <= 31)
-      || (a === 192 && b === 168) || (a === 100 && b >= 64 && b <= 127) || a >= 224;
+      || (a === 192 && b === 168) || (a === 100 && b >= 64 && b <= 127) || a >= 224
+      || (a === 198 && (b === 18 || b === 19)) // 198.18.0.0/15 benchmarking (often internal)
+      || (a === 192 && b === 0 && c === 0); // 192.0.0.0/24 IETF protocol assignments
   }
-  const v = addr.toLowerCase();
-  if (v.startsWith('::ffff:')) return isPrivateAddress(v.slice(7));
-  return v === '::' || v === '::1' || v.startsWith('fc') || v.startsWith('fd') || v.startsWith('fe8')
-    || v.startsWith('fe9') || v.startsWith('fea') || v.startsWith('feb') || v.startsWith('ff');
+  const g = ipv6Groups(addr);
+  if (!g) return true; // unparseable: refuse
+  const [g0, g1, g2, g3, g4, g5, g6, g7] = g;
+  const v4 = `${g6 >> 8}.${g6 & 255}.${g7 >> 8}.${g7 & 255}`;
+  if (g0 === 0 && g1 === 0 && g2 === 0 && g3 === 0 && g4 === 0) {
+    if (g5 === 0xffff) return isPrivateAddress(v4); // ::ffff:a.b.c.d (v4-mapped)
+    if (g5 === 0) return true; // ::, ::1 and ::a.b.c.d (deprecated v4-compatible)
+  }
+  if (g0 === 0x64 && g1 === 0xff9b) return true; // NAT64 64:ff9b::/96 and 64:ff9b:1::/48 (reach v4 internals)
+  if (g0 === 0x2002) return true; // 6to4 2002::/16 (embeds an arbitrary v4)
+  if (g0 === 0x2001 && g1 === 0x0db8) return true; // documentation
+  if (g0 === 0x0100 && g1 === 0 && g2 === 0 && g3 === 0) return true; // discard-only 100::/64
+  return (g0 & 0xfe00) === 0xfc00 // fc00::/7 unique local
+    || (g0 & 0xffc0) === 0xfe80 // fe80::/10 link-local
+    || (g0 & 0xffc0) === 0xfec0 // fec0::/10 site-local (deprecated)
+    || (g0 & 0xff00) === 0xff00; // multicast
 }
 
 /** dns.lookup wrapper that refuses private answers (unless PROXY_ALLOW_PRIVATE=1, tests only). */
@@ -162,11 +198,15 @@ server.on('connect', (req, client, head) => {
 server.on('clientError', (_err, socket) => reject(socket, 400, 'Bad Request'));
 
 server.maxConnections = MAX_CONN;
-server.listen(PORT, HOST, () => {
-  const addr = server.address();
-  log({ event: 'listening', port: typeof addr === 'object' && addr ? addr.port : PORT, allow: [...ALLOW], ports: [...ALLOW_PORTS] });
-});
 
-const stop = () => server.close(() => process.exit(0));
-process.on('SIGTERM', stop);
-process.on('SIGINT', stop);
+// Listen only when run as the entry point, so unit tests can import the pure helpers above.
+const isMain = process.argv[1] !== undefined && pathToFileURL(process.argv[1]).href === import.meta.url;
+if (isMain) {
+  server.listen(PORT, HOST, () => {
+    const addr = server.address();
+    log({ event: 'listening', port: typeof addr === 'object' && addr ? addr.port : PORT, allow: [...ALLOW], ports: [...ALLOW_PORTS] });
+  });
+  const stop = () => server.close(() => process.exit(0));
+  process.on('SIGTERM', stop);
+  process.on('SIGINT', stop);
+}
