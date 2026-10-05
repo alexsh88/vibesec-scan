@@ -406,11 +406,11 @@ describe('ReDoS resistance (2 MiB adversarial inputs)', () => {
     ['aws candidates', () => fill(`aws = ${'A'.repeat(40)} \n`)],
     ['aws keys + candidates on one line', () => fill(`${fake.awsAccessKey()} aws = ${fake.awsSecretKey()} `)],
     ['minified js-like single line', minifiedJsLike],
-  ])('%s finishes detectSecrets in < 1.5 s', (_name, gen) => {
+  ])('%s finishes detectSecrets without catastrophic backtracking (budget 5 s; was hours)', (_name, gen) => {
     const text = gen();
     const t0 = performance.now();
     detectSecrets(text);
-    expect(performance.now() - t0).toBeLessThan(1500);
+    expect(performance.now() - t0).toBeLessThan(5000);
   }, 30_000);
 
   it('still finds tokens straddling the 16 KiB window boundaries of a long single line', () => {

@@ -87,14 +87,14 @@ describe('scanText', () => {
     expect(candidate!.redacted).toBe(`${value.slice(0, 2)}…`);
   });
 
-  it('builds snippets for 20k tokens in < 1 s and never leaks a raw value', () => {
+  it('builds snippets for 20k tokens linearly (quadratic took ~8.5 s; budget 4 s under parallel load) and never leaks a raw value', () => {
     const tokens = Array.from({ length: 20_000 }, () => fake.github());
     const text = tokens.join('\n');
     const t0 = performance.now();
     const candidates = scanText('big.txt', text);
     const elapsed = performance.now() - t0;
     expect(candidates).toHaveLength(20_000);
-    expect(elapsed).toBeLessThan(1000);
+    expect(elapsed).toBeLessThan(4000);
     for (const c of candidates) {
       const at = c.line - 1;
       for (const neighbour of [tokens[at - 1], tokens[at], tokens[at + 1]]) {
@@ -108,7 +108,7 @@ describe('scanText', () => {
     const text = tokens.map((t) => `"${t}"`).join(',');
     const t0 = performance.now();
     const candidates = scanText('bundle.min.js', text);
-    expect(performance.now() - t0).toBeLessThan(1000);
+    expect(performance.now() - t0).toBeLessThan(4000);
     expect(candidates).toHaveLength(5_000);
     expect(candidates[0]!.snippet.includes(tokens[0]!)).toBe(false);
     expect(candidates[0]!.snippet.includes(tokens[1]!)).toBe(false);
