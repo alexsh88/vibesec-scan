@@ -1,0 +1,278 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+@import "@fontsource-variable/ibm-plex-sans";
+@import "@fontsource/ibm-plex-mono/400.css";
+@import "@fontsource/ibm-plex-mono/500.css";
+@import "@fontsource/ibm-plex-mono/600.css";
+
+@custom-variant dark (&:where(.dark, .dark *));
+
+/*
+ * VibeSec design tokens.
+ * Direction: "instrument panel" — graphite surfaces, hairline borders, mono labels, one signal colour
+ * (phosphor chartreuse) for brand + primary actions. Every other hue is reserved for meaning:
+ * severity (critical→info), grade (A→F) and scan state. Never use a severity colour decoratively.
+ */
+:root {
+  --radius: 0.5rem;
+
+  /* light theme */
+  --background: oklch(0.985 0.003 250);
+  --foreground: oklch(0.2 0.015 260);
+  --card: oklch(1 0 0);
+  --card-foreground: oklch(0.2 0.015 260);
+  --popover: oklch(1 0 0);
+  --popover-foreground: oklch(0.2 0.015 260);
+  --primary: oklch(0.24 0.02 260);
+  --primary-foreground: oklch(0.97 0.01 125);
+  --secondary: oklch(0.955 0.005 250);
+  --secondary-foreground: oklch(0.25 0.015 260);
+  --muted: oklch(0.955 0.005 250);
+  --muted-foreground: oklch(0.5 0.015 260);
+  --accent: oklch(0.945 0.008 250);
+  --accent-foreground: oklch(0.2 0.015 260);
+  --destructive: oklch(0.56 0.22 22);
+  --border: oklch(0.905 0.007 255);
+  --input: oklch(0.88 0.008 255);
+  --ring: oklch(0.62 0.17 132);
+
+  --signal: oklch(0.62 0.17 132);
+  --signal-foreground: oklch(0.99 0 0);
+  --signal-soft: oklch(0.62 0.17 132 / 0.12);
+  --surface-raised: oklch(0.975 0.004 250);
+  --grid-line: oklch(0.2 0.02 260 / 0.045);
+
+  /* severity — text/icon colour, soft fill and border for badges */
+  --sev-critical: oklch(0.55 0.22 18);
+  --sev-high: oklch(0.6 0.18 42);
+  --sev-medium: oklch(0.64 0.15 75);
+  --sev-low: oklch(0.55 0.13 245);
+  --sev-info: oklch(0.55 0.02 260);
+
+  /* grades */
+  --grade-a: oklch(0.6 0.15 150);
+  --grade-b: oklch(0.65 0.15 125);
+  --grade-c: oklch(0.68 0.15 80);
+  --grade-d: oklch(0.62 0.18 45);
+  --grade-f: oklch(0.56 0.22 20);
+
+  /* scan / finding status */
+  --status-new: oklch(0.55 0.17 290);
+  --status-existing: oklch(0.55 0.02 260);
+  --status-fixed: oklch(0.58 0.15 150);
+  --status-triaged: oklch(0.55 0.08 220);
+  --state-running: oklch(0.6 0.15 230);
+
+  --chart-1: var(--sev-critical);
+  --chart-2: var(--sev-high);
+  --chart-3: var(--sev-medium);
+  --chart-4: var(--sev-low);
+  --chart-5: var(--sev-info);
+}
+
+.dark {
+  --background: oklch(0.155 0.008 260);
+  --foreground: oklch(0.94 0.006 250);
+  --card: oklch(0.185 0.009 260);
+  --card-foreground: oklch(0.94 0.006 250);
+  --popover: oklch(0.2 0.01 260);
+  --popover-foreground: oklch(0.94 0.006 250);
+  --primary: oklch(0.9 0.19 125);
+  --primary-foreground: oklch(0.18 0.03 130);
+  --secondary: oklch(0.235 0.01 260);
+  --secondary-foreground: oklch(0.92 0.006 250);
+  --muted: oklch(0.225 0.01 260);
+  --muted-foreground: oklch(0.66 0.015 255);
+  --accent: oklch(0.25 0.012 260);
+  --accent-foreground: oklch(0.96 0.006 250);
+  --destructive: oklch(0.65 0.21 22);
+  --border: oklch(1 0 0 / 0.085);
+  --input: oklch(1 0 0 / 0.12);
+  --ring: oklch(0.9 0.19 125 / 0.7);
+
+  --signal: oklch(0.9 0.19 125);
+  --signal-foreground: oklch(0.18 0.03 130);
+  --signal-soft: oklch(0.9 0.19 125 / 0.1);
+  --surface-raised: oklch(0.205 0.01 260);
+  --grid-line: oklch(1 0 0 / 0.035);
+
+  --sev-critical: oklch(0.68 0.22 18);
+  --sev-high: oklch(0.75 0.17 48);
+  --sev-medium: oklch(0.84 0.15 85);
+  --sev-low: oklch(0.74 0.12 240);
+  --sev-info: oklch(0.7 0.02 260);
+
+  --grade-a: oklch(0.78 0.16 150);
+  --grade-b: oklch(0.86 0.17 125);
+  --grade-c: oklch(0.84 0.15 85);
+  --grade-d: oklch(0.75 0.17 48);
+  --grade-f: oklch(0.68 0.22 18);
+
+  --status-new: oklch(0.74 0.15 290);
+  --status-existing: oklch(0.68 0.02 260);
+  --status-fixed: oklch(0.78 0.15 150);
+  --status-triaged: oklch(0.74 0.08 220);
+  --state-running: oklch(0.76 0.13 230);
+}
+
+@theme inline {
+  --font-sans: "IBM Plex Sans Variable", "IBM Plex Sans", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "IBM Plex Mono", ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
+
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --color-chart-1: var(--chart-1);
+  --color-chart-2: var(--chart-2);
+  --color-chart-3: var(--chart-3);
+  --color-chart-4: var(--chart-4);
+  --color-chart-5: var(--chart-5);
+
+  --color-signal: var(--signal);
+  --color-signal-foreground: var(--signal-foreground);
+  --color-signal-soft: var(--signal-soft);
+  --color-surface-raised: var(--surface-raised);
+
+  --color-sev-critical: var(--sev-critical);
+  --color-sev-high: var(--sev-high);
+  --color-sev-medium: var(--sev-medium);
+  --color-sev-low: var(--sev-low);
+  --color-sev-info: var(--sev-info);
+
+  --color-grade-a: var(--grade-a);
+  --color-grade-b: var(--grade-b);
+  --color-grade-c: var(--grade-c);
+  --color-grade-d: var(--grade-d);
+  --color-grade-f: var(--grade-f);
+
+  --color-status-new: var(--status-new);
+  --color-status-existing: var(--status-existing);
+  --color-status-fixed: var(--status-fixed);
+  --color-status-triaged: var(--status-triaged);
+  --color-state-running: var(--state-running);
+
+  --animate-pulse-dot: pulse-dot 1.6s ease-in-out infinite;
+  --animate-rise: rise 0.5s cubic-bezier(0.2, 0.7, 0.2, 1) both;
+}
+
+@keyframes pulse-dot {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.45; transform: scale(0.8); }
+}
+
+@keyframes rise {
+  from { opacity: 0; transform: translateY(6px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+  }
+  html {
+    color-scheme: light;
+  }
+  html.dark {
+    color-scheme: dark;
+  }
+  body {
+    @apply bg-background text-foreground antialiased;
+    font-feature-settings: "ss02", "tnum" 0;
+    min-height: 100dvh;
+  }
+  code, kbd, samp, pre {
+    @apply font-mono;
+    font-size: 0.92em;
+  }
+  ::selection {
+    background: var(--signal-soft);
+  }
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after {
+      animation-duration: 0.01ms !important;
+      animation-iteration-count: 1 !important;
+      transition-duration: 0.01ms !important;
+    }
+  }
+}
+
+@layer components {
+  /* Small uppercase mono label used for section eyebrows, table headers and metadata keys. */
+  .eyebrow {
+    @apply font-mono text-[11px] font-medium tracking-[0.12em] text-muted-foreground uppercase;
+  }
+  /* Faint blueprint grid for hero/empty surfaces. */
+  .bg-grid {
+    background-image:
+      linear-gradient(to right, var(--grid-line) 1px, transparent 1px),
+      linear-gradient(to bottom, var(--grid-line) 1px, transparent 1px);
+    background-size: 32px 32px;
+  }
+  /* Inline code reference: file paths, rule ids, package@version. */
+  .code-ref {
+    @apply rounded-sm bg-muted px-1.5 py-0.5 font-mono text-[0.85em] text-foreground;
+  }
+  .tabular {
+    font-variant-numeric: tabular-nums;
+  }
+}
+
+/* ---- Code viewer (Shiki dual theme via CSS variables, see lib/highlighter.ts) ---- */
+@layer components {
+  .vs-code pre.shiki {
+    margin: 0;
+    background: transparent !important;
+    font-family: var(--font-mono);
+    tab-size: 2;
+  }
+  .vs-code .shiki,
+  .vs-code .shiki span {
+    color: var(--shiki-light, var(--foreground));
+  }
+  .dark .vs-code .shiki,
+  .dark .vs-code .shiki span {
+    color: var(--shiki-dark, var(--foreground));
+  }
+  .vs-code .line {
+    display: inline-block;
+    width: 100%;
+    min-width: max-content;
+    padding: 0 1rem;
+    border-left: 2px solid transparent;
+  }
+  .vs-code .line.line-hl {
+    background: color-mix(in oklab, var(--sev-high) 11%, transparent);
+    border-left-color: var(--sev-high);
+  }
+  .vs-code-numbered .line::before {
+    counter-increment: line;
+    content: counter(line);
+    display: inline-block;
+    width: 3.5ch;
+    margin-right: 1.25rem;
+    text-align: right;
+    color: var(--muted-foreground);
+    opacity: 0.55;
+    user-select: none;
+  }
+}

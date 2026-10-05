@@ -8,12 +8,16 @@
     "test:watch": "vitest",
     "typecheck": "npm run typecheck --workspaces --if-present",
     "dev:api": "npm run dev -w @vibesec/api",
+    "dev:web": "npm run dev -w @vibesec/web",
+    "dev": "concurrently -k -n api,web -c cyan,green \"npm:dev:api\" \"npm:dev:web\"",
+    "build:web": "npm run build -w @vibesec/web",
     "llm:smoke": "npm run llm:smoke -w @vibesec/api",
     "eval:vuln-app": "npm run eval:vuln-app -w @vibesec/api --",
     "sandbox:build": "node scripts/sandbox-build.mjs"
   },
   "devDependencies": {
     "@types/node": "^24.0.0",
+    "concurrently": "^10.0.5",
     "tsx": "^4.20.0",
     "typescript": "^5.9.0",
     "vitest": "^3.2.0"
