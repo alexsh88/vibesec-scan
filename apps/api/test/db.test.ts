@@ -16,7 +16,7 @@ function seed() {
 describe('migrations', () => {
   it('sets user_version to latest', () => {
     const db = memoryDb();
-    expect(db.pragma('user_version', { simple: true })).toBe(3);
+    expect(db.pragma('user_version', { simple: true })).toBe(4);
   });
 });
 
