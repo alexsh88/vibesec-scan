@@ -19,8 +19,14 @@ export class AnthropicTransport implements LlmTransport {
       // adaptive thinking (the SDK's own non-streaming sizing is ~60min * maxTokens/128000), and
       // passing an explicit `timeout` bypasses the SDK's "streaming required" guard for large
       // max_tokens. Stream instead and read the accumulated result (#I-2).
+      //
+      // Only the JSON schema is sent — never zodOutputFormat's `parse` hook. With that hook the SDK
+      // parses + zod-validates the reply itself at message_stop and throws a plain AnthropicError on a
+      // max_tokens-truncated or constraint-violating reply (maxLength/maxItems are only advisory in the
+      // server-side schema). That surfaced as a generic permanent INTERNAL error: no repair turn, no
+      // truncation detection, a failed call in llm_calls. LlmClient owns parsing, repair and truncation.
       const outputConfig = {
-        ...(req.schema ? { format: zodOutputFormat(req.schema) } : {}),
+        ...(req.schema ? { format: jsonSchemaFormat(req.schema) } : {}),
         ...(req.effort ? { effort: req.effort } : {}),
       };
       const stream = this.client.messages.stream({
@@ -40,7 +46,13 @@ export class AnthropicTransport implements LlmTransport {
   }
 }
 
-const CONTEXT_TOO_LARGE = /prompt is too long|too many tokens|context (window|length)|exceeds the maximum/i;
+/** The server-side structured-output format for `schema`, without the SDK's client-side parse hook. */
+function jsonSchemaFormat(schema: NonNullable<LlmRequest['schema']>): { type: 'json_schema'; schema: Record<string, unknown> } {
+  const { type, schema: jsonSchema } = zodOutputFormat(schema as Parameters<typeof zodOutputFormat>[0]);
+  return { type, schema: jsonSchema };
+}
+
+const CONTEXT_TOO_LARGE =/prompt is too long|too many tokens|context (window|length)|exceeds the maximum/i;
 
 /**
  * `retry-after-ms` (milliseconds) takes priority over the standard `retry-after` (seconds)

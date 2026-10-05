@@ -64,6 +64,46 @@ describe('AnthropicTransport', () => {
     expect(plain.tools).toBeUndefined();
   });
 
+  it('sends the JSON schema without a client-side parse hook, so validation stays with LlmClient (repair turn / truncation)', async () => {
+    const { t, stream } = transport();
+    await t.send(req(), new AbortController().signal);
+    const [params] = stream.mock.calls[0] as unknown as [Record<string, any>];
+    expect(params.output_config.format.type).toBe('json_schema');
+    expect(params.output_config.format.schema).toBeTypeOf('object');
+    expect('parse' in params.output_config.format).toBe(false);
+  });
+
+  describe('with the real SDK stream (fake fetch)', () => {
+    /** One streamed reply whose text is `text` and whose stop_reason is `stopReason`. */
+    function sse(text: string, stopReason: string): Response {
+      const events: Array<[string, unknown]> = [
+        ['message_start', { type: 'message_start', message: { id: 'msg_1', type: 'message', role: 'assistant', model: 'claude-haiku-4-5', content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: 10, output_tokens: 0 } } }],
+        ['content_block_start', { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } }],
+        ['content_block_delta', { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text } }],
+        ['content_block_stop', { type: 'content_block_stop', index: 0 }],
+        ['message_delta', { type: 'message_delta', delta: { stop_reason: stopReason, stop_sequence: null }, usage: { output_tokens: 4096 } }],
+        ['message_stop', { type: 'message_stop' }],
+      ];
+      const body = events.map(([e, d]) => `event: ${e}\ndata: ${JSON.stringify(d)}\n\n`).join('');
+      return new Response(body, { status: 200, headers: { 'content-type': 'text/event-stream' } });
+    }
+    const realTransport = (res: () => Response) =>
+      new AnthropicTransport(new Anthropic({ apiKey: 'test-key', maxRetries: 0, fetch: (async () => res()) as unknown as typeof fetch }), 10_000);
+
+    it('returns a max_tokens-truncated reply (incomplete JSON) instead of throwing a generic SDK parse error', async () => {
+      const t = realTransport(() => sse('{"verdict":"vulnerable","reason":"the inp', 'max_tokens'));
+      const msg = await t.send(req({ model: 'claude-haiku-4-5', thinking: false, effort: undefined }), new AbortController().signal);
+      expect(msg.stop_reason).toBe('max_tokens');
+    });
+
+    it('returns schema-invalid JSON as-is so LlmClient can run its repair turn', async () => {
+      const t = realTransport(() => sse('{"verdict":"maybe","reason":"x"}', 'end_turn'));
+      const msg = await t.send(req({ model: 'claude-haiku-4-5', thinking: false, effort: undefined }), new AbortController().signal);
+      expect(msg.stop_reason).toBe('end_turn');
+      expect(msg.content[0]).toMatchObject({ type: 'text', text: '{"verdict":"maybe","reason":"x"}' });
+    });
+  });
+
   it('maps errors thrown while finalizing the stream to AppErrors', async () => {
     const { t, stream } = transport();
     stream.mockReturnValueOnce({

@@ -41,6 +41,7 @@ import { toAppError } from '../../errors/AppError';
 import type { Entrypoint, ImportEdge, IndexedFile } from '../../index/types';
 import type { WorkLease } from '../../llm/budget';
 import { NO_LEASE, tokensForBytes, type BudgetLanes } from '../../llm/budgetLanes';
+import { formatFailureReasons, llmFailureReason, type LlmFailureReason } from '../../llm/failureReason';
 import type { LlmClient, StructuredCall } from '../../llm/LlmClient';
 import type { MockResponder } from '../../llm/mockTransport';
 import { estimateTokens, untrustedFile, untrustedText } from '../../llm/prompt';
@@ -429,7 +430,7 @@ export function createSastAnalyzer(deps: SastAnalyzerDeps): Analyzer {
 
     const byFingerprint = new Map<string, Finding>();
     let dropped = 0;
-    let warnedPartial = false;
+    const failures = new Map<LlmFailureReason, number>();
     const exhausted: Record<SastPass, boolean> = { deep: false, fast: false };
     let done = 0;
 
@@ -479,10 +480,8 @@ export function createSastAnalyzer(deps: SastAnalyzerDeps): Analyzer {
           return;
         }
         record(path, 'failed');
-        if (!warnedPartial) {
-          warnedPartial = true;
-          ctx.warn('SAST_PARTIAL', 'AI code review failed for one or more files; those files have no SAST findings');
-        }
+        const reason = llmFailureReason(err);
+        failures.set(reason, (failures.get(reason) ?? 0) + 1);
         return;
       } finally {
         ctx.touch();
@@ -512,6 +511,10 @@ export function createSastAnalyzer(deps: SastAnalyzerDeps): Analyzer {
       }
     });
 
+    if (failures.size > 0) {
+      const failed = [...failures.values()].reduce((a, b) => a + b, 0);
+      ctx.warn('SAST_PARTIAL', `AI code review failed for ${failed} file(s) (${formatFailureReasons(failures)}); those files have no SAST findings`);
+    }
     if (dropped > 0) {
       ctx.warn('SAST_UNVERIFIED_DROPPED', `${dropped} AI-reported issue(s) were dropped because the cited code could not be found in the reviewed file`);
     }
