@@ -24,6 +24,7 @@ import type { MockResponder } from '../../../llm/mockTransport';
 import { untrustedFile } from '../../../llm/prompt';
 import type { LlmRequest } from '../../../llm/transport';
 import type { IndexedFile, Language } from '../../../index/types';
+import { reusablePaths, reusedFindings } from '../../reuse';
 import type { Analyzer, AnalyzerContext, CoverageStatus } from '../../types';
 import { issueToFinding } from '../toFinding';
 import type { RawCodeIssue } from '../types';
@@ -299,10 +300,14 @@ export function createQualityAnalyzer(deps: QualityAnalyzerDeps): Analyzer {
       const metricsByPath = new Map(metrics.map((m) => [m.path, m]));
       const textByPath = new Map(withLang.map((f) => [f.path, f.text]));
       for (const f of candidates) if (!contentOf.has(f.path)) record(f.path, 'failed');
-      const selected = rankFilesForQualityReview(metrics);
+      const ranked = rankFilesForQualityReview(metrics);
+      // Incremental rescan: unchanged files the base scan reviewed keep their findings (re-attached), no call.
+      const reused = reusablePaths(ctx, 'quality', ranked);
+      for (const path of reused) record(path, 'cached');
+      const selected = ranked.filter((p) => !reused.has(p));
       let budgetExhausted = false;
 
-      const findings: Finding[] = [];
+      const findings: Finding[] = reusedFindings(ctx, 'quality', reused);
       const failures = new Map<LlmFailureReason, number>();
 
       await forEachLimit(selected, REVIEW_CONCURRENCY, async (path) => {

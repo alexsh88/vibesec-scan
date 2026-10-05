@@ -18,7 +18,7 @@ import { loadConfig } from '../src/config';
 import { createContainer, type Container, type ContainerOverrides } from '../src/container';
 import type { GitHubClient, RepoMeta } from '../src/github/GitHubClient';
 import { buildApp } from '../src/http/app';
-import { createFixtureRepo, type FixtureRepo } from '../test/fixtures/gitRepo';
+import { createFixtureRepo, type FixtureCommit, type FixtureRepo } from '../test/fixtures/gitRepo';
 
 // apps/api/scripts -> apps/api -> apps -> <repo root>
 export const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
@@ -118,8 +118,8 @@ export type VulnAppHarness = {
   container: Container;
   app: FastifyInstance;
   repo: FixtureRepo;
-  /** Starts a scan of the fixture over HTTP and waits until the runner is idle. */
-  scan(options?: Partial<ScanOptions>): Promise<{ scanId: string; durationMs: number }>;
+  /** Starts a scan of the fixture (default branch, or `ref`) over HTTP and waits until the runner is idle. */
+  scan(options?: Partial<ScanOptions>, ref?: string): Promise<{ scanId: string; durationMs: number }>;
   close(): Promise<void>;
 };
 
@@ -129,10 +129,13 @@ export type VulnAppHarnessOptions = {
   /** OSV/registry fetch; omit for the real network (live mode). */
   fetch?: typeof fetch;
   wrapTransport?: ContainerOverrides['wrapTransport'];
+  /** The fixture repo's history, built from the vuln-app files (default: one commit with all of them). */
+  commits?: (files: Record<string, string>) => FixtureCommit[];
 };
 
 export async function startVulnAppHarness(opts: VulnAppHarnessOptions = {}): Promise<VulnAppHarness> {
-  const repo = await createFixtureRepo([{ files: await readVulnAppFiles() }]);
+  const files = await readVulnAppFiles();
+  const repo = await createFixtureRepo(opts.commits ? opts.commits(files) : [{ files }]);
   const workDir = await mkdtemp(join(tmpdir(), 'vibesec-vuln-app-'));
   const config = loadConfig({
     ...(opts.env ?? {}),
@@ -151,11 +154,11 @@ export async function startVulnAppHarness(opts: VulnAppHarnessOptions = {}): Pro
 
   return {
     container, app, repo,
-    async scan(options = {}) {
+    async scan(options = {}, ref) {
       const started = Date.now();
       const res = await app.inject({
         method: 'POST', url: '/api/scans', headers: { 'idempotency-key': randomUUID() },
-        payload: { repoUrl: 'https://github.com/acme/vuln-app', options },
+        payload: { repoUrl: 'https://github.com/acme/vuln-app', options, ...(ref ? { ref } : {}) },
       });
       if (res.statusCode !== 202) throw new Error(`scan was not accepted (${res.statusCode}): ${res.body}`);
       const scanId = (res.json() as { scanId: string }).scanId;

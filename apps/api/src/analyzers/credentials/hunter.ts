@@ -46,6 +46,7 @@ import type { RawCodeIssue } from '../code/types';
 import type { TriageService } from '../code/triage';
 import type { WorkLease } from '../../llm/budget';
 import { NO_LEASE, type BudgetLanes } from '../../llm/budgetLanes';
+import { reusablePaths, reusedFindings } from '../reuse';
 import type { Analyzer, AnalyzerContext, CoverageStatus } from '../types';
 import { detectSecrets, redact, secretHash } from './rules';
 import { scanText } from './scanText';
@@ -510,8 +511,13 @@ export function createCredentialHunter(deps: CredentialHunterDeps): Analyzer {
       checkAbort();
       const credentialRiskPaths = new Set([...triageResult.files.values()].filter((f) => f.credentialRisk).map((f) => f.path));
 
-      const selected = selectHunterFiles(ctx.files, credentialRiskPaths, maxFileBytes);
-      if (selected.length === 0) return [];
+      const candidates = selectHunterFiles(ctx.files, credentialRiskPaths, maxFileBytes);
+      // Incremental rescan: unchanged files the base scan hunted keep their findings (re-attached), no call.
+      const reused = reusablePaths(ctx, 'credential-hunter', candidates.map((f) => f.path));
+      for (const path of reused) record(path, 'cached');
+      const reusedResults = reusedFindings(ctx, 'credential-hunter', reused);
+      const selected = candidates.filter((f) => !reused.has(f.path));
+      if (selected.length === 0) return reusedResults;
 
       const contentOf = new Map<string, string>();
       await forEachLimit(selected, READ_CONCURRENCY, async (f) => {
@@ -521,7 +527,7 @@ export function createCredentialHunter(deps: CredentialHunterDeps): Analyzer {
         ctx.touch();
       });
       for (const f of selected) if (!contentOf.has(f.path)) record(f.path, 'failed');
-      if (contentOf.size === 0) return [];
+      if (contentOf.size === 0) return reusedResults;
 
       const regexCoveredLines = regexCoverage(contentOf);
 
@@ -535,7 +541,7 @@ export function createCredentialHunter(deps: CredentialHunterDeps): Analyzer {
       lease.project(remainingUsd);
       let budgetExhausted = false;
 
-      const findings: Finding[] = [];
+      const findings: Finding[] = [...reusedResults];
       let warnedPartial = false;
       for (const batch of batches) {
         checkAbort();

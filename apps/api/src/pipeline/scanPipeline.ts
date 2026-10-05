@@ -4,6 +4,7 @@ import type { CoverageRepo } from '../db/coverageRepo';
 import type { FindingRepo } from '../db/findingRepo';
 import type { FixPlanRepo } from '../db/fixPlanRepo';
 import type { IndexRepo } from '../db/indexRepo';
+import type { LlmCallRepo } from '../db/llmCallRepo';
 import type { ScanCacheKeys, ScanRepo } from '../db/scanRepo';
 import type { SummaryRepo } from '../db/summaryRepo';
 import { AppError, toAppError } from '../errors/AppError';
@@ -21,19 +22,22 @@ import { verifyStage } from './stages/verifyStage';
 import type { Pipeline, PipelineContext, StageSpec } from './types';
 
 export type ScanPipelineDeps = Omit<ResolveDeps, 'git' | 'scans'> & Omit<IndexDeps, 'git' | 'indexRepo'> & {
-  git: Pick<GitService, 'remoteUrl' | 'resolveRef' | 'ensureCheckout' | 'removeScanDir' | 'repoDir'>;
-  scans: Pick<ScanRepo, 'updateRepoMeta' | 'setCommitSha' | 'getDto' | 'setCacheKeys' | 'findFullCacheSource' | 'setReuse' | 'getDiagnostics'>;
+  git: Pick<GitService, 'remoteUrl' | 'resolveRef' | 'ensureCheckout' | 'removeScanDir' | 'repoDir' | 'diffNameStatus' | 'fetchCommit'>;
+  scans: Pick<ScanRepo,
+    | 'updateRepoMeta' | 'setCommitSha' | 'getRow' | 'getDto' | 'setCacheKeys' | 'findFullCacheSource' | 'findIncrementalBase'
+    | 'setReuse' | 'getDiagnostics'>;
   indexRepo: Pick<IndexRepo, 'replace' | 'files' | 'imports' | 'entrypoints' | 'stats'>;
   analyzers: readonly Analyzer[];
   findings: FindingRepo;
   coverage: CoverageRepo;
   fixPlans: Pick<FixPlanRepo, 'get' | 'save'>;
   summaries: Pick<SummaryRepo, 'get' | 'save'>;
+  llmCalls: Pick<LlmCallRepo, 'byAnalyzer'>;
   /** VERIFYING's skeptic pass and SYNTHESIZING's summary. */
   llm: Pick<LlmClient, 'structured'>;
   /** Re-applies the repo's triage decisions after SCORING. */
   suppressions: Pick<SuppressionService, 'applySuppressions'>;
-  /** The scan's cache keys (scans/cacheKeys.ts); omit to disable the full-scan cache. */
+  /** The scan's cache keys (scans/cacheKeys.ts); omit to disable the full-scan cache and incremental rescans. */
   cacheKeys?: (options: ScanOptions) => ScanCacheKeys;
   /** One DB transaction (the full-scan cache copy). */
   atomically: <T>(fn: () => T) => T;
@@ -69,8 +73,8 @@ function scoringStage(deps: ScanPipelineDeps): StageSpec {
 }
 
 /**
- * RESOLVING (+ full-scan cache) → CLONING → INDEXING → ANALYZING → VERIFYING → SCORING (+ suppressions)
- * → SYNTHESIZING. Every stage is idempotent, so
+ * RESOLVING (+ full-scan cache) → CLONING → INDEXING → ANALYZING (incremental when a base exists) →
+ * VERIFYING → SCORING (+ suppressions) → SYNTHESIZING. Every stage is idempotent, so
  * JobRunner's resume (skip checkpointed stages, re-run the interrupted one) is safe.
  */
 export function createScanPipeline(deps: ScanPipelineDeps): Pipeline {
@@ -81,7 +85,10 @@ export function createScanPipeline(deps: ScanPipelineDeps): Pipeline {
       cacheKeys ? withFullScanCache(resolve, { ...deps, cacheKeys }) : resolve,
       cloneStage(deps),
       indexStage(deps),
-      analyzeStage({ analyzers: deps.analyzers, findings: deps.findings, indexRepo: deps.indexRepo, git: deps.git, coverage: deps.coverage }),
+      analyzeStage({
+        analyzers: deps.analyzers, findings: deps.findings, indexRepo: deps.indexRepo, git: deps.git, coverage: deps.coverage,
+        ...(cacheKeys ? { incremental: deps } : {}),
+      }),
       verifyStage({ findings: deps.findings, llm: deps.llm, git: deps.git }),
       scoringStage(deps),
       createSynthesizeStage({

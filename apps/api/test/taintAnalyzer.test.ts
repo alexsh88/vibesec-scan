@@ -3,12 +3,12 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import type Anthropic from '@anthropic-ai/sdk';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
-import { FindingSchema, ScanOptionsSchema, type ScanDto } from '@vibesec/shared';
+import { FindingSchema, ScanOptionsSchema, type Finding, type ScanDto } from '@vibesec/shared';
 import type { ReportFlowInput } from '../src/analyzers/code/repoTools';
 import { createTaintAnalyzer, TAINT_TASK_MARKER, taintMockResponder, toTaintRuleId, type TaintAnalyzerDeps } from '../src/analyzers/code/taint';
 import { codeTriageMockResponder, TriageService } from '../src/analyzers/code/triage';
 import type { FileTriage, TraceStep, TriageResult } from '../src/analyzers/code/types';
-import type { AnalyzerContext } from '../src/analyzers/types';
+import type { AnalyzerContext, CoverageStatus, IncrementalContext } from '../src/analyzers/types';
 import { LlmCallRepo } from '../src/db/llmCallRepo';
 import { ScanRepo } from '../src/db/scanRepo';
 import { TriageCacheRepo } from '../src/db/triageCacheRepo';
@@ -358,5 +358,62 @@ describe('taint analyzer', () => {
     } as LlmRequest;
     expect(taintMockResponder(req)).toMatchObject({ content: [{ type: 'tool_use', name: 'read_file' }, { type: 'tool_use', name: 'get_imports' }] });
     expect(taintMockResponder({ ...req, system: [{ type: 'text', text: 'other' }] })).toBeUndefined();
+  });
+});
+
+describe('taint analyzer — incremental rescans', () => {
+  function incremental(base: Finding[], opts: { affected?: string[]; baseStatus?: CoverageStatus } = {}): IncrementalContext {
+    return {
+      baseScanId: 'base-scan', baseCommitSha: 'b'.repeat(40),
+      changed: new Set(['src/a.ts']), affected: new Set(['src/a.ts', ...(opts.affected ?? [])]), deleted: new Set(),
+      baseFindings: (a) => (a === 'taint' ? base : []),
+      baseCoverage: (a) => new Map(a === 'taint' ? [['src/route.ts', opts.baseStatus ?? 'reviewed']] : []),
+    };
+  }
+  async function baseRun(): Promise<Finding[]> {
+    const { llm, scanId } = llmSetup([script([mockToolUse('report_flow', flow())])]);
+    return analyzer(llm).run(makeCtx(scanId).ctx);
+  }
+  function rescan(base: Finding[], opts: Parameters<typeof incremental>[1] = {}) {
+    const { llm, seen, scanId } = llmSetup([script([mockToolUse('report_flow', flow())])]);
+    const { ctx } = makeCtx(scanId);
+    const coverage = new Map<string, CoverageStatus>();
+    ctx.recordCoverage = (a, p, s) => { if (a === 'taint') coverage.set(p, s); };
+    ctx.incremental = incremental(base, opts);
+    return { run: () => analyzer(llm).run(ctx), seen, coverage, scanId };
+  }
+
+  it('re-attaches an unaffected entrypoint\'s flow after re-validating every step, without an agent call', async () => {
+    const base = await baseRun();
+    const r = rescan(base);
+    const findings = await r.run();
+    expect(r.seen).toHaveLength(0);
+    expect(r.coverage.get('src/route.ts')).toBe('cached');
+    expect(findings).toHaveLength(1);
+    expect(FindingSchema.parse(findings[0])).toMatchObject({ scanId: r.scanId, fingerprint: base[0]!.fingerprint, scanStatus: 'new' });
+    expect(findings[0]!.id).not.toBe(base[0]!.id);
+    expect(findings[0]!.taintTrace).toEqual(base[0]!.taintTrace);
+  });
+
+  it('drops a base flow that no longer verifies and traces its entrypoint again', async () => {
+    const [good] = await baseRun();
+    const stale: Finding = { ...good!, taintTrace: good!.taintTrace!.map((s) => (s.kind === 'sink' ? { ...s, code: 'return pool.rawQuery(sqlText, extra);' } : s)) };
+    const r = rescan([stale]);
+    const findings = await r.run();
+    expect(r.seen.length).toBeGreaterThan(0);
+    expect(r.coverage.get('src/route.ts')).toBe('reviewed');
+    expect(findings).toHaveLength(1);
+    expect(findings[0]!.taintTrace!.at(-1)!.code).toBe('  return pool.query(sql);');
+  });
+
+  it('traces affected entrypoints (and ones the base scan did not cover) again', async () => {
+    const base = await baseRun();
+    const affected = rescan(base, { affected: ['src/route.ts'] });
+    await affected.run();
+    expect(affected.seen.length).toBeGreaterThan(0);
+    expect(affected.coverage.get('src/route.ts')).toBe('reviewed');
+    const skipped = rescan(base, { baseStatus: 'budget-skipped' });
+    await skipped.run();
+    expect(skipped.seen.length).toBeGreaterThan(0);
   });
 });

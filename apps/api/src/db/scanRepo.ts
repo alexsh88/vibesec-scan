@@ -138,6 +138,15 @@ export class ScanRepo {
     ).get(repoId, commitSha, keys.resultOptionsHash, keys.analyzerVersionsHash, excludeId) as ScanRow | undefined;
   }
 
+  /** Incremental rescans: the latest completed scan of the same repo + configuration at a DIFFERENT commit. */
+  findIncrementalBase(repoId: string, commitSha: string, keys: ScanCacheKeys, excludeId: string): ScanRow | undefined {
+    return this.db.prepare(
+      `SELECT * FROM scans WHERE repo_id = ? AND commit_sha IS NOT NULL AND commit_sha <> ? AND result_options_hash = ?
+         AND analyzer_versions_hash = ? AND state IN ${COMPLETED_SQL} AND id <> ?
+       ORDER BY finished_at DESC, rowid DESC LIMIT 1`,
+    ).get(repoId, commitSha, keys.resultOptionsHash, keys.analyzerVersionsHash, excludeId) as ScanRow | undefined;
+  }
+
   findActiveDuplicate(repoId: string, ref: string | null, optionsHash: string): ScanRow | undefined {
     return this.db.prepare(
       `SELECT * FROM scans WHERE repo_id = ? AND ref IS ? AND options_hash = ? AND state NOT IN ${TERMINAL_SQL}

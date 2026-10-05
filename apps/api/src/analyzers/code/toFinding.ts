@@ -12,7 +12,7 @@ function normalizeSnippet(snippet: string): string {
 }
 
 /** Code findings quote real code: any credential the regex rules recognize in it is masked first. */
-function maskCredentials(text: string): string {
+export function maskCredentials(text: string): string {
   let out = text;
   for (const m of detectSecrets(text, { includeRedactOnly: true })) {
     if (m.value.length > 0) out = out.split(m.value).join(redact(m.value, m.type));

@@ -173,6 +173,22 @@ export class GitService {
   }
 
   /**
+   * Fetches one commit (trees only, blobs stay lazy) into an existing clone, e.g. an incremental
+   * rescan's base commit that is no longer reachable from the advertised refs. False when the remote
+   * does not have it (force-push / history rewrite) — the caller then runs a full scan.
+   */
+  async fetchCommit(dir: string, sha: string, call: GitCallOptions = {}): Promise<boolean> {
+    if (!SHA_RE.test(sha)) return false;
+    try {
+      await this.git(['fetch', '--filter=blob:none', '--no-tags', '--', 'origin', sha], { ...call, cwd: dir, timeoutMs: this.opts.cloneTimeoutMs });
+      return true;
+    } catch (err) {
+      if (err instanceof AppError && (err.kind === 'cancelled' || call.signal?.aborted)) throw err;
+      return false;
+    }
+  }
+
+  /**
    * Unified-0 patches of the last `depth` commits reachable from HEAD (newest first), with a NUL-prefixed
    * `\0COMMIT <sha>` marker line before each commit's patch so a parser can't be fooled by file content.
    * depth <= 0 returns `{ text: '', truncated: false }` without running git. `token` is only needed for a

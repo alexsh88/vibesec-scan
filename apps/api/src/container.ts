@@ -160,7 +160,7 @@ export function createContainer(config: Config, overrides: ContainerOverrides = 
   };
   const pipeline = overrides.pipeline ?? createScanPipeline({
     git, github, scans, indexRepo, indexer, maxRepoBytes: config.maxRepoBytes, maxFiles: config.maxFiles,
-    analyzers, findings, coverage: new CoverageRepo(db), fixPlans, summaries, llm, suppressions,
+    analyzers, findings, coverage: new CoverageRepo(db), fixPlans, summaries, llmCalls, llm, suppressions,
     cacheKeys: (options) => scanCacheKeys(options, resultConfig),
     atomically: (fn) => lifecycle.atomically(fn),
     onFinished: (scanId) => {

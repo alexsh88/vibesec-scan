@@ -30,7 +30,8 @@ import { NO_LEASE, type BudgetLanes } from '../../llm/budgetLanes';
 import type { Analyzer, AnalyzerContext, CoverageStatus } from '../types';
 import { createRepoTools, normalizeRepoPath, ReportFlowInput } from './repoTools';
 import { buildSeedPrompt, SEED_LINES, TAINT_PROMPT_VERSION, TAINT_SYSTEM_PROMPT, TAINT_TASK_MARKER } from './taintPrompt';
-import { issueToFinding } from './toFinding';
+import { issueToFinding, maskCredentials } from './toFinding';
+import { rebaseFinding, reusablePaths } from '../reuse';
 import { selectForTaint, type TriageService } from './triage';
 import type { FileTriage, RawCodeIssue, TraceStep } from './types';
 
@@ -99,18 +100,23 @@ async function runTaint(deps: TaintAnalyzerDeps, ctx: AnalyzerContext, lease: Wo
     .sort((a, b) => b.relevance - a.relevance || b.sources.length - a.sources.length || (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
   const rankedPaths = new Set(ranked.map((f) => f.path));
   for (const path of [...kindsOf.keys()].sort()) if (!rankedPaths.has(path)) record(path, 'not-relevant'); // no untrusted source seen
+  const reader = createConfinedReader(ctx.repoDir, ctx.files);
+
+  // 1b. Incremental rescan: unaffected entrypoints keep their base flows (every step re-validated), no agent.
+  const reuse = ctx.incremental ? await reuseBaseFlows(ctx, rankedPaths, reader) : { entrypoints: new Set<string>(), findings: [] };
+  for (const path of reuse.entrypoints) record(path, 'cached');
+  const selected = ranked.filter((f) => !reuse.entrypoints.has(f.path));
+
   const perAgentUsd = deps.lanes?.estimateUsd('deep', PROJECTED_AGENT_INPUT_TOKENS, PROJECTED_AGENT_OUTPUT_TOKENS) ?? 0;
-  let agentsLeft = ranked.length;
+  let agentsLeft = selected.length;
   if (agentsLeft === 0) {
     lease.close();
-    return [];
+    return reuse.findings;
   }
   lease.project(agentsLeft * perAgentUsd);
-  const selected = ranked;
 
   // 2. One agent per entrypoint (bounded concurrency), sharing one set of confined repo tools (and its file cache).
   const imports: ImportEdge[] = deps.indexRepo.imports(ctx.scanId);
-  const reader = createConfinedReader(ctx.repoDir, ctx.files);
   const repoTools = createRepoTools({ repoDir: ctx.repoDir, files: ctx.files, imports, signal: ctx.signal });
   const reportFlow = defineTool({
     name: 'report_flow',
@@ -211,8 +217,74 @@ async function runTaint(deps: TaintAnalyzerDeps, ctx: AnalyzerContext, lease: Wo
   }
   if (sanitized > 0) ctx.progress(`Taint agent: ${sanitized} sanitized flow(s) not reported`);
 
-  // 4. Dedupe by sink location + rule, then convert at the sink step.
-  return dedupeFlows(verified).map((v) => issueToFinding(ctx, 'taint', toIssue(v), ['taint:agent']));
+  // 4. Dedupe by sink location + rule, then convert at the sink step; re-attached flows fill in (fresh ones win).
+  const fresh = dedupeFlows(verified).map((v) => issueToFinding(ctx, 'taint', toIssue(v), ['taint:agent']));
+  const seen = new Set(fresh.map((f) => f.fingerprint));
+  return [...fresh, ...reuse.findings.filter((f) => !seen.has(f.fingerprint))];
+}
+
+// --- incremental reuse -------------------------------------------------------------------------
+
+type Reader = ReturnType<typeof createConfinedReader>;
+
+/**
+ * Incremental rescan (spec §11): the base scan's taint flows of entrypoints OUTSIDE the affected set are
+ * re-attached instead of re-traced — but only after every trace step is re-located in the new checkout
+ * with verifyTrace (a flow whose source or sink can no longer be found is dropped, and its entrypoint is
+ * traced again). A flow is attributed to the entrypoint of its source step; a flow whose source lies
+ * outside any traced entrypoint is kept when none of its files is affected (and it still verifies).
+ * Entrypoints the base scan did not fully cover (budget-skipped / failed) are always traced again.
+ */
+async function reuseBaseFlows(
+  ctx: AnalyzerContext, ranked: ReadonlySet<string>, reader: Reader,
+): Promise<{ entrypoints: Set<string>; findings: Finding[] }> {
+  const inc = ctx.incremental!;
+  const candidates = reusablePaths(ctx, 'taint', ranked, 'affected');
+  const byEntrypoint = new Map<string, Finding[]>();
+  const unattributed: Finding[] = [];
+  for (const f of inc.baseFindings('taint')) {
+    const source = f.taintTrace?.find((s) => s.kind === 'source')?.file;
+    if (!source) continue;
+    if (ranked.has(source)) (byEntrypoint.get(source) ?? byEntrypoint.set(source, []).get(source)!).push(f);
+    else unattributed.push(f);
+  }
+
+  const revalidate = async (f: Finding): Promise<Finding | null> => {
+    const trace = f.taintTrace ?? [];
+    if (trace.some((s) => inc.affected.has(s.file) || inc.deleted.has(s.file))) return null;
+    const texts = new Map<string, string | null>();
+    for (const file of new Set(trace.map((s) => s.file))) texts.set(file, await reader.read(file));
+    const result = verifyTrace(trace, (p) => texts.get(p) ?? null);
+    if (!result.ok) return null;
+    const sink = [...result.trace].reverse().find((s) => s.kind === 'sink');
+    if (!sink || !result.trace.some((s) => s.kind === 'source') || sink.file !== f.location.file) return null;
+    return rebaseFinding(ctx, f, {
+      taintTrace: result.trace.map((s) => ({ ...s, code: maskCredentials(s.code) })),
+      location: { startLine: sink.line, endLine: sink.line, snippet: f.location.snippet },
+    });
+  };
+
+  const entrypoints = new Set<string>();
+  const findings: Finding[] = [];
+  let dropped = 0;
+  for (const path of [...candidates].sort()) {
+    const kept: Finding[] = [];
+    let ok = true;
+    for (const f of byEntrypoint.get(path) ?? []) {
+      const rebased = await revalidate(f);
+      if (!rebased) { ok = false; break; }
+      kept.push(rebased);
+    }
+    if (!ok) { dropped++; continue; } // a flow no longer verifies: trace this entrypoint again
+    entrypoints.add(path);
+    findings.push(...kept);
+  }
+  for (const f of unattributed) {
+    const rebased = await revalidate(f);
+    if (rebased) findings.push(rebased);
+  }
+  if (dropped > 0) ctx.progress(`Taint: ${dropped} unchanged entrypoint(s) re-traced because a previous flow no longer verifies`);
+  return { entrypoints, findings };
 }
 
 // --- conversion / dedupe -----------------------------------------------------------------------

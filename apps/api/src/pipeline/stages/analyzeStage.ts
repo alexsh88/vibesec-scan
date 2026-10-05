@@ -1,10 +1,12 @@
 import { FindingSummarySchema, type Finding } from '@vibesec/shared';
-import type { Analyzer, AnalyzerContext, CoverageEntry, CoverageStatus } from '../../analyzers/types';
+import type { Analyzer, AnalyzerContext, CoverageEntry, CoverageStatus, IncrementalContext } from '../../analyzers/types';
 import type { CoverageRepo } from '../../db/coverageRepo';
 import type { FindingRepo } from '../../db/findingRepo';
 import type { IndexRepo } from '../../db/indexRepo';
+import type { ScanRepo } from '../../db/scanRepo';
 import { AppError, toAppError } from '../../errors/AppError';
 import type { GitService } from '../../git/GitService';
+import { planIncremental, reuseStats, type IncrementalDeps } from '../incremental';
 import type { PipelineContext, StageSpec } from '../types';
 import { requireCommitSha } from './common';
 
@@ -15,6 +17,8 @@ export type AnalyzeStageDeps = {
   git: Pick<GitService, 'repoDir'>;
   /** Persists per-file AI-review coverage (budget-skipped files are listed in diagnostics). */
   coverage?: Pick<CoverageRepo, 'replaceForScan'>;
+  /** Incremental rescans (pipeline/incremental.ts); absent → every scan analyzes every file. */
+  incremental?: IncrementalDeps & { scans: Pick<ScanRepo, 'setReuse'> };
 };
 
 type AnalyzerOutcome =
@@ -82,6 +86,9 @@ export function analyzeStage(deps: AnalyzeStageDeps): StageSpec {
       const files = deps.indexRepo.files(ctx.scanId, { includeSkipped: true });
       const repo = { owner: ctx.scan.repo.owner, name: ctx.scan.repo.name };
       const token = ctx.secrets.token;
+      const plan: IncrementalContext | undefined = deps.incremental
+        ? await planIncremental(deps.incremental, ctx, { repoDir, commitSha, files })
+        : undefined;
       const coverage = new Map<string, CoverageEntry>();
       const recordCoverage = (analyzer: string, path: string, status: CoverageStatus) => {
         coverage.set(`${analyzer}\0${path}`, { analyzer, path, status });
@@ -104,6 +111,7 @@ export function analyzeStage(deps: AnalyzeStageDeps): StageSpec {
             // a no-op until one does. See report for this deviation.
             progress: () => {},
             recordCoverage,
+            ...(plan ? { incremental: plan } : {}),
           };
           return runAnalyzer(analyzer, actx, deps, ctx);
         }),
@@ -126,9 +134,24 @@ export function analyzeStage(deps: AnalyzeStageDeps): StageSpec {
 
       if (cancellation) throw cancellation;
       reportCoverage(ctx, [...coverage.values()], deps.coverage);
+      if (deps.incremental) reportReuse(ctx, deps.incremental, plan, files, [...coverage.values()]);
       if (succeeded === 0) throw new AppError('ALL_ANALYZERS_FAILED', 'permanent', 'All analyzers failed');
     },
   };
+}
+
+/** Marks the scan 'partial' with its reuse stats (or clears a stale mark) and tells the UI via a `cache` event. */
+function reportReuse(
+  ctx: PipelineContext, deps: NonNullable<AnalyzeStageDeps['incremental']>, plan: IncrementalContext | undefined,
+  files: AnalyzerContext['files'], entries: CoverageEntry[],
+): void {
+  if (!plan) {
+    deps.scans.setReuse(ctx.scanId, 'none', null);
+    return;
+  }
+  const stats = reuseStats(deps, plan, { files, coverage: entries });
+  deps.scans.setReuse(ctx.scanId, 'partial', stats);
+  ctx.emit({ type: 'cache', filesReused: stats.filesReused, filesAnalyzed: stats.filesChanged, savedUsd: stats.estimatedSavedUsd });
 }
 
 /**
