@@ -18,6 +18,7 @@ import type { Finding, Severity } from '@vibesec/shared';
 import { toAppError } from '../../../errors/AppError';
 import { SEVERITY_RANK } from '../../../findings/helpers';
 import { verifyIssueLocation } from '../../../findings/verify';
+import { formatFailureReasons, llmFailureReason, type LlmFailureReason } from '../../../llm/failureReason';
 import type { LlmClient, StructuredCall } from '../../../llm/LlmClient';
 import type { MockResponder } from '../../../llm/mockTransport';
 import { untrustedFile } from '../../../llm/prompt';
@@ -32,14 +33,18 @@ import {
   type DuplicateBlock, type FileMetrics, type QualityLanguage,
 } from './metrics';
 
-export const QUALITY_PROMPT_VERSION = 'quality-v1';
+export const QUALITY_PROMPT_VERSION = 'quality-v2';
 /** Appears verbatim in the system prompt; `qualityMockResponder` keys on it. */
 export const QUALITY_TASK_MARKER = 'Task: code-quality-review';
 
 const MAX_FILE_BYTES = 200 * 1024;
 const READ_CONCURRENCY = 16;
 const REVIEW_CONCURRENCY = 4;
-const MAX_ISSUES_PER_FILE = 8;
+const MAX_ISSUES_PER_FILE = 5;
+const SCHEMA_MAX_ISSUES = 10;
+/** Haiku's role default is 4096; up to 10 issues with verbatim snippets + prose need headroom so a
+ *  verbose reply is not cut off mid-JSON (a truncated reply is unusable and is not retried). */
+const QUALITY_MAX_TOKENS = 8_192;
 const NUL_PROBE_BYTES = 8_192;
 
 const LANG_MAP: Partial<Record<Language, QualityLanguage>> = {
@@ -50,10 +55,39 @@ const LANG_MAP: Partial<Record<Language, QualityLanguage>> = {
 
 // --- schema --------------------------------------------------------------------------------------
 
+/**
+ * Fixed maintainability/reliability catalogue. The output schema enforces it (server-side enum), so the
+ * model cannot drift into security vulnerabilities — those belong to SAST/taint/credentials/config, and
+ * duplicating them as quality findings only adds noise (first live eval: 60 quality findings, most of
+ * them re-reported injections and hardcoded credentials).
+ */
+export const QUALITY_RULES = {
+  'quality/swallowed-error': 'catch block that ignores or only logs an error, so the caller continues in a bad state',
+  'quality/unhandled-promise': 'promise whose rejection is never handled (fire-and-forget async call, missing .catch)',
+  'quality/missing-await': 'async call not awaited where the result or its completion is relied on',
+  'quality/inconsistent-error-handling': 'error paths handled differently in the same module (some throw, some return null, some respond twice)',
+  'quality/null-dereference': 'value that can be null/undefined/empty (query result, lookup, optional field) used without a check',
+  'quality/missing-input-validation': 'non-security data hygiene: a request/input value used without checking its type/shape/range, leading to crashes or wrong results',
+  'quality/type-coercion': 'implicit or unchecked conversion (Number(), parseInt without radix/NaN check, == comparisons) that silently yields wrong values',
+  'quality/resource-leak': 'file handle, connection, timer or listener that is opened but never closed/released on every path',
+  'quality/race-condition': 'check-then-act or shared mutable state updated concurrently without coordination',
+  'quality/missing-timeout': 'network/IO call with no timeout, so one slow dependency can hang a request or worker',
+  'quality/blocking-io-in-handler': 'synchronous filesystem/CPU-heavy work inside a request handler that blocks the event loop',
+  'quality/n-plus-one-query': 'database/API query issued inside a loop instead of one batched query',
+  'quality/dead-code': 'unreachable branch, or unused variable/parameter/import that suggests an incomplete change',
+  'quality/complex-function': 'function long or deeply nested enough to hide bugs (cite where the complexity actually hurts)',
+  'quality/duplicated-logic': 'logic copy-pasted across places that must be kept in sync by hand',
+  'quality/magic-values': 'unexplained literal (limit, timeout, status code, path) repeated or likely to need changing',
+  'quality/todo-hack': 'TODO/FIXME/HACK marking known-incomplete behaviour on a live code path',
+} as const;
+export type QualityRuleId = keyof typeof QUALITY_RULES;
+export const QUALITY_RULE_IDS = Object.keys(QUALITY_RULES) as [QualityRuleId, ...QualityRuleId[]];
+const QUALITY_RULE_SET: ReadonlySet<string> = new Set(QUALITY_RULE_IDS);
+
 const QualityIssueSchema = z.object({
-  ruleId: z.string().min(1).max(100),
+  ruleId: z.enum(QUALITY_RULE_IDS),
   title: z.string().min(1).max(200),
-  severity: z.enum(['critical', 'high', 'medium', 'low', 'info']),
+  severity: z.enum(['medium', 'low', 'info']),
   confidence: z.enum(['high', 'medium', 'low']),
   startLine: z.number().int().positive(),
   endLine: z.number().int().positive(),
@@ -62,36 +96,42 @@ const QualityIssueSchema = z.object({
   impact: z.string().min(1).max(2_000),
   remediation: z.string().min(1).max(2_000),
 });
-const QualityOutputSchema = z.object({ issues: z.array(QualityIssueSchema).max(MAX_ISSUES_PER_FILE) });
+// The array bound is deliberately looser than MAX_ISSUES_PER_FILE: maxItems is only advisory in the
+// server-side schema, so a model that returns 6 issues should not cost a repair turn — the analyzer
+// keeps the most severe MAX_ISSUES_PER_FILE itself.
+export const QualityOutputSchema = z.object({ issues: z.array(QualityIssueSchema).max(SCHEMA_MAX_ISSUES) });
 type QualityOutput = z.infer<typeof QualityOutputSchema>;
 
 // --- system prompt ---------------------------------------------------------------------------
 
+const RULE_LINES = Object.entries(QUALITY_RULES).map(([id, desc]) => `  - ${id}: ${desc}`);
+
 const SYSTEM_PROMPT = [
   QUALITY_TASK_MARKER,
   '',
-  'You are reviewing ONE source file for code-quality issues that are plausible, specific, and worth',
-  "a developer's time. The <untrusted_file> block has 1-based line numbers prefixed to each line so",
-  'you can cite them exactly. After it, "Metrics for <path>" lists facts computed by static analysis',
-  '(line counts, function lengths, nesting depth, TODO density, duplicate code elsewhere in the repo).',
-  'Those facts are evidence to guide your review, not findings themselves — they point at what might',
-  'be worth flagging, but you decide whether each is an actual problem, and you may also flag issues',
-  'the metrics never mention.',
+  'You are reviewing ONE source file for maintainability and reliability problems that are specific,',
+  "real, and worth a developer's time. The <untrusted_file> block has 1-based line numbers prefixed to",
+  'each line so you can cite them exactly. After it, "Metrics for <path>" lists facts computed by static',
+  'analysis (line counts, function lengths, nesting depth, TODO density, duplicate code elsewhere in the',
+  'repo). Those facts are evidence to guide your review, not findings themselves — you decide whether',
+  'each is an actual problem, and you may also flag issues the metrics never mention.',
   '',
-  'Focus your review on:',
-  '  - error handling: swallowed errors (empty or log-only catch blocks), missing awaits on promises,',
-  '    unchecked error paths that can leave the system in a bad state.',
-  '  - input validation hygiene: data used without checking its shape/type/bounds, especially before',
-  '    it reaches a sink.',
-  '  - dead code: unreachable branches, unused parameters/variables that suggest an incomplete fix.',
-  '  - complexity/readability hot spots that are likely to hide bugs (not simply "this is long").',
-  '  - maintainability risks in security-relevant code (auth, crypto, data access, request handling).',
+  'Security vulnerabilities are out of scope: another analyzer owns them. Do NOT report injection (SQL,',
+  'command, code, prompt), XSS, SSRF, path traversal, open redirects, unsafe deserialization, hardcoded',
+  'or exposed credentials, weak crypto/hashing, CORS, authentication/authorization or JWT problems —',
+  'not even rephrased as "missing validation" or "unsafe" quality issues. Also skip noise: reading a',
+  'documented public config value (e.g. a NEXT_PUBLIC_* anon/publishable key) without a presence',
+  'check, style/naming nits, and generic "add error handling" advice where the framework already',
+  'handles the error.',
   '',
-  `Report at most ${MAX_ISSUES_PER_FILE} issues, each with: a ruleId formatted as "quality/<kebab-case-name>"`,
-  '(e.g. "quality/swallowed-error"), a short title, a severity no higher than "medium" (quality issues',
-  'are never critical/high — clamp your own judgement to at most medium), a confidence, the exact',
-  'startLine/endLine and the snippet of code at that location (copy it verbatim from the numbered file',
-  'so it can be verified), and an explanation, impact and remediation. If you find nothing worth',
+  'Rule ids — use exactly one of:',
+  ...RULE_LINES,
+  '',
+  `Report at most ${MAX_ISSUES_PER_FILE} issues; prefer fewer, high-value ones (most files deserve 0-2). Each`,
+  'issue needs: a ruleId from the list, a short title, a severity of "medium", "low" or "info" (quality',
+  'issues are never critical/high), a confidence, the exact startLine/endLine and the snippet of code at',
+  'that location (copy it verbatim from the numbered file, without the "12: " prefix, so it can be',
+  'verified), and a brief explanation, impact and remediation (1-3 sentences each). If nothing is worth',
   'reporting, return an empty issues array — do not invent problems to fill a quota.',
 ].join('\n');
 // Note: UNTRUSTED_POLICY is appended automatically by LlmClient (via buildRequestParts), so it is
@@ -195,12 +235,20 @@ function clampSeverity(s: Severity): Severity {
   return SEVERITY_RANK[s] < SEVERITY_RANK.medium ? 'medium' : s;
 }
 
-function kebab(s: string): string {
-  return s.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '') || 'issue';
-}
+const CONFIDENCE_RANK: Record<QualityOutput['issues'][number]['confidence'], number> = { high: 0, medium: 1, low: 2 };
 
-function normalizeRuleId(ruleId: string): string {
-  return ruleId.startsWith('quality/') ? ruleId : `quality/${kebab(ruleId)}`;
+/** Catalogue rule ids only (defence in depth — the schema enum already enforces it), most severe and
+ *  most confident first (stable among equals), capped at MAX_ISSUES_PER_FILE. */
+function selectIssues(issues: readonly QualityOutput['issues'][number][]): QualityOutput['issues'] {
+  return issues
+    .filter((i) => QUALITY_RULE_SET.has(i.ruleId))
+    .map((issue, index) => ({ issue, index }))
+    .sort((a, b) =>
+      SEVERITY_RANK[clampSeverity(a.issue.severity)] - SEVERITY_RANK[clampSeverity(b.issue.severity)]
+      || CONFIDENCE_RANK[a.issue.confidence] - CONFIDENCE_RANK[b.issue.confidence]
+      || a.index - b.index)
+    .slice(0, MAX_ISSUES_PER_FILE)
+    .map((x) => x.issue);
 }
 
 // --- service ---------------------------------------------------------------------------------
@@ -255,7 +303,7 @@ export function createQualityAnalyzer(deps: QualityAnalyzerDeps): Analyzer {
       let budgetExhausted = false;
 
       const findings: Finding[] = [];
-      let warnedPartial = false;
+      const failures = new Map<LlmFailureReason, number>();
 
       await forEachLimit(selected, REVIEW_CONCURRENCY, async (path) => {
         checkAbort();
@@ -268,14 +316,14 @@ export function createQualityAnalyzer(deps: QualityAnalyzerDeps): Analyzer {
         const call: StructuredCall<QualityOutput> = {
           scanId: ctx.scanId, analyzer: 'quality', purpose: 'quality-review', promptVersion: QUALITY_PROMPT_VERSION,
           role: 'fast', tier: 3, system: SYSTEM_PROMPT, prompt, schema: QualityOutputSchema,
-          signal: ctx.signal, onActivity: ctx.touch,
+          maxTokens: QUALITY_MAX_TOKENS, signal: ctx.signal, onActivity: ctx.touch,
         };
 
         try {
           const result = await deps.llm.structured(call);
-          for (const raw of result.output.issues) {
+          for (const raw of selectIssues(result.output.issues)) {
             const issue: RawCodeIssue = {
-              ruleId: normalizeRuleId(raw.ruleId),
+              ruleId: raw.ruleId,
               title: raw.title,
               severity: clampSeverity(raw.severity),
               confidence: raw.confidence,
@@ -301,16 +349,18 @@ export function createQualityAnalyzer(deps: QualityAnalyzerDeps): Analyzer {
             return;
           }
           record(path, 'failed');
-          // Quality is not security-critical: a file whose AI review fails produces NO findings,
-          // only a once-per-run warning (unlike config's fail-open, which keeps low-confidence hints).
-          if (!warnedPartial) {
-            warnedPartial = true;
-            ctx.warn('QUALITY_PARTIAL', 'AI code-quality review failed for one or more files; those files produced no quality findings');
-          }
+          // Quality is not security-critical: a file whose AI review fails produces NO findings, only
+          // one aggregated warning per run (unlike config's fail-open, which keeps low-confidence hints).
+          const reason = llmFailureReason(err);
+          failures.set(reason, (failures.get(reason) ?? 0) + 1);
         }
         ctx.touch();
       });
 
+      if (failures.size > 0) {
+        const failed = [...failures.values()].reduce((a, b) => a + b, 0);
+        ctx.warn('QUALITY_PARTIAL', `AI code-quality review failed for ${failed} file(s) (${formatFailureReasons(failures)}); those files produced no quality findings`);
+      }
       return findings;
     },
   };
@@ -360,7 +410,7 @@ export const qualityMockResponder: MockResponder = (req: LlmRequest) => {
   if (snippet.trim() === '') return { issues: [] };
 
   const issues: QualityOutput['issues'] = [{
-    ruleId: 'quality/long-function',
+    ruleId: 'quality/complex-function',
     title: `Long function '${name}'`,
     severity: 'medium',
     confidence: 'medium',
