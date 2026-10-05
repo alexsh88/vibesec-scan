@@ -23,10 +23,10 @@ import { verifyStage } from './stages/verifyStage';
 import type { Pipeline, PipelineContext, StageSpec } from './types';
 
 export type ScanPipelineDeps = Omit<ResolveDeps, 'git' | 'scans'> & Omit<IndexDeps, 'git' | 'indexRepo'> & {
-  git: Pick<GitService, 'remoteUrl' | 'resolveRef' | 'ensureCheckout' | 'removeScanDir' | 'repoDir' | 'diffNameStatus' | 'fetchCommit'>;
+  git: Pick<GitService, 'remoteUrl' | 'resolveRef' | 'ensureCheckout' | 'removeScanDir' | 'repoDir' | 'diffNameStatus' | 'fetchCommit' | 'isAncestor'>;
   scans: Pick<ScanRepo,
     | 'updateRepoMeta' | 'setCommitSha' | 'getRow' | 'getDto' | 'setCacheKeys' | 'findFullCacheSource' | 'findIncrementalBase'
-    | 'findPreviousCompleted' | 'setReuse' | 'getDiagnostics'>;
+    | 'findBaselineCandidates' | 'setReuse' | 'getDiagnostics'>;
   indexRepo: Pick<IndexRepo, 'replace' | 'files' | 'imports' | 'entrypoints' | 'stats'>;
   analyzers: readonly Analyzer[];
   findings: FindingRepo;
@@ -40,6 +40,8 @@ export type ScanPipelineDeps = Omit<ResolveDeps, 'git' | 'scans'> & Omit<IndexDe
   suppressions: Pick<SuppressionService, 'applySuppressions'>;
   /** The scan's cache keys (scans/cacheKeys.ts); omit to disable the full-scan cache and incremental rescans. */
   cacheKeys?: (options: ScanOptions) => ScanCacheKeys;
+  /** The full-scan cache only serves results younger than this (FULL_CACHE_TTL_HOURS); omit for no limit. */
+  fullCacheTtlMs?: number;
   /** One DB transaction (the full-scan cache copy). */
   atomically: <T>(fn: () => T) => T;
   /** Called after cleanup, once the scan reaches a terminal state (e.g. budget-tracker cleanup). */
@@ -69,7 +71,10 @@ function scoringStage(deps: ScanPipelineDeps): StageSpec {
       };
       await step(() => score.run(ctx));
       await step(() => deps.suppressions.applySuppressions(ctx.scanId));
-      await step(() => applyScanStatus({ scans: deps.scans, findings: deps.findings }, ctx.scanId));
+      await step(() => applyScanStatus(
+        { scans: deps.scans, findings: deps.findings, coverage: deps.coverage, indexRepo: deps.indexRepo, git: deps.git },
+        ctx.scanId, { signal: ctx.signal, touch: ctx.touch },
+      ));
       if (failure) throw failure;
     },
   };

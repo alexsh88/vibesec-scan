@@ -157,11 +157,17 @@ export function createContainer(config: Config, overrides: ContainerOverrides = 
   const resultConfig = {
     analyzers: analyzers.map((a) => ({ id: a.id, version: a.version })),
     promptVersions: PROMPT_VERSIONS, models: config.models, llmMode: config.scanMode,
+    defaultBudgetUsd: config.scanBudgetUsd,
+    environment: {
+      maxFiles: config.maxFiles, maxFileBytes: config.maxFileBytes, maxRepoBytes: config.maxRepoBytes,
+      sandboxEnabled: sandbox !== null, sandboxInstall: config.sandbox.install,
+    },
   };
   const pipeline = overrides.pipeline ?? createScanPipeline({
     git, github, scans, indexRepo, indexer, maxRepoBytes: config.maxRepoBytes, maxFiles: config.maxFiles,
     analyzers, findings, coverage: new CoverageRepo(db), fixPlans, summaries, llmCalls, llm, suppressions,
     cacheKeys: (options) => scanCacheKeys(options, resultConfig),
+    fullCacheTtlMs: config.fullCacheTtlMs,
     atomically: (fn) => lifecycle.atomically(fn),
     onFinished: (scanId) => {
       budget.forget(scanId);

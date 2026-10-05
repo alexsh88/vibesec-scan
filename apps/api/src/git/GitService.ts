@@ -173,6 +173,31 @@ export class GitService {
   }
 
   /**
+   * Whether `ancestor` is an ancestor of (or equal to) `descendant` in the clone at `dir`: true / false, or
+   * null when it cannot be told (a commit is missing locally, no clone, any git failure). Best-effort:
+   * never fetches. Cancellation propagates.
+   */
+  async isAncestor(dir: string, ancestor: string, descendant: string, call: GitCallOptions = {}): Promise<boolean | null> {
+    if (!SHA_RE.test(ancestor) || !SHA_RE.test(descendant)) return null;
+    if (ancestor === descendant) return true;
+    try {
+      // Both commits must exist locally, or "not an ancestor" would be indistinguishable from "unknown".
+      await this.git(['cat-file', '-e', `${ancestor}^{commit}`], { ...call, cwd: dir });
+      await this.git(['cat-file', '-e', `${descendant}^{commit}`], { ...call, cwd: dir });
+    } catch (err) {
+      if (err instanceof AppError && (err.kind === 'cancelled' || call.signal?.aborted)) throw err;
+      return null;
+    }
+    try {
+      await this.git(['merge-base', '--is-ancestor', ancestor, descendant], { ...call, cwd: dir });
+      return true;
+    } catch (err) {
+      if (err instanceof AppError && (err.kind === 'cancelled' || call.signal?.aborted)) throw err;
+      return false; // exit 1: both commits exist, and it is not an ancestor
+    }
+  }
+
+  /**
    * Fetches one commit (trees only, blobs stay lazy) into an existing clone, e.g. an incremental
    * rescan's base commit that is no longer reachable from the advertised refs. False when the remote
    * does not have it (force-push / history rewrite) — the caller then runs a full scan.

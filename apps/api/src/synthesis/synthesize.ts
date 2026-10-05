@@ -32,6 +32,14 @@ export function computeStats(findings: readonly Finding[]): SummaryStats {
 }
 
 /**
+ * A copied summary (full-scan cache hit) brought up to date with THIS scan's findings after their triage
+ * and new/existing/fixed were recomputed: the stats are recounted.
+ */
+export function refreshSummary(summary: ScanSummary, findings: readonly Finding[]): ScanSummary {
+  return ScanSummarySchema.parse({ ...summary, stats: computeStats(findings) });
+}
+
+/**
  * Keeps only references to ids that were actually in the input: unknown finding ids and fix-action ids are
  * dropped, a top risk left without findings is dropped, and so is a next action left with no reference at
  * all. A top risk's severity is recomputed from the findings it cites (the model cannot inflate/deflate it).

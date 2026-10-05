@@ -124,7 +124,9 @@ describe('Claude code analyzers, end to end over fixtures/vuln-app (mock LLM)', 
     expect(scan.reuse!.filesReused).toBeGreaterThan(0);
     expect(scan.reuse!.estimatedSavedUsd).toBeCloseTo(first.costUsd, 6);
     expect(full.container.llmCalls.totals(scanId).calls).toBe(0);
-    const strip = (fs: Finding[]) => fs.map(({ id: _id, scanId: _s, ...rest }) => rest).sort((x, y) => (x.fingerprint < y.fingerprint ? -1 : 1));
+    // Same findings; new/existing is recomputed for the rescan (its baseline is the first scan: all existing).
+    expect(findingsOf(full.container, scanId).every((f) => f.scanStatus === 'existing')).toBe(true);
+    const strip = (fs: Finding[]) => fs.map(({ id: _id, scanId: _s, scanStatus: _st, ...rest }) => rest).sort((x, y) => (x.fingerprint < y.fingerprint ? -1 : 1));
     expect(strip(findingsOf(full.container, scanId))).toEqual(strip(findingsOf(full.container, first.id)));
     expect(full.container.summaries.get(scanId)?.riskGrade).toBe(full.container.summaries.get(first.id)?.riskGrade);
     // Straight from RESOLVING to the terminal state; the UI gets the reuse numbers in a `cache` event.

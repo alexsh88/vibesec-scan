@@ -59,6 +59,12 @@ export const FindingSchema = z.object({
   remediation: z.object({ summary: z.string(), patch: z.string().optional() }),
   scanStatus: z.enum(['new', 'existing', 'fixed']),
   producedBy: z.array(z.string()).optional(),
+  /**
+   * Fingerprints of the findings cross-analyzer dedupe merged into this one (VERIFYING). A finding is
+   * matched across scans (new/existing/fixed, triage suppressions) by its fingerprint OR any of these,
+   * so which analyzer "wins" a merge never changes a finding's identity.
+   */
+  mergedFingerprints: z.array(z.string()).optional(),
   triage: TriageSchema.optional(),
 });
 export type Finding = z.infer<typeof FindingSchema>;

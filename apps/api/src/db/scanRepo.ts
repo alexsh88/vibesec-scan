@@ -128,14 +128,24 @@ export class ScanRepo {
 
   /**
    * Full-scan cache (spec §11): the most recent completed scan of the same repo at the same commit with
-   * the same result configuration — its results can be served as-is.
+   * the same result configuration — its results can be served as-is. Only a CLEAN result qualifies:
+   * COMPLETED, or COMPLETED_WITH_WARNINGS whose warnings are all level 'info' (a degraded scan — a failed
+   * analyzer, partial budget coverage, a synthesis fallback — must be recomputed, not frozen). Only an
+   * original analysis qualifies (never itself a full-cache copy), and only while it finished less than
+   * `maxAgeMs` ago (advisories and credential liveness change without a commit).
    */
-  findFullCacheSource(repoId: string, commitSha: string, keys: ScanCacheKeys, excludeId: string): ScanRow | undefined {
+  findFullCacheSource(
+    repoId: string, commitSha: string, keys: ScanCacheKeys, excludeId: string, opts: { maxAgeMs?: number } = {},
+  ): ScanRow | undefined {
+    const notBefore = opts.maxAgeMs !== undefined ? new Date(Date.parse(this.now()) - opts.maxAgeMs).toISOString() : null;
     return this.db.prepare(
       `SELECT * FROM scans WHERE repo_id = ? AND commit_sha = ? AND result_options_hash = ? AND analyzer_versions_hash = ?
-         AND state IN ${COMPLETED_SQL} AND id <> ?
+         AND id <> ? AND cache_hit <> 'full'
+         AND (state = 'COMPLETED' OR (state = 'COMPLETED_WITH_WARNINGS' AND NOT EXISTS (
+           SELECT 1 FROM json_each(scans.warnings_json) w WHERE coalesce(json_extract(w.value, '$.level'), 'warning') <> 'info')))
+         AND (? IS NULL OR finished_at >= ?)
        ORDER BY finished_at DESC, rowid DESC LIMIT 1`,
-    ).get(repoId, commitSha, keys.resultOptionsHash, keys.analyzerVersionsHash, excludeId) as ScanRow | undefined;
+    ).get(repoId, commitSha, keys.resultOptionsHash, keys.analyzerVersionsHash, excludeId, notBefore, notBefore) as ScanRow | undefined;
   }
 
   /** Incremental rescans: the latest completed scan of the same repo + configuration at a DIFFERENT commit. */
@@ -148,15 +158,23 @@ export class ScanRepo {
   }
 
   /**
-   * new/existing/fixed: the latest completed scan of the same repo (any options or commit) that was
-   * requested no later than `scanId` (a scan never compares itself against a newer one).
+   * new/existing/fixed baseline candidates for `scanId`, newest first: completed scans of the same repo
+   * with the same result options (result_options_hash) and the same requested ref (the same branch/tag
+   * string, null = the default branch; a scan pinned to a commit SHA matches any other SHA-pinned scan,
+   * commit ancestry then decides), requested no later than `scanId` (a scan never compares itself against a newer one),
+   * with a known commit. The caller still checks commit ancestry (scanStatus.ts). Empty when `scanId` has
+   * no result options hash yet.
    */
-  findPreviousCompleted(repoId: string, scanId: string): ScanRow | undefined {
+  findBaselineCandidates(scanId: string, limit = 10): ScanRow[] {
+    const row = this.getRow(scanId);
+    if (!row?.result_options_hash) return [];
+    const pinned = row.ref !== null && /^[0-9a-f]{40}$/i.test(row.ref);
+    const refClause = pinned ? `length(ref) = 40 AND lower(ref) NOT GLOB '*[^0-9a-f]*'` : 'ref IS ?';
     return this.db.prepare(
-      `SELECT * FROM scans WHERE repo_id = ? AND state IN ${COMPLETED_SQL} AND id <> ?
-         AND created_at <= (SELECT created_at FROM scans WHERE id = ?)
-       ORDER BY finished_at DESC, rowid DESC LIMIT 1`,
-    ).get(repoId, scanId, scanId) as ScanRow | undefined;
+      `SELECT * FROM scans WHERE repo_id = ? AND state IN ${COMPLETED_SQL} AND id <> ? AND result_options_hash = ?
+         AND ${refClause} AND commit_sha IS NOT NULL AND created_at <= ?
+       ORDER BY finished_at DESC, rowid DESC LIMIT ?`,
+    ).all(row.repo_id, scanId, row.result_options_hash, ...(pinned ? [] : [row.ref]), row.created_at, limit) as ScanRow[];
   }
 
   findActiveDuplicate(repoId: string, ref: string | null, optionsHash: string): ScanRow | undefined {

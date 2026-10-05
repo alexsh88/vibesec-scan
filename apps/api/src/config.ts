@@ -61,6 +61,12 @@ const EnvSchema = z.object({
   SANDBOX_MAX_DEPS_MB: z.coerce.number().int().positive().default(1536),
   /** Opt-in phase A (dependency install behind the egress proxy); phase B never needs it. */
   SANDBOX_INSTALL: z.enum(['true', 'false']).default('false'),
+  /**
+   * Full-scan cache lifetime. A cached result is served for the same commit + configuration only while it
+   * is younger than this: dependency advisories (OSV) and credential liveness change without any commit,
+   * so an old result must be recomputed rather than frozen forever.
+   */
+  FULL_CACHE_TTL_HOURS: z.coerce.number().positive().default(24),
 });
 
 export type Config = {
@@ -74,6 +80,8 @@ export type Config = {
   llmConcurrency: number; llmRequestsPerMinute: number; llmInputTokensPerMinute: number; llmTimeoutMs: number; llmRecordingsDir: string;
   /** Docker sandbox for dependency install (phase A) and offline usage analysis (phase B). */
   sandbox: { enabled: boolean; install: boolean; imagePrefix: string; installTimeoutMs: number; analyzeTimeoutMs: number; maxDepsBytes: number };
+  /** FULL_CACHE_TTL_HOURS in ms: the full-scan cache only serves results younger than this. */
+  fullCacheTtlMs: number;
 };
 
 export function loadConfig(env: Record<string, string | undefined> = process.env): Config {
@@ -119,5 +127,6 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
       installTimeoutMs: e.SANDBOX_INSTALL_TIMEOUT_MS, analyzeTimeoutMs: e.SANDBOX_ANALYZE_TIMEOUT_MS,
       maxDepsBytes: e.SANDBOX_MAX_DEPS_MB * 1024 * 1024,
     },
+    fullCacheTtlMs: Math.round(e.FULL_CACHE_TTL_HOURS * 3_600_000),
   };
 }
