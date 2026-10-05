@@ -1,4 +1,7 @@
 import { AuditLogger } from './audit/AuditLogger';
+import { createCredentialsAnalyzer } from './analyzers/credentials/credentialsAnalyzer';
+import { credentialsFpMockResponder } from './analyzers/credentials/fpFilter';
+import { SecretVerifier } from './analyzers/credentials/verifiers';
 import type { Config } from './config';
 import { openDatabase, type Db } from './db/database';
 import { EventRepo } from './db/eventRepo';
@@ -28,7 +31,7 @@ export type Container = {
 };
 
 /** Composition root: the only place that wires concrete implementations together. */
-export function createContainer(config: Config, overrides: { pipeline?: Pipeline } = {}): Container {
+export function createContainer(config: Config, overrides: { pipeline?: Pipeline; fetch?: typeof fetch } = {}): Container {
   const db = openDatabase(config.dbPath);
   const scans = new ScanRepo(db);
   const bus = new EventBus(new EventRepo(db));
@@ -46,7 +49,7 @@ export function createContainer(config: Config, overrides: { pipeline?: Pipeline
   const llmCalls = new LlmCallRepo(db);
   const budget = new BudgetTracker(config.scanBudgetUsd, (scanId) => scans.getDto(scanId)?.costUsd ?? 0);
   const llm = new LlmClient({
-    transport: createTransport(config),
+    transport: createTransport(config, [credentialsFpMockResponder]),
     models: config.models,
     limiter: new RateLimiter({ requestsPerMinute: config.llmRequestsPerMinute, inputTokensPerMinute: config.llmInputTokensPerMinute }),
     semaphore: new Semaphore(config.llmConcurrency),
@@ -57,9 +60,13 @@ export function createContainer(config: Config, overrides: { pipeline?: Pipeline
     }),
   });
 
+  const verifier = new SecretVerifier({ audit, ...(overrides.fetch ? { fetch: overrides.fetch } : {}) });
+  const analyzers = [createCredentialsAnalyzer({ llm, git, verifier })];
+
   const pipeline = overrides.pipeline ?? createScanPipeline({
     git, github, scans, indexRepo, indexer, maxRepoBytes: config.maxRepoBytes, maxFiles: config.maxFiles,
-    onFinished: (scanId) => budget.forget(scanId),
+    analyzers, findings,
+    onFinished: (scanId) => { budget.forget(scanId); verifier.forget(scanId); },
   });
 
   const runner = new JobRunner({
