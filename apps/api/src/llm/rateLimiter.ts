@@ -33,9 +33,26 @@ export class RateLimiter {
 
   /** Acquires capacity in strict call order, so a large request can't be starved behind a stream of small ones. */
   acquire(estimatedInputTokens: number, signal?: AbortSignal): Promise<void> {
-    const run = this.tail.then(() => this.acquireNow(estimatedInputTokens, signal));
-    this.tail = run.catch(() => undefined);
-    return run;
+    const turn = this.tail.then(() => this.acquireNow(estimatedInputTokens, signal));
+    // The tail always awaits `turn` itself (not the raced promise below), so later waiters keep
+    // queueing strictly in call order regardless of how/when an earlier waiter's public promise
+    // settles.
+    this.tail = turn.catch(() => undefined);
+    if (!signal) return turn;
+    if (signal.aborted) return Promise.reject(cancelled());
+    // A waiter can be aborted while still queued behind an earlier turn that is itself blocked
+    // (e.g. sleeping for refill) — `turn` won't settle until the queue actually reaches it, which
+    // could be arbitrarily far away. Race it against the abort signal so cancellation is prompt
+    // instead of waiting for its turn. Once its turn does arrive, acquireNow's own
+    // `signal?.aborted` check skips it immediately, so it never delays whoever queued up next.
+    return new Promise<void>((resolve, reject) => {
+      const onAbort = () => reject(cancelled());
+      signal.addEventListener('abort', onAbort, { once: true });
+      turn.then(
+        (value) => { signal.removeEventListener('abort', onAbort); resolve(value); },
+        (err) => { signal.removeEventListener('abort', onAbort); reject(err); },
+      );
+    });
   }
 
   private async acquireNow(estimatedInputTokens: number, signal?: AbortSignal): Promise<void> {

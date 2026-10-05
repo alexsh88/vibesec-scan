@@ -15,7 +15,11 @@ export class AnthropicTransport implements LlmTransport {
 
   async send(req: LlmRequest, signal: AbortSignal): Promise<Anthropic.Message> {
     try {
-      return await this.client.messages.create({
+      // Non-streaming messages.create has a fixed timeout too short for 8-16k-token outputs with
+      // adaptive thinking (the SDK's own non-streaming sizing is ~60min * maxTokens/128000), and
+      // passing an explicit `timeout` bypasses the SDK's "streaming required" guard for large
+      // max_tokens. Stream instead and read the accumulated result (#I-2).
+      const stream = this.client.messages.stream({
         model: req.model,
         max_tokens: req.maxTokens,
         system: req.system,
@@ -23,6 +27,7 @@ export class AnthropicTransport implements LlmTransport {
         ...(req.thinking ? { thinking: { type: 'adaptive' as const } } : {}),
         output_config: { format: zodOutputFormat(req.schema), ...(req.effort ? { effort: req.effort } : {}) },
       }, { signal, timeout: this.timeoutMs });
+      return await stream.finalMessage();
     } catch (err) {
       throw mapAnthropicError(err);
     }
@@ -31,21 +36,39 @@ export class AnthropicTransport implements LlmTransport {
 
 const CONTEXT_TOO_LARGE = /prompt is too long|too many tokens|context (window|length)|exceeds the maximum/i;
 
+/**
+ * `retry-after-ms` (milliseconds) takes priority over the standard `retry-after` (seconds)
+ * header, mirroring the SDK's own internal retry-delay parsing (#M-2).
+ */
+function retryDelayMs(headers: Headers | undefined): number | undefined {
+  const ms = Number(headers?.get('retry-after-ms'));
+  if (Number.isFinite(ms) && ms > 0) return ms;
+  const seconds = Number(headers?.get('retry-after'));
+  return Number.isFinite(seconds) && seconds > 0 ? seconds * 1000 : undefined;
+}
+
 export function mapAnthropicError(err: unknown): AppError {
   if (err instanceof Anthropic.APIUserAbortError) {
     return new AppError('CANCELLED', 'cancelled', 'Operation was cancelled', { cause: err });
+  }
+  // Must be checked before APIConnectionError, which it extends (#I-2).
+  if (err instanceof Anthropic.APIConnectionTimeoutError) {
+    return new AppError('LLM_UNAVAILABLE', 'transient', 'The Anthropic API request timed out', {
+      cause: err, details: { timeout: true },
+    });
   }
   if (err instanceof Anthropic.APIConnectionError) {
     return new AppError('LLM_UNAVAILABLE', 'transient', 'Could not reach the Anthropic API', { cause: err });
   }
   if (err instanceof Anthropic.RateLimitError) {
-    const seconds = Number(err.headers?.get('retry-after'));
     return new AppError('LLM_UNAVAILABLE', 'transient', 'Anthropic API rate limit reached', {
-      cause: err, retryAfterMs: Number.isFinite(seconds) && seconds > 0 ? seconds * 1000 : undefined, details: { rateLimited: true },
+      cause: err, retryAfterMs: retryDelayMs(err.headers), details: { rateLimited: true },
     });
   }
   if (err instanceof Anthropic.InternalServerError) {
-    return new AppError('LLM_UNAVAILABLE', 'transient', 'The Anthropic API is temporarily unavailable', { cause: err });
+    return new AppError('LLM_UNAVAILABLE', 'transient', 'The Anthropic API is temporarily unavailable', {
+      cause: err, retryAfterMs: retryDelayMs(err.headers),
+    });
   }
   if (err instanceof Anthropic.AuthenticationError || err instanceof Anthropic.PermissionDeniedError) {
     return new AppError('LLM_UNAVAILABLE', 'permanent', 'The Anthropic API key is invalid or lacks access', { cause: err });

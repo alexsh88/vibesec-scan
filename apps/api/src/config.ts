@@ -1,6 +1,12 @@
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, isAbsolute, join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { z } from 'zod';
+
+// apps/api/src/config.ts -> apps/api/src -> apps/api -> apps -> <repo root>. Anchoring on
+// import.meta.url (not process.cwd()) keeps LLM_RECORDINGS_DIR stable no matter where the
+// process is launched from (#M-6).
+const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
 
 const EnvSchema = z.object({
   PORT: z.coerce.number().int().positive().default(4000),
@@ -31,7 +37,9 @@ const EnvSchema = z.object({
   LLM_CONCURRENCY: z.coerce.number().int().positive().default(8),
   LLM_REQUESTS_PER_MINUTE: z.coerce.number().int().positive().default(50),
   LLM_INPUT_TOKENS_PER_MINUTE: z.coerce.number().int().positive().default(200_000),
-  LLM_TIMEOUT_MS: z.coerce.number().int().positive().default(120_000),
+  // Non-streaming has an SDK-enforced "streaming required" cliff around 10 min for large
+  // max_tokens; this is the per-request total cap for the now-streamed send() (#I-2).
+  LLM_TIMEOUT_MS: z.coerce.number().int().positive().default(600_000),
   LLM_RECORDINGS_DIR: z.string().default(join('fixtures', 'llm-recordings')),
 });
 
@@ -80,6 +88,9 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     cloneTimeoutMs: e.CLONE_TIMEOUT_MS, gitStallMs: e.GIT_STALL_MS,
     models: { fast: e.LLM_MODEL_FAST, deep: e.LLM_MODEL_DEEP, synthesis: e.LLM_MODEL_SYNTHESIS },
     llmConcurrency: e.LLM_CONCURRENCY, llmRequestsPerMinute: e.LLM_REQUESTS_PER_MINUTE,
-    llmInputTokensPerMinute: e.LLM_INPUT_TOKENS_PER_MINUTE, llmTimeoutMs: e.LLM_TIMEOUT_MS, llmRecordingsDir: e.LLM_RECORDINGS_DIR,
+    llmInputTokensPerMinute: e.LLM_INPUT_TOKENS_PER_MINUTE, llmTimeoutMs: e.LLM_TIMEOUT_MS,
+    // Relative overrides (and the relative default) resolve against the repo root, not cwd;
+    // an absolute override is used as-is (#M-6).
+    llmRecordingsDir: isAbsolute(e.LLM_RECORDINGS_DIR) ? e.LLM_RECORDINGS_DIR : resolve(REPO_ROOT, e.LLM_RECORDINGS_DIR),
   };
 }

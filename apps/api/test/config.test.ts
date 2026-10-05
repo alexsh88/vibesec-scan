@@ -1,5 +1,10 @@
+import { isAbsolute, resolve, dirname } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 import { loadConfig } from '../src/config';
+
+// apps/api/test/config.test.ts -> apps/api/test -> apps/api -> apps -> <repo root>
+const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
 
 describe('loadConfig', () => {
   it('defaults to mock mode without an API key', () => {
@@ -65,7 +70,9 @@ describe('LLM config', () => {
   it('has tiered model defaults and limits', () => {
     const c = loadConfig({});
     expect(c.models).toEqual({ fast: 'claude-haiku-4-5', deep: 'claude-sonnet-5', synthesis: 'claude-opus-5' });
-    expect(c).toMatchObject({ llmConcurrency: 8, llmRequestsPerMinute: 50, llmInputTokensPerMinute: 200_000, llmTimeoutMs: 120_000 });
+    // Long generations with adaptive thinking need a cap well above the SDK's own
+    // non-streaming timeout sizing, not the old 120s (#I-2).
+    expect(c).toMatchObject({ llmConcurrency: 8, llmRequestsPerMinute: 50, llmInputTokensPerMinute: 200_000, llmTimeoutMs: 600_000 });
     expect(c.llmRecordingsDir).toMatch(/llm-recordings$/);
   });
 
@@ -77,5 +84,23 @@ describe('LLM config', () => {
     expect(() => loadConfig({ SCAN_MODE: 'live' })).toThrow(/ANTHROPIC_API_KEY/);
     expect(() => loadConfig({ SCAN_MODE: 'record' })).toThrow(/ANTHROPIC_API_KEY/);
     expect(loadConfig({ SCAN_MODE: 'mock' }).scanMode).toBe('mock');
+  });
+});
+
+describe('LLM recordings dir (#M-6)', () => {
+  it('defaults to an absolute, repo-root-anchored path regardless of cwd', () => {
+    const c = loadConfig({});
+    expect(isAbsolute(c.llmRecordingsDir)).toBe(true);
+    expect(c.llmRecordingsDir).toBe(resolve(REPO_ROOT, 'fixtures', 'llm-recordings'));
+  });
+
+  it('resolves a relative override against the repo root, not the process cwd', () => {
+    const c = loadConfig({ LLM_RECORDINGS_DIR: 'rec' });
+    expect(c.llmRecordingsDir).toBe(resolve(REPO_ROOT, 'rec'));
+  });
+
+  it('uses an absolute override as-is', () => {
+    const abs = resolve(REPO_ROOT, 'somewhere', 'else');
+    expect(loadConfig({ LLM_RECORDINGS_DIR: abs }).llmRecordingsDir).toBe(abs);
   });
 });

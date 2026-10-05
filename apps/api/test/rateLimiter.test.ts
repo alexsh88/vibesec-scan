@@ -110,6 +110,43 @@ describe('RateLimiter', () => {
     expect(order.slice(1)).toEqual(Array.from({ length: 20 }, (_, i) => `small-${i}`));
   });
 
+  it('rejects an aborted waiter immediately even while the head is indefinitely blocked, and still lets the next waiter proceed right after the head (#M-1)', async () => {
+    const c = clock();
+    let releaseHead: (() => void) | undefined;
+    let sleepCalls = 0;
+    // The first sleep() call belongs to the head's wait-for-refill; hold it open indefinitely
+    // (instead of the fake clock's near-instant resolution) so we can prove the aborted waiter
+    // behind it rejects without waiting for the head to finish. Every later call behaves normally.
+    const sleep = async (ms: number, signal?: AbortSignal) => {
+      sleepCalls += 1;
+      if (sleepCalls === 1) {
+        await new Promise<void>((resolve) => { releaseHead = resolve; });
+        c.advance(ms);
+        return;
+      }
+      return c.sleep(ms, signal);
+    };
+    const rl = new RateLimiter({ requestsPerMinute: 1, inputTokensPerMinute: 1_000_000, now: c.now, sleep });
+    await rl.acquire(1); // consumes the only request slot
+
+    const order: string[] = [];
+    const ac = new AbortController();
+
+    const head = rl.acquire(1).then(() => order.push('head')); // must wait for refill → calls sleep (held open)
+    const aborted = rl.acquire(1, ac.signal);
+    const w3 = rl.acquire(1).then(() => order.push('w3'));
+
+    ac.abort(); // abort while queued behind the still-blocked head
+
+    await expect(aborted).rejects.toMatchObject({ code: 'CANCELLED' });
+    expect(order).toEqual([]); // the head has not completed yet — it is still blocked on sleep
+
+    releaseHead?.();
+    await head;
+    await w3;
+    expect(order).toEqual(['head', 'w3']);
+  });
+
   it('rejects an aborted queued waiter promptly without blocking the rest, which still complete in order', async () => {
     const c = clock();
     const rl = new RateLimiter({ requestsPerMinute: 10_000, inputTokensPerMinute: 100, now: c.now, sleep: c.sleep });
