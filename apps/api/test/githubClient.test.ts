@@ -88,6 +88,20 @@ describe('GitHubClient.getRepo', () => {
     expect(fetchMock).toHaveBeenCalledTimes(4);
   });
 
+  it('throws INTERNAL when a 200 response body is missing required fields, after exhausting retries', async () => {
+    const empty = () => json(200, {});
+    const { gh, fetchMock } = client([empty(), empty(), empty(), empty()]);
+    await expect(gh.getRepo('acme', 'app', undefined)).rejects.toMatchObject({ code: 'INTERNAL' });
+    expect(fetchMock).toHaveBeenCalledTimes(4);
+  });
+
+  it('never treats a repo as public when `private` is not a boolean', async () => {
+    const stringPrivate = () => json(200, repoJson({ private: 'false' }));
+    const { gh, fetchMock } = client([stringPrivate(), stringPrivate(), stringPrivate(), stringPrivate()]);
+    await expect(gh.getRepo('acme', 'app', undefined)).rejects.toMatchObject({ code: 'INTERNAL' });
+    expect(fetchMock).toHaveBeenCalledTimes(4);
+  });
+
   it('cancels when the signal is aborted', async () => {
     const ac = new AbortController();
     ac.abort();

@@ -65,11 +65,13 @@ export function runProcess(cmd: string, args: readonly string[], opts: RunOption
 
     const totalTimer = setTimeout(() => fail('timeout', `${cmd} timed out after ${opts.timeoutMs} ms`), opts.timeoutMs);
     const armStall = () => {
-      if (!opts.stallMs) return;
+      if (!opts.stallMs || settled || failure) return;
       clearTimeout(stallTimer);
       stallTimer = setTimeout(() => fail('stall', `${cmd} made no progress for ${opts.stallMs} ms`), opts.stallMs);
     };
-    armStall();
+    // Arm only once the child has actually started: cold start (process spawn, OS scheduling)
+    // shouldn't eat into the stall budget before the child has had a chance to produce output.
+    child.on('spawn', armStall);
 
     const onAbort = () => fail('aborted', `${cmd} aborted`);
     opts.signal?.addEventListener('abort', onAbort, { once: true });

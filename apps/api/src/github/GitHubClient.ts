@@ -1,3 +1,4 @@
+import { z } from 'zod';
 import { AppError, toAppError } from '../errors/AppError';
 import { CircuitBreaker } from '../resilience/circuitBreaker';
 import { RETRY_POLICIES, withRetry, type RetryDeps } from '../resilience/retry';
@@ -14,7 +15,15 @@ export type GitHubClientOptions = {
   breaker?: CircuitBreaker;
 };
 
-type RepoResponse = { private: boolean; default_branch: string; size: number; html_url: string; archived: boolean };
+const RepoResponseSchema = z.object({
+  private: z.boolean(),
+  default_branch: z.string().min(1),
+  size: z.number().nonnegative(),
+  html_url: z.string(),
+  archived: z.boolean(),
+}).passthrough();
+
+type RepoResponse = z.infer<typeof RepoResponseSchema>;
 
 export class GitHubClient {
   private readonly fetchImpl: typeof fetch;
@@ -74,11 +83,17 @@ export class GitHubClient {
     }
 
     if (res.ok) {
+      let json: unknown;
       try {
-        return (await res.json()) as RepoResponse;
+        json = await res.json();
       } catch (err) {
         throw new AppError('INTERNAL', 'transient', 'GitHub returned an unparseable response', { cause: err });
       }
+      const parsed = RepoResponseSchema.safeParse(json);
+      if (!parsed.success) {
+        throw new AppError('INTERNAL', 'transient', 'GitHub returned an unexpected response', { cause: parsed.error });
+      }
+      return parsed.data;
     }
 
     const rateLimited = (res.status === 403 || res.status === 429)

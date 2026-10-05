@@ -30,12 +30,14 @@ describe('runProcess', () => {
 
   it('output resets the stall timer and reports activity', async () => {
     let activity = 0;
+    const t0 = Date.now();
     const r = await run(
-      "let i = 0; const t = setInterval(() => { process.stderr.write('.'); if (++i === 6) { clearInterval(t); } }, 100)",
-      { stallMs: 400, onActivity: () => { activity++; } },
+      "let i = 0; const t = setInterval(() => { process.stderr.write('.'); if (++i === 30) clearInterval(t); }, 50)",
+      { stallMs: 1_000, onActivity: () => { activity++; } },
     );
     expect(r.code).toBe(0);
-    expect(activity).toBeGreaterThanOrEqual(6);
+    expect(activity).toBeGreaterThanOrEqual(30);
+    expect(Date.now() - t0).toBeGreaterThan(1_000); // only possible if the stall timer was reset
   });
 
   it('rejects with aborted when the signal fires', async () => {
