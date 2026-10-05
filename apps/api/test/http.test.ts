@@ -182,4 +182,27 @@ describe('HTTP API', () => {
     await start();
     expect((await app.inject({ method: 'GET', url: '/api/scans/nope/diagnostics' })).statusCode).toBe(404);
   });
+
+  it('lists, filters and fetches findings of a scan', async () => {
+    await start();
+    const { scanId } = (await createScan()).json();
+    await c.runner.whenIdle();
+    const base = {
+      scanId, category: 'secret' as const, ruleId: 'secret/x', baseSeverity: 'high' as const, riskScore: 70, riskFactors: [],
+      confidence: 'high' as const, explanation: 'e', impact: 'i', remediation: { summary: 'r' }, scanStatus: 'new' as const,
+      location: { file: 'a.ts', startLine: 1, endLine: 1, snippet: 's', permalink: 'p' },
+    };
+    c.findings.replaceForAnalyzer(scanId, 'secrets', [
+      { ...base, id: 'f1', fingerprint: 'a', title: 'High one', severity: 'high' },
+      { ...base, id: 'f2', fingerprint: 'b', title: 'Critical one', severity: 'critical', riskScore: 95 },
+    ]);
+    const list = (await app.inject({ method: 'GET', url: `/api/scans/${scanId}/findings` })).json();
+    expect(list.items.map((f: { id: string }) => f.id)).toEqual(['f2', 'f1']);
+    expect(list.counts).toEqual({ total: 2, bySeverity: { critical: 1, high: 1 }, byCategory: { secret: 2 } });
+    expect((await app.inject({ method: 'GET', url: `/api/scans/${scanId}/findings?severity=critical` })).json().items).toHaveLength(1);
+    expect((await app.inject({ method: 'GET', url: `/api/scans/${scanId}/findings/f1` })).json().title).toBe('High one');
+    expect((await app.inject({ method: 'GET', url: `/api/scans/${scanId}/findings/nope` })).statusCode).toBe(404);
+    expect((await app.inject({ method: 'GET', url: `/api/scans/${scanId}/findings?severity=urgent` })).statusCode).toBe(400);
+    expect((await app.inject({ method: 'GET', url: `/api/scans/missing/findings` })).statusCode).toBe(404);
+  });
 });
