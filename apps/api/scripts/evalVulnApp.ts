@@ -8,7 +8,7 @@
 //     calls, and OSV/registries are queried live — this costs money (bounded by the scan budget;
 //     pass --budget=<usd> or EVAL_BUDGET_USD to set budgetUsd for the scan).
 // Prints a per-issue table (found/missed + which analyzer), recall overall and per category, false
-// positives on the safe look-alikes, total findings, cost (USD + tokens by analyzer, from the
+// positives on the safe look-alikes (same concern) plus other findings on safe lines, total findings, cost (USD + tokens by analyzer, from the
 // diagnostics endpoint) and duration, and writes the full JSON report to $TEMP (path printed) —
 // never into the repository. Always exits 0 (it is a measurement) unless the scan itself fails.
 
@@ -73,8 +73,11 @@ async function main(): Promise<number> {
     const found = report.verdicts.filter((v) => v.found).length;
     console.log(`Recall: ${found}/${report.verdicts.length} = ${pct(report.recall)}`);
     for (const [cat, r] of Object.entries(report.recallByCategory).sort()) console.log(`  ${pad(cat, 11)} ${r.found}/${r.total} = ${pct(r.recall)}`);
-    console.log(`False positives on safe look-alikes: ${report.falsePositives.length}/${expected.safe.length}`);
+    console.log(`False positives (same concern) on safe look-alikes: ${report.falsePositives.length}/${expected.safe.length}`);
     for (const fp of report.falsePositives) console.log(`  ${fp.safe.file}:${fp.safe.line} <- ${fp.findings.map((f) => `${f.ruleId}@${f.line}`).join(', ')}`);
+    const others = report.otherFindingsOnSafeLines.reduce((n, o) => n + o.findings.length, 0);
+    console.log(`Other findings on safe lines (different concern, for review): ${others}`);
+    for (const o of report.otherFindingsOnSafeLines) console.log(`  ${o.safe.file}:${o.safe.line} <- ${o.findings.map((f) => `${f.ruleId}@${f.line}`).join(', ')}`);
     const byCategory = new Map<string, number>();
     for (const f of findings) byCategory.set(f.category, (byCategory.get(f.category) ?? 0) + 1);
     console.log(`Total findings: ${findings.length} (${[...byCategory.entries()].map(([c, n]) => `${c} ${n}`).join(', ')})`);

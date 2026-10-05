@@ -3,8 +3,12 @@
 //
 // An expected issue is FOUND when some finding is in the same file, its line range lies within
 // `lineTolerance` of the expected line, and it is compatible: same category, or same CWE, or the
-// expected `ruleHint` matches the finding's ruleId (kebab-normalized, either contains the other).
-// A safe look-alike is a FALSE POSITIVE when any finding's line range covers its line.
+// expected `ruleHint` (or one of its `alsoAccept` hints) matches the finding's ruleId (kebab-normalized,
+// either contains the other).
+// A safe look-alike is a FALSE POSITIVE only when a finding of the SAME CONCERN covers its line — same
+// CWE family or matching rule hint (the look-alike's `concern`). Any other finding covering a safe line
+// (e.g. missing-authn on the route a safe path-join sits in) is reported separately as "other findings on
+// safe lines", for review: it may be legitimate and is not what the look-alike tests.
 
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
@@ -12,10 +16,13 @@ import type { Category, Finding } from '@vibesec/shared';
 import { VULN_APP_ROOT } from './vulnApp';
 
 export type ExpectedIssue = {
-  id: string; category: Category; cwe?: string; ruleHint: string; file: string; line: number;
+  id: string; category: Category; cwe?: string; ruleHint: string; alsoAccept?: string[]; file: string; line: number;
   lineContains: string; lineTolerance: number; severityAtLeast: string; description: string;
 };
-export type SafeEntry = { file: string; line: number; lineContains: string; description: string };
+/** The vulnerability family a safe look-alike resembles. */
+export type SafeConcern = { ruleHints: string[]; cwes: string[] };
+export type SafeEntry = { file: string; line: number; lineContains: string; description: string; concern: SafeConcern };
+export type SafeLineFindings = { safe: SafeEntry; findings: Array<{ ruleId: string; category: Category; line: number }> };
 export type Expected = { version: 1; issues: ExpectedIssue[]; safe: SafeEntry[] };
 
 export type IssueVerdict = {
@@ -29,7 +36,10 @@ export type ScoreReport = {
   verdicts: IssueVerdict[];
   recall: number;
   recallByCategory: Record<string, { found: number; total: number; recall: number }>;
-  falsePositives: Array<{ safe: SafeEntry; findings: Array<{ ruleId: string; category: Category; line: number }> }>;
+  /** Same-concern findings on safe look-alike lines — the meaningful false-positive count. */
+  falsePositives: SafeLineFindings[];
+  /** Any other findings covering a safe line (different concern), listed for review. */
+  otherFindingsOnSafeLines: SafeLineFindings[];
   totalFindings: number;
 };
 
@@ -50,7 +60,13 @@ function nearLine(f: Finding, line: number, tolerance: number): boolean {
 }
 
 export function compatible(issue: ExpectedIssue, f: Finding): boolean {
-  return f.category === issue.category || (issue.cwe !== undefined && f.cwe === issue.cwe) || ruleHintMatches(issue.ruleHint, f.ruleId);
+  return f.category === issue.category || (issue.cwe !== undefined && f.cwe === issue.cwe)
+    || [issue.ruleHint, ...(issue.alsoAccept ?? [])].some((h) => ruleHintMatches(h, f.ruleId));
+}
+
+/** Does finding `f` raise the concern a safe look-alike is there to test? */
+export function sameConcern(concern: SafeConcern, f: Finding): boolean {
+  return (f.cwe !== undefined && concern.cwes.includes(f.cwe)) || concern.ruleHints.some((h) => ruleHintMatches(h, f.ruleId));
 }
 
 /** A finding plus the analyzer that persisted it (findings.analyzer). */
@@ -71,14 +87,17 @@ export function scoreFindings(findings: readonly ScoredFinding[], expected: Expe
     if (v.found) c.found++;
   }
   for (const c of Object.values(recallByCategory)) c.recall = c.total ? c.found / c.total : 0;
-  const falsePositives = expected.safe
+  const onSafeLine = (same: boolean): SafeLineFindings[] => expected.safe
     .map((safe) => ({
       safe,
       findings: findings
-        .filter((f) => f.location.file === safe.file && nearLine(f, safe.line, 0))
+        .filter((f) => f.location.file === safe.file && nearLine(f, safe.line, 0) && sameConcern(safe.concern, f) === same)
         .map((f) => ({ ruleId: f.ruleId, category: f.category, line: f.location.startLine })),
     }))
     .filter((fp) => fp.findings.length > 0);
   const found = verdicts.filter((v) => v.found).length;
-  return { verdicts, recall: verdicts.length ? found / verdicts.length : 0, recallByCategory, falsePositives, totalFindings: findings.length };
+  return {
+    verdicts, recall: verdicts.length ? found / verdicts.length : 0, recallByCategory,
+    falsePositives: onSafeLine(true), otherFindingsOnSafeLines: onSafeLine(false), totalFindings: findings.length,
+  };
 }

@@ -15,6 +15,8 @@ const IssueSchema = z.object({
   category: CategorySchema,
   cwe: z.string().optional(),
   ruleHint: z.string().min(1),
+  /** Other rule hints that also name this exact issue (e.g. a more specific rule for the same flaw). */
+  alsoAccept: z.array(z.string().min(1)).optional(),
   file: z.string().min(1),
   line: z.number().int().positive(),
   lineContains: z.string().min(1),
@@ -28,6 +30,11 @@ const SafeSchema = z.object({
   line: z.number().int().positive(),
   lineContains: z.string().min(1),
   description: z.string().min(1),
+  /** The concern this look-alike resembles: only findings of that rule/CWE family are false positives. */
+  concern: z.object({
+    ruleHints: z.array(z.string().min(1)),
+    cwes: z.array(z.string().regex(/^CWE-\d+$/)),
+  }).refine((c) => c.ruleHints.length + c.cwes.length > 0, 'concern needs a ruleHint or a CWE'),
 });
 
 const ExpectedSchema = z.object({

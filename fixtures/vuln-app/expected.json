@@ -234,6 +234,9 @@
       "category": "secret",
       "cwe": "CWE-200",
       "ruleHint": "client-exposed-credential",
+      "alsoAccept": [
+        "supabase-service-role-in-client"
+      ],
       "file": "web/lib/supabaseAdmin.ts",
       "line": 5,
       "lineContains": "NEXT_PUBLIC_SUPABASE_SERVICE_ROLE_KEY",
@@ -379,37 +382,91 @@
       "file": "api/src/services/invoiceService.ts",
       "line": 9,
       "lineContains": "WHERE id = $1",
-      "description": "Bound parameter — a safe look-alike next to the SQL-injection finding above, for contrast."
+      "description": "Bound parameter — a safe look-alike next to the SQL-injection finding above, for contrast.",
+      "concern": {
+        "ruleHints": [
+          "sql-injection"
+        ],
+        "cwes": [
+          "CWE-89"
+        ]
+      }
     },
     {
       "file": "api/src/routes/files.ts",
       "line": 19,
       "lineContains": "path.basename(req.params.name)",
-      "description": "path.basename strips '..' segments before the extension allowlist check, unlike the two path-traversal routes above."
+      "description": "path.basename strips '..' segments before the extension allowlist check, unlike the two path-traversal routes above.",
+      "concern": {
+        "ruleHints": [
+          "path-traversal"
+        ],
+        "cwes": [
+          "CWE-22"
+        ]
+      }
     },
     {
       "file": "api/src/routes/redirect.ts",
       "line": 12,
       "lineContains": "target.startsWith('/')",
-      "description": "Only same-site relative paths are allowed, so this redirect can't be used off-site."
+      "description": "Only same-site relative paths are allowed, so this redirect can't be used off-site.",
+      "concern": {
+        "ruleHints": [
+          "open-redirect"
+        ],
+        "cwes": [
+          "CWE-601"
+        ]
+      }
     },
     {
       "file": "api/test/mathUtils.test.ts",
       "line": 1,
       "lineContains": "eval(userInput)",
-      "description": "eval(userInput) appears only in a comment about a past implementation; nothing in this file calls eval."
+      "description": "eval(userInput) appears only in a comment about a past implementation; nothing in this file calls eval.",
+      "concern": {
+        "ruleHints": [
+          "code-injection",
+          "eval-injection"
+        ],
+        "cwes": [
+          "CWE-94",
+          "CWE-95"
+        ]
+      }
     },
     {
       "file": "web/components/CommentView.tsx",
       "line": 13,
       "lineContains": "{comment.authorName}",
-      "description": "Author name is rendered as plain JSX text (React escapes it), unlike the dangerouslySetInnerHTML above."
+      "description": "Author name is rendered as plain JSX text (React escapes it), unlike the dangerouslySetInnerHTML above.",
+      "concern": {
+        "ruleHints": [
+          "xss"
+        ],
+        "cwes": [
+          "CWE-79"
+        ]
+      }
     },
     {
       "file": "web/lib/supabaseClient.ts",
       "line": 6,
       "lineContains": "NEXT_PUBLIC_SUPABASE_ANON_KEY",
-      "description": "The anon key is designed to be public; exposing it via NEXT_PUBLIC_ is the correct, intended usage."
+      "description": "The anon key is designed to be public; exposing it via NEXT_PUBLIC_ is the correct, intended usage.",
+      "concern": {
+        "ruleHints": [
+          "client-exposed-credential",
+          "supabase-service-role-in-client",
+          "hardcoded-credential"
+        ],
+        "cwes": [
+          "CWE-200",
+          "CWE-284",
+          "CWE-798"
+        ]
+      }
     }
   ]
 }
