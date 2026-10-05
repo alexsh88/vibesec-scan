@@ -482,6 +482,7 @@ export function createConfigAnalyzer(deps: ConfigAnalyzerDeps): Analyzer {
 
       const findings: Finding[] = [];
       let warnedUnavailable = false;
+      let batchesDone = 0;
 
       await forEachLimit(batches, BATCH_CONCURRENCY, async (batch) => {
         try {
@@ -489,6 +490,8 @@ export function createConfigAnalyzer(deps: ConfigAnalyzerDeps): Analyzer {
         } finally {
           remainingUsd -= batchUsd(batch);
           lease.project(remainingUsd);
+          batchesDone++;
+          ctx.reportProgress?.(batchesDone, batches.length);
         }
       });
 

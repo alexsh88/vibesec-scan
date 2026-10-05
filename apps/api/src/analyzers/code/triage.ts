@@ -343,7 +343,7 @@ export class TriageService {
     const batches = packBatches(promptFiles, batchTokens);
 
     let warnedPartial = false;
-    await forEachLimit(batches, BATCH_CONCURRENCY, async (batch) => {
+    const reviewBatch = async (batch: PromptFile[]): Promise<void> => {
       checkAbort();
       const batchPaths = new Set(batch.map((f) => f.path));
       const call: StructuredCall<TriageOutput> = {
@@ -385,6 +385,18 @@ export class TriageService {
         }
       }
       ctx.touch();
+    };
+
+    // Reports as analyzer 'triage' regardless of which analyzer's context is actually driving this
+    // shared/memoized pass (see AnalyzerContext.reportProgress).
+    let batchesDone = 0;
+    await forEachLimit(batches, BATCH_CONCURRENCY, async (batch) => {
+      try {
+        await reviewBatch(batch);
+      } finally {
+        batchesDone++;
+        ctx.reportProgress?.(batchesDone, batches.length, 'triage');
+      }
     });
 
     return { files, skipped, warnings };

@@ -51,6 +51,16 @@ export type AnalyzerContext = {
   warn: (code: string, message: string) => void;
   /** Throttled progress/log line; a no-op if the pipeline has nowhere to send it. */
   progress: (message: string) => void;
+  /**
+   * Structured per-unit progress (files reviewed / batches / entrypoints / lockfiles / steps),
+   * wired to a `{type:'progress', analyzer, done, total}` ScanEvent (pipeline/stages/analyzeStage.ts).
+   * Throttled to at most 4 events/s per `analyzerLabel` (always including the final `done === total`
+   * call) — call it freely, every call after the first within the window is coalesced, not dropped.
+   * `analyzerLabel` overrides the emitted `analyzer` field; omit it to report under this analyzer's own
+   * id. Used by the shared triage pass (code/triage.ts) to always report as 'triage' regardless of
+   * which analyzer's context triggered it. Absent in unit tests that build a bare AnalyzerContext.
+   */
+  reportProgress?: (done: number, total: number, analyzerLabel?: string) => void;
   /** Records a file's coverage outcome (last write per analyzer+path wins). Absent in unit tests. */
   recordCoverage?: (analyzer: string, path: string, status: CoverageStatus) => void;
   /** Present on an incremental rescan only (see IncrementalContext). */

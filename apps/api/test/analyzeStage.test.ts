@@ -238,6 +238,89 @@ describe('analyzeStage', () => {
   });
 });
 
+describe('analyzeStage progress', () => {
+  it('emits a structured progress event per reportProgress call, throttled to <=4/s but always including the final done===total', async () => {
+    const { ctx, findings, indexRepo, events } = setup(['sast']);
+    vi.useFakeTimers();
+    try {
+      const analyzer = makeAnalyzer({
+        id: 'sast', category: 'sast',
+        run: async (actx) => {
+          for (let i = 1; i <= 10; i++) {
+            actx.reportProgress?.(i, 10);
+            vi.advanceTimersByTime(10); // well under the 250ms throttle window
+          }
+          return [];
+        },
+      });
+      await analyzeStage({ analyzers: [analyzer], findings, indexRepo, git: fakeGit }).run(ctx);
+    } finally {
+      vi.useRealTimers();
+    }
+
+    const progress = events.filter((e): e is Extract<ScanEvent, { type: 'progress' }> => e.type === 'progress' && e.analyzer === 'sast');
+    // Throttled: far fewer than the 10 calls made (only the first, and the forced final, got through).
+    expect(progress.length).toBeLessThan(10);
+    expect(progress[0]).toMatchObject({ done: 1, total: 10 });
+    expect(progress[progress.length - 1]).toMatchObject({ done: 10, total: 10 });
+    for (let i = 1; i < progress.length; i++) {
+      expect(progress[i]!.done).toBeGreaterThanOrEqual(progress[i - 1]!.done);
+      expect(progress[i]!.done).toBeLessThanOrEqual(progress[i]!.total);
+    }
+  });
+
+  it('always emits the final done===total call even when it arrives within the throttle window', async () => {
+    const { ctx, findings, indexRepo, events } = setup(['sast']);
+    const analyzer = makeAnalyzer({
+      id: 'sast', category: 'sast',
+      run: async (actx) => {
+        actx.reportProgress?.(1, 3);
+        actx.reportProgress?.(2, 3); // same tick: throttled away
+        actx.reportProgress?.(3, 3); // final: forced through regardless
+        return [];
+      },
+    });
+    await analyzeStage({ analyzers: [analyzer], findings, indexRepo, git: fakeGit }).run(ctx);
+
+    const progress = events.filter((e): e is Extract<ScanEvent, { type: 'progress' }> => e.type === 'progress');
+    expect(progress).toEqual([
+      { type: 'progress', analyzer: 'sast', done: 1, total: 3 },
+      { type: 'progress', analyzer: 'sast', done: 3, total: 3 },
+    ]);
+  });
+
+  it('lets an analyzer report under a different label (the shared triage pass always reports as "triage")', async () => {
+    const { ctx, findings, indexRepo, events } = setup(['sast']);
+    const analyzer = makeAnalyzer({
+      id: 'sast', category: 'sast',
+      run: async (actx) => {
+        actx.reportProgress?.(1, 2, 'triage');
+        actx.reportProgress?.(2, 2, 'triage');
+        actx.reportProgress?.(1, 1); // defaults to this analyzer's own id
+        return [];
+      },
+    });
+    await analyzeStage({ analyzers: [analyzer], findings, indexRepo, git: fakeGit }).run(ctx);
+
+    const progress = events.filter((e): e is Extract<ScanEvent, { type: 'progress' }> => e.type === 'progress');
+    expect(progress).toEqual([
+      { type: 'progress', analyzer: 'triage', done: 1, total: 2 },
+      { type: 'progress', analyzer: 'triage', done: 2, total: 2 },
+      { type: 'progress', analyzer: 'sast', done: 1, total: 1 },
+    ]);
+  });
+
+  it('keeps each analyzer\'s progress independent (one analyzer finishing fast never throttles another)', async () => {
+    const { ctx, findings, indexRepo, events } = setup(['secret', 'sast']);
+    const a = makeAnalyzer({ id: 'credentials', category: 'secret', run: async (actx) => { actx.reportProgress?.(1, 1); return []; } });
+    const b = makeAnalyzer({ id: 'sast', category: 'sast', run: async (actx) => { actx.reportProgress?.(1, 1); return []; } });
+    await analyzeStage({ analyzers: [a, b], findings, indexRepo, git: fakeGit }).run(ctx);
+
+    const progress = events.filter((e): e is Extract<ScanEvent, { type: 'progress' }> => e.type === 'progress');
+    expect(progress.map((p) => p.analyzer).sort()).toEqual(['credentials', 'sast']);
+  });
+});
+
 describe('analyzeStage coverage', () => {
   it('collects per-file coverage from every analyzer, persists it and warns BUDGET_COVERAGE_PARTIAL with counts', async () => {
     const { ctx, findings, indexRepo, warnings, scanId, db } = setup(['sast', 'quality']);
@@ -281,6 +364,37 @@ describe('analyzeStage coverage', () => {
     await analyzeStage({ analyzers: [sast], findings, indexRepo, git: fakeGit, coverage }).run(ctx);
     expect(warnings).toEqual([]);
     expect(coverage.list(scanId)).toEqual([{ analyzer: 'sast', path: 'a.ts', status: 'cached' }]);
+  });
+
+  it('persists coverage incrementally as each analyzer finishes, not only once the whole stage ends', async () => {
+    const { ctx, findings, indexRepo, scanId, db } = setup(['secret', 'sast']);
+    const coverage = new CoverageRepo(db);
+    const defSlow = deferred<Finding[]>();
+    const fast = makeAnalyzer({
+      id: 'credentials', category: 'secret',
+      run: async (actx) => { actx.recordCoverage?.('credentials', 'a.ts', 'reviewed'); return []; },
+    });
+    const slow = makeAnalyzer({
+      id: 'sast', category: 'sast',
+      run: async (actx) => {
+        await defSlow.promise; // still running (and hasn't recorded anything yet) when `fast` settles
+        actx.recordCoverage?.('sast', 'b.ts', 'reviewed');
+        return [];
+      },
+    });
+    const runPromise = analyzeStage({ analyzers: [fast, slow], findings, indexRepo, git: fakeGit, coverage }).run(ctx);
+
+    // `fast` settles on its own microtask queue turn; give it a chance to flush before `slow` resolves.
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(coverage.list(scanId)).toEqual([{ analyzer: 'credentials', path: 'a.ts', status: 'reviewed' }]);
+
+    defSlow.resolve([]);
+    await runPromise;
+    expect(coverage.list(scanId)).toEqual([
+      { analyzer: 'credentials', path: 'a.ts', status: 'reviewed' },
+      { analyzer: 'sast', path: 'b.ts', status: 'reviewed' },
+    ]);
   });
 });
 

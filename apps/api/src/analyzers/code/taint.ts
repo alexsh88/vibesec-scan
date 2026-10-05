@@ -131,12 +131,15 @@ async function runTaint(deps: TaintAnalyzerDeps, ctx: AnalyzerContext, lease: Wo
   let failed = 0;
   let budgetExhausted = false;
 
+  let tracedCount = 0;
   await forEachLimit(selected, deps.concurrency ?? DEFAULT_CONCURRENCY, async (file) => {
     try {
       await traceOne(file);
     } finally {
       agentsLeft--;
       lease.project(agentsLeft * perAgentUsd);
+      tracedCount++;
+      ctx.reportProgress?.(tracedCount, selected.length);
     }
   });
 

@@ -301,32 +301,38 @@ export function createCredentialsAnalyzer(deps: CredentialsAnalyzerDeps): Analyz
       const verifyEnabled = ctx.scan.options.verifySecrets;
       const findings: Finding[] = [];
       let warnedVerificationFailure = false;
+      let verified = 0;
       try {
         await forEachLimit(deduped, deps.maxConcurrentVerifications ?? 4, async ({ candidate, occurrenceCount }) => {
-          let verify: VerifyResult;
-          if (verifyEnabled) {
-            try {
-              verify = await deps.verifier.verify(ctx.scanId, toVerifiable(candidate), ctx.signal);
-            } catch (raw) {
-              const err = toAppError(raw);
-              // M3: cancellation must still propagate; it's only a *liveness-check* failure that is
-              // tolerated by degrading this one candidate to 'unknown' rather than failing the whole
-              // analyzer (and, by extension, every other candidate's finding) over one bad network call.
-              if (err.kind === 'cancelled' || ctx.signal.aborted) throw err;
-              if (!warnedVerificationFailure) {
-                ctx.warn(
-                  'CREDENTIALS_VERIFICATION_FAILED',
-                  `Liveness verification failed for one or more credential candidates: ${err.userMessage}`,
-                );
-                warnedVerificationFailure = true;
+          try {
+            let verify: VerifyResult;
+            if (verifyEnabled) {
+              try {
+                verify = await deps.verifier.verify(ctx.scanId, toVerifiable(candidate), ctx.signal);
+              } catch (raw) {
+                const err = toAppError(raw);
+                // M3: cancellation must still propagate; it's only a *liveness-check* failure that is
+                // tolerated by degrading this one candidate to 'unknown' rather than failing the whole
+                // analyzer (and, by extension, every other candidate's finding) over one bad network call.
+                if (err.kind === 'cancelled' || ctx.signal.aborted) throw err;
+                if (!warnedVerificationFailure) {
+                  ctx.warn(
+                    'CREDENTIALS_VERIFICATION_FAILED',
+                    `Liveness verification failed for one or more credential candidates: ${err.userMessage}`,
+                  );
+                  warnedVerificationFailure = true;
+                }
+                verify = { liveness: 'unknown' };
               }
-              verify = { liveness: 'unknown' };
+            } else {
+              verify = { liveness: 'not_checked' };
             }
-          } else {
-            verify = { liveness: 'not_checked' };
+            ctx.touch();
+            findings.push(buildFinding(ctx, candidate, verify, verdicts.get(candidate.id), occurrenceCount));
+          } finally {
+            verified++;
+            ctx.reportProgress?.(verified, deduped.length);
           }
-          ctx.touch();
-          findings.push(buildFinding(ctx, candidate, verify, verdicts.get(candidate.id), occurrenceCount));
         });
       } finally {
         deps.verifier.forget(ctx.scanId);

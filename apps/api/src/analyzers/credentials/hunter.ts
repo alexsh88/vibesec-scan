@@ -543,51 +543,57 @@ export function createCredentialHunter(deps: CredentialHunterDeps): Analyzer {
 
       const findings: Finding[] = [...reusedResults];
       let warnedPartial = false;
+      let batchesDone = 0;
       for (const batch of batches) {
-        checkAbort();
-        remainingUsd -= batchUsd(batch);
-        const batchPaths = new Set(batch.map((f) => f.path));
-        if (budgetExhausted) {
-          for (const f of batch) record(f.path, 'budget-skipped');
-          lease.project(remainingUsd);
-          continue;
-        }
-        const call: StructuredCall<HunterOutput> = {
-          scanId: ctx.scanId, analyzer: 'credential-hunter', purpose: 'credential-hunt',
-          promptVersion: CREDENTIAL_HUNTER_PROMPT_VERSION, role: 'fast', system: SYSTEM_PROMPT,
-          prompt: batch.map((f) => f.block).join('\n\n'), schema: HunterOutputSchema,
-          signal: ctx.signal, onActivity: ctx.touch,
-        };
-        let output: HunterOutput;
         try {
-          const result = await deps.llm.structured(call);
-          output = result.output;
-        } catch (raw) {
-          const err = toAppError(raw);
-          if (err.kind === 'cancelled' || ctx.signal.aborted) throw err;
-          lease.project(remainingUsd);
-          if (err.kind === 'budget') {
-            budgetExhausted = true;
+          checkAbort();
+          remainingUsd -= batchUsd(batch);
+          const batchPaths = new Set(batch.map((f) => f.path));
+          if (budgetExhausted) {
             for (const f of batch) record(f.path, 'budget-skipped');
+            lease.project(remainingUsd);
             continue;
           }
-          for (const f of batch) record(f.path, 'failed');
-          if (!warnedPartial) {
-            warnedPartial = true;
-            ctx.warn('CREDENTIAL_HUNTER_PARTIAL', 'AI credential hunting failed for one or more file batches; those files were only covered by the regex scanner');
+          const call: StructuredCall<HunterOutput> = {
+            scanId: ctx.scanId, analyzer: 'credential-hunter', purpose: 'credential-hunt',
+            promptVersion: CREDENTIAL_HUNTER_PROMPT_VERSION, role: 'fast', system: SYSTEM_PROMPT,
+            prompt: batch.map((f) => f.block).join('\n\n'), schema: HunterOutputSchema,
+            signal: ctx.signal, onActivity: ctx.touch,
+          };
+          let output: HunterOutput;
+          try {
+            const result = await deps.llm.structured(call);
+            output = result.output;
+          } catch (raw) {
+            const err = toAppError(raw);
+            if (err.kind === 'cancelled' || ctx.signal.aborted) throw err;
+            lease.project(remainingUsd);
+            if (err.kind === 'budget') {
+              budgetExhausted = true;
+              for (const f of batch) record(f.path, 'budget-skipped');
+              continue;
+            }
+            for (const f of batch) record(f.path, 'failed');
+            if (!warnedPartial) {
+              warnedPartial = true;
+              ctx.warn('CREDENTIAL_HUNTER_PARTIAL', 'AI credential hunting failed for one or more file batches; those files were only covered by the regex scanner');
+            }
+            continue;
           }
-          continue;
+          for (const r of output.results) {
+            if (!batchPaths.has(r.file)) continue; // only trust files we actually sent in this batch
+            const fileText = contentOf.get(r.file);
+            if (fileText === undefined) continue;
+            const finding = buildHunterFinding(ctx, r, fileText, regexCoveredLines);
+            if (finding) findings.push(finding);
+          }
+          for (const f of batch) record(f.path, 'reviewed');
+          lease.project(remainingUsd);
+          ctx.touch();
+        } finally {
+          batchesDone++;
+          ctx.reportProgress?.(batchesDone, batches.length);
         }
-        for (const r of output.results) {
-          if (!batchPaths.has(r.file)) continue; // only trust files we actually sent in this batch
-          const fileText = contentOf.get(r.file);
-          if (fileText === undefined) continue;
-          const finding = buildHunterFinding(ctx, r, fileText, regexCoveredLines);
-          if (finding) findings.push(finding);
-        }
-        for (const f of batch) record(f.path, 'reviewed');
-        lease.project(remainingUsd);
-        ctx.touch();
       }
 
       return findings;

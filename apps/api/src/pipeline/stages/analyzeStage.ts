@@ -8,7 +8,10 @@ import { AppError, toAppError } from '../../errors/AppError';
 import type { GitService } from '../../git/GitService';
 import { planIncremental, reuseStats, type IncrementalDeps } from '../incremental';
 import type { PipelineContext, StageSpec } from '../types';
-import { requireCommitSha } from './common';
+import { requireCommitSha, throttle } from './common';
+
+/** Max rate of `progress` events emitted per analyzer label (see AnalyzerContext.reportProgress). */
+const PROGRESS_THROTTLE_MS = 250; // <= 4 events/s
 
 export type AnalyzeStageDeps = {
   analyzers: readonly Analyzer[];
@@ -94,8 +97,32 @@ export function analyzeStage(deps: AnalyzeStageDeps): StageSpec {
         coverage.set(`${analyzer}\0${path}`, { analyzer, path, status });
       };
 
+      // Flushed to `deps.coverage` every time an analyzer settles (see below), so GET /api/scans/:id/diagnostics
+      // can show coverage incrementally while other analyzers are still running, not only once the whole
+      // stage ends. Each flush writes the FULL map-so-far (replaceForScan fully replaces the scan's
+      // coverage), so it is always safe to call again — the authoritative, failedIds-filtered call below
+      // still runs last and wins.
+      const flushCoverage = () => deps.coverage?.replaceForScan(ctx.scanId, [...coverage.values()]);
+
       const settled = await Promise.allSettled(
         enabled.map((analyzer) => {
+          // Per-analyzer-context throttled progress emitter, keyed by the reported label (almost always
+          // `analyzer.id`, except the shared triage pass which always overrides to 'triage' — see
+          // AnalyzerContext.reportProgress). A fresh Map per analyzer context: only the analyzer whose
+          // `run` actually reaches the shared/memoized triage service drives its throttle state.
+          const progressThrottles = new Map<string, (done: number, total: number) => void>();
+          const reportProgress = (done: number, total: number, analyzerLabel: string = analyzer.id) => {
+            let emitThrottled = progressThrottles.get(analyzerLabel);
+            if (!emitThrottled) {
+              emitThrottled = throttle(
+                (d: number, t: number) => ctx.emit({ type: 'progress', analyzer: analyzerLabel, done: d, total: t }),
+                PROGRESS_THROTTLE_MS,
+                (d, t) => d >= t,
+              );
+              progressThrottles.set(analyzerLabel, emitThrottled);
+            }
+            emitThrottled(done, total);
+          };
           const actx: AnalyzerContext = {
             scanId: ctx.scanId,
             scan: ctx.scan,
@@ -110,10 +137,14 @@ export function analyzeStage(deps: AnalyzeStageDeps): StageSpec {
             // No free-text log/progress ScanEvent exists today (only structured `progress` with done/total);
             // a no-op until one does. See report for this deviation.
             progress: () => {},
+            reportProgress,
             recordCoverage,
             ...(plan ? { incremental: plan } : {}),
           };
-          return runAnalyzer(analyzer, actx, deps, ctx);
+          return runAnalyzer(analyzer, actx, deps, ctx).then((outcome) => {
+            flushCoverage();
+            return outcome;
+          });
         }),
       );
 

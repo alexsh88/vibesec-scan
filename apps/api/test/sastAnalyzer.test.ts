@@ -42,7 +42,13 @@ async function writeFiles(files: Record<string, string>, tags: Record<string, In
   return indexed;
 }
 
-function makeCtx(files: IndexedFile[], opts: { warn?: (code: string, message: string) => void; signal?: AbortSignal; scanId?: string; coverage?: Map<string, CoverageStatus> } = {}): AnalyzerContext {
+function makeCtx(
+  files: IndexedFile[],
+  opts: {
+    warn?: (code: string, message: string) => void; signal?: AbortSignal; scanId?: string; coverage?: Map<string, CoverageStatus>;
+    onProgress?: (done: number, total: number) => void;
+  } = {},
+): AnalyzerContext {
   const scan: ScanDto = {
     id: opts.scanId ?? 'scan-1', repo: { id: 'repo-1', owner: 'acme', name: 'app', isPrivate: false }, ref: null,
     commitSha: 'c'.repeat(40), state: 'ANALYZING', errorCode: null, errorMessage: null, cacheHit: 'none',
@@ -52,6 +58,7 @@ function makeCtx(files: IndexedFile[], opts: { warn?: (code: string, message: st
   return {
     scanId: scan.id, scan, repoDir: dir, commitSha: scan.commitSha!, repo: scan.repo, files,
     signal: opts.signal ?? new AbortController().signal, touch: () => {}, warn: opts.warn ?? (() => {}), progress: () => {},
+    reportProgress: opts.onProgress ?? (() => {}),
     recordCoverage: (analyzer, path, status) => { expect(analyzer).toBe('sast'); opts.coverage?.set(path, status); },
   };
 }
@@ -318,12 +325,17 @@ describe('SAST analyzer — resilience', () => {
     const { llm, calls } = stubLlm(async () => { throw new AppError('BUDGET_EXHAUSTED', 'budget', 'out'); });
     const warnings: string[] = [];
     const coverage = new Map<string, CoverageStatus>();
+    const progress: Array<[number, number]> = [];
     const findings = await createSastAnalyzer({ llm, concurrency: 1, triage: triageOf(tri('a.ts', 3), tri('b.ts', 3), tri('c.ts', 3), tri('d.ts', 1)), indexRepo: indexRepoOf() })
-      .run(makeCtx(files, { warn: (c) => warnings.push(c), coverage }));
+      .run(makeCtx(files, { warn: (c) => warnings.push(c), coverage, onProgress: (done, total) => progress.push([done, total]) }));
     expect(findings).toEqual([]);
     expect(calls).toHaveLength(1);
     expect(warnings).toEqual([]); // the pipeline reports BUDGET_COVERAGE_PARTIAL from the coverage instead
     expect(Object.fromEntries(coverage)).toEqual({ 'a.ts': 'budget-skipped', 'b.ts': 'budget-skipped', 'c.ts': 'budget-skipped', 'd.ts': 'budget-skipped' });
+    // Every work item is reported — including the budget-skipped ones, never just the ones actually
+    // reviewed — so the final call always reaches done === total (here 4), not just "1 reviewed".
+    expect(progress.every(([done, total]) => done <= total && total === 4)).toBe(true);
+    expect(progress[progress.length - 1]).toEqual([4, 4]);
   });
 
   it('propagates cancellation from the LLM and stops other workers', async () => {

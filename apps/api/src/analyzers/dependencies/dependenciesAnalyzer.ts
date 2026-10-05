@@ -472,9 +472,10 @@ export function createDependenciesAnalyzer(deps: DependenciesAnalyzerDeps): Anal
       } catch {
         edges = null;
       }
-      for (const w of work) {
+      for (const [i, w] of work.entries()) {
         w.usages = edges === null ? null : indexUsages(edges, w.graph);
         if (w.vulnerable.length > 0 || w.signals.length > 0) w.references = await findPackageReferences(read, ctx.files, w.graph);
+        ctx.reportProgress?.(i + 1, work.length);
       }
 
       const sandboxTargets = work.filter((w) => w.vulnerable.length > 0);

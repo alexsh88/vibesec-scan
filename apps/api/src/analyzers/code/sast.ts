@@ -479,67 +479,75 @@ export function createSastAnalyzer(deps: SastAnalyzerDeps): Analyzer {
       if (!existing || SEVERITY_RANK[finding.severity] < SEVERITY_RANK[existing.severity]) byFingerprint.set(finding.fingerprint, finding);
     };
 
+    // Reports against every work item (cached/budget-skipped/failed included), so the final call always
+    // reaches done === work.length — `done` above only counts actual reviews, for the free-text message.
+    let processed = 0;
     const reviewOne = async ({ path, pass }: WorkItem): Promise<void> => {
-      checkAbort();
-      const content = await readRepoFile(ctx.repoDir, path);
-      if (content === null) { record(path, 'failed'); return; }
-      const prompt = buildPrompt(path, content, await buildLocalContext(ctx, path, imports, indexed), hintsFor(triage.files.get(path)), ruleHintsFor(path, content));
-
-      const key = deps.cache ? cacheKey(prompt, deps.cache.model(pass)) : null;
-      const cached = key ? deps.cache!.store.get(key) : undefined;
-      if (cached) {
-        for (const c of cached) {
-          const raw = fromCached(c, content);
-          const outcome = raw ? verifyIssueLocation(raw, content) : null; // re-clips exactly like the first run
-          if (outcome && outcome.status !== 'dropped') keep(outcome.issue, pass);
-        }
-        record(path, 'cached');
-        return;
-      }
-      if (exhausted[pass] || (pass === 'fast' && exhausted.deep)) { record(path, 'budget-skipped'); return; }
-
-      const call: StructuredCall<SastOutput> = {
-        scanId: ctx.scanId, analyzer: 'sast', purpose: pass === 'deep' ? 'sast-file' : 'sast-file-fast', promptVersion: SAST_PROMPT_VERSION,
-        role: pass, system: SAST_SYSTEM_PROMPT, context: sharedContext, prompt,
-        schema: SastOutputSchema, signal: ctx.signal, onActivity: ctx.touch,
-        ...(pass === 'deep' ? { effort: 'medium' as const } : { tier: 2 as const }),
-      };
-      let issues: SastIssue[];
-      let degraded = false;
       try {
-        const result = await deps.llm.structured(call);
-        issues = result.output.issues;
-        degraded = result.degraded;
-      } catch (raw) {
-        const err = toAppError(raw);
-        if (err.kind === 'cancelled' || ctx.signal.aborted) throw err;
-        if (err.kind === 'budget') {
-          exhausted[pass] = true;
-          record(path, 'budget-skipped');
+        checkAbort();
+        const content = await readRepoFile(ctx.repoDir, path);
+        if (content === null) { record(path, 'failed'); return; }
+        const prompt = buildPrompt(path, content, await buildLocalContext(ctx, path, imports, indexed), hintsFor(triage.files.get(path)), ruleHintsFor(path, content));
+
+        const key = deps.cache ? cacheKey(prompt, deps.cache.model(pass)) : null;
+        const cached = key ? deps.cache!.store.get(key) : undefined;
+        if (cached) {
+          for (const c of cached) {
+            const raw = fromCached(c, content);
+            const outcome = raw ? verifyIssueLocation(raw, content) : null; // re-clips exactly like the first run
+            if (outcome && outcome.status !== 'dropped') keep(outcome.issue, pass);
+          }
+          record(path, 'cached');
           return;
         }
-        record(path, 'failed');
-        const reason = llmFailureReason(err);
-        failures.set(reason, (failures.get(reason) ?? 0) + 1);
-        return;
-      } finally {
-        ctx.touch();
-      }
+        if (exhausted[pass] || (pass === 'fast' && exhausted.deep)) { record(path, 'budget-skipped'); return; }
 
-      const verified: RawCodeIssue[] = [];
-      for (const issue of issues) {
-        if (issue.file !== path) { dropped++; continue; }
-        const raw = toRaw(issue, degraded);
-        if (pass === 'fast') raw.confidence = CAP_MEDIUM[raw.confidence];
-        const outcome = verifyIssueLocation(raw, content);
-        if (outcome.status === 'dropped') { dropped++; continue; }
-        verified.push(outcome.issue);
-        keep(outcome.issue, pass);
+        const call: StructuredCall<SastOutput> = {
+          scanId: ctx.scanId, analyzer: 'sast', purpose: pass === 'deep' ? 'sast-file' : 'sast-file-fast', promptVersion: SAST_PROMPT_VERSION,
+          role: pass, system: SAST_SYSTEM_PROMPT, context: sharedContext, prompt,
+          schema: SastOutputSchema, signal: ctx.signal, onActivity: ctx.touch,
+          ...(pass === 'deep' ? { effort: 'medium' as const } : { tier: 2 as const }),
+        };
+        let issues: SastIssue[];
+        let degraded = false;
+        try {
+          const result = await deps.llm.structured(call);
+          issues = result.output.issues;
+          degraded = result.degraded;
+        } catch (raw) {
+          const err = toAppError(raw);
+          if (err.kind === 'cancelled' || ctx.signal.aborted) throw err;
+          if (err.kind === 'budget') {
+            exhausted[pass] = true;
+            record(path, 'budget-skipped');
+            return;
+          }
+          record(path, 'failed');
+          const reason = llmFailureReason(err);
+          failures.set(reason, (failures.get(reason) ?? 0) + 1);
+          return;
+        } finally {
+          ctx.touch();
+        }
+
+        const verified: RawCodeIssue[] = [];
+        for (const issue of issues) {
+          if (issue.file !== path) { dropped++; continue; }
+          const raw = toRaw(issue, degraded);
+          if (pass === 'fast') raw.confidence = CAP_MEDIUM[raw.confidence];
+          const outcome = verifyIssueLocation(raw, content);
+          if (outcome.status === 'dropped') { dropped++; continue; }
+          verified.push(outcome.issue);
+          keep(outcome.issue, pass);
+        }
+        if (key && !degraded) deps.cache!.store.set(key, verified.map(toCached));
+        record(path, pass === 'deep' ? 'reviewed' : 'reviewed-fast');
+        done++;
+        ctx.progress(`SAST: reviewed ${done}/${work.length} files`);
+      } finally {
+        processed++;
+        ctx.reportProgress?.(processed, work.length);
       }
-      if (key && !degraded) deps.cache!.store.set(key, verified.map(toCached));
-      record(path, pass === 'deep' ? 'reviewed' : 'reviewed-fast');
-      done++;
-      ctx.progress(`SAST: reviewed ${done}/${work.length} files`);
     };
 
     await forEachLimit(work, concurrency, async (item) => {

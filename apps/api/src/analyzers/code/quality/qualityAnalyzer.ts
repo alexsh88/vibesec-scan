@@ -309,57 +309,63 @@ export function createQualityAnalyzer(deps: QualityAnalyzerDeps): Analyzer {
 
       const findings: Finding[] = reusedFindings(ctx, 'quality', reused);
       const failures = new Map<LlmFailureReason, number>();
+      let reviewedCount = 0;
 
       await forEachLimit(selected, REVIEW_CONCURRENCY, async (path) => {
-        checkAbort();
-        const m = metricsByPath.get(path);
-        const text = textByPath.get(path);
-        if (!m || text === undefined) return;
-        if (budgetExhausted) { record(path, 'budget-skipped'); return; }
-
-        const prompt = `${untrustedFile(path, numberLines(text))}\n\n${buildFacts(m, duplicatesByPath.get(path) ?? [])}`;
-        const call: StructuredCall<QualityOutput> = {
-          scanId: ctx.scanId, analyzer: 'quality', purpose: 'quality-review', promptVersion: QUALITY_PROMPT_VERSION,
-          role: 'fast', tier: 3, system: SYSTEM_PROMPT, prompt, schema: QualityOutputSchema,
-          maxTokens: QUALITY_MAX_TOKENS, signal: ctx.signal, onActivity: ctx.touch,
-        };
-
         try {
-          const result = await deps.llm.structured(call);
-          for (const raw of selectIssues(result.output.issues)) {
-            const issue: RawCodeIssue = {
-              ruleId: raw.ruleId,
-              title: raw.title,
-              severity: clampSeverity(raw.severity),
-              confidence: raw.confidence,
-              file: path,
-              startLine: raw.startLine,
-              endLine: raw.endLine,
-              snippet: raw.snippet,
-              explanation: raw.explanation,
-              impact: raw.impact,
-              remediation: raw.remediation,
-            };
-            const outcome = verifyIssueLocation(issue, text);
-            if (outcome.status === 'dropped') continue;
-            findings.push(issueToFinding(ctx, 'quality', outcome.issue, ['quality:llm']));
+          checkAbort();
+          const m = metricsByPath.get(path);
+          const text = textByPath.get(path);
+          if (!m || text === undefined) return;
+          if (budgetExhausted) { record(path, 'budget-skipped'); return; }
+
+          const prompt = `${untrustedFile(path, numberLines(text))}\n\n${buildFacts(m, duplicatesByPath.get(path) ?? [])}`;
+          const call: StructuredCall<QualityOutput> = {
+            scanId: ctx.scanId, analyzer: 'quality', purpose: 'quality-review', promptVersion: QUALITY_PROMPT_VERSION,
+            role: 'fast', tier: 3, system: SYSTEM_PROMPT, prompt, schema: QualityOutputSchema,
+            maxTokens: QUALITY_MAX_TOKENS, signal: ctx.signal, onActivity: ctx.touch,
+          };
+
+          try {
+            const result = await deps.llm.structured(call);
+            for (const raw of selectIssues(result.output.issues)) {
+              const issue: RawCodeIssue = {
+                ruleId: raw.ruleId,
+                title: raw.title,
+                severity: clampSeverity(raw.severity),
+                confidence: raw.confidence,
+                file: path,
+                startLine: raw.startLine,
+                endLine: raw.endLine,
+                snippet: raw.snippet,
+                explanation: raw.explanation,
+                impact: raw.impact,
+                remediation: raw.remediation,
+              };
+              const outcome = verifyIssueLocation(issue, text);
+              if (outcome.status === 'dropped') continue;
+              findings.push(issueToFinding(ctx, 'quality', outcome.issue, ['quality:llm']));
+            }
+            record(path, 'reviewed');
+          } catch (rawErr) {
+            const err = toAppError(rawErr);
+            if (err.kind === 'cancelled' || ctx.signal.aborted) throw err;
+            if (err.kind === 'budget') {
+              budgetExhausted = true;
+              record(path, 'budget-skipped');
+              return;
+            }
+            record(path, 'failed');
+            // Quality is not security-critical: a file whose AI review fails produces NO findings, only
+            // one aggregated warning per run (unlike config's fail-open, which keeps low-confidence hints).
+            const reason = llmFailureReason(err);
+            failures.set(reason, (failures.get(reason) ?? 0) + 1);
           }
-          record(path, 'reviewed');
-        } catch (rawErr) {
-          const err = toAppError(rawErr);
-          if (err.kind === 'cancelled' || ctx.signal.aborted) throw err;
-          if (err.kind === 'budget') {
-            budgetExhausted = true;
-            record(path, 'budget-skipped');
-            return;
-          }
-          record(path, 'failed');
-          // Quality is not security-critical: a file whose AI review fails produces NO findings, only
-          // one aggregated warning per run (unlike config's fail-open, which keeps low-confidence hints).
-          const reason = llmFailureReason(err);
-          failures.set(reason, (failures.get(reason) ?? 0) + 1);
+          ctx.touch();
+        } finally {
+          reviewedCount++;
+          ctx.reportProgress?.(reviewedCount, selected.length);
         }
-        ctx.touch();
       });
 
       if (failures.size > 0) {
