@@ -206,6 +206,28 @@ describe('HTTP API', () => {
     expect((await app.inject({ method: 'GET', url: `/api/scans/missing/findings` })).statusCode).toBe(404);
   });
 
+  it('serves the fix plan of a scan (empty when none stored, 404 for unknown scans)', async () => {
+    await start();
+    const { scanId } = (await createScan()).json();
+    await c.runner.whenIdle();
+    expect((await app.inject({ method: 'GET', url: `/api/scans/${scanId}/fix-plan` })).json()).toEqual({ scanId, actions: [], unfixable: [] });
+    const plan = {
+      scanId,
+      actions: [{
+        id: 'fx_1', scanId, ecosystem: 'npm' as const, manifestDir: '', lockfile: 'package-lock.json', kind: 'upgrade-direct' as const,
+        package: 'lodash', from: '4.17.20', to: '4.17.21', semverJump: 'patch' as const, breakingRisk: false,
+        resolves: [{ findingId: 'f1', advisoryId: 'GHSA-1', severity: 'high' as const, package: 'lodash', version: '4.17.20' }],
+        resolvedCount: 1, riskReduced: 70, effort: 1, priority: 70, command: 'npm install lodash@4.17.21', notes: [],
+      }],
+      unfixable: [],
+    };
+    c.fixPlans.save(plan);
+    const res = await app.inject({ method: 'GET', url: `/api/scans/${scanId}/fix-plan` });
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toEqual(plan);
+    expect((await app.inject({ method: 'GET', url: '/api/scans/missing/fix-plan' })).statusCode).toBe(404);
+  });
+
   it('M2: returns 400 (not 500) for a pagination cursor decoding to an unsafe integer', async () => {
     await start();
     const { scanId } = (await createScan()).json();

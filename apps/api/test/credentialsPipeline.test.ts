@@ -18,6 +18,7 @@ import { loadConfig } from '../src/config';
 import type { Container } from '../src/container';
 import { EventRepo } from '../src/db/eventRepo';
 import { FindingRepo } from '../src/db/findingRepo';
+import { FixPlanRepo } from '../src/db/fixPlanRepo';
 import { IndexRepo } from '../src/db/indexRepo';
 import { LlmCallRepo } from '../src/db/llmCallRepo';
 import { ScanRepo } from '../src/db/scanRepo';
@@ -123,7 +124,7 @@ beforeAll(async () => {
 
   container = {
     config, db, scans, bus, audit, lifecycle, runner, service,
-    git, github: github as unknown as GitHubClient, indexRepo, gitVersion: null, llm, llmCalls, budget, findings,
+    git, github: github as unknown as GitHubClient, indexRepo, gitVersion: null, llm, llmCalls, budget, findings, fixPlans: new FixPlanRepo(db),
   };
 
   app = await buildApp(container, { logger: false });
