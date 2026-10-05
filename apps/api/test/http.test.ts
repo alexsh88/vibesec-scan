@@ -5,6 +5,7 @@ import { loadConfig } from '../src/config';
 import { createContainer, type Container } from '../src/container';
 import { buildApp } from '../src/http/app';
 import { createStubPipeline } from '../src/pipeline/stubPipeline';
+import { sampleSummary } from './summaryFixture';
 
 let app: FastifyInstance;
 let c: Container;
@@ -226,6 +227,22 @@ describe('HTTP API', () => {
     expect(res.statusCode).toBe(200);
     expect(res.json()).toEqual(plan);
     expect((await app.inject({ method: 'GET', url: '/api/scans/missing/fix-plan' })).statusCode).toBe(404);
+  });
+
+  it('serves the scan summary (404 NOT_READY until stored, 404 NOT_FOUND for unknown scans)', async () => {
+    await start();
+    const { scanId } = (await createScan()).json();
+    await c.runner.whenIdle();
+    const notReady = await app.inject({ method: 'GET', url: `/api/scans/${scanId}/summary` });
+    expect(notReady.statusCode).toBe(404);
+    expect(notReady.json().error.code).toBe('NOT_READY');
+    c.summaries.save(sampleSummary(scanId));
+    const res = await app.inject({ method: 'GET', url: `/api/scans/${scanId}/summary` });
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toEqual(sampleSummary(scanId));
+    const missing = await app.inject({ method: 'GET', url: '/api/scans/missing/summary' });
+    expect(missing.statusCode).toBe(404);
+    expect(missing.json().error.code).toBe('NOT_FOUND');
   });
 
   it('M2: returns 400 (not 500) for a pagination cursor decoding to an unsafe integer', async () => {

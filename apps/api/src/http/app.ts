@@ -13,6 +13,7 @@ import { fixPlanRoutes } from './routes/fixPlan';
 import { healthRoutes } from './routes/health';
 import { indexRoutes } from './routes/index';
 import { scanRoutes } from './routes/scans';
+import { summaryRoutes } from './routes/summary';
 
 export async function buildApp(c: Container, opts: { logger?: FastifyServerOptions['logger'] } = {}): Promise<FastifyInstance> {
   const app = Fastify({
@@ -33,6 +34,7 @@ export async function buildApp(c: Container, opts: { logger?: FastifyServerOptio
   indexRoutes(app, c.service, c.indexRepo);
   findingRoutes(app, c);
   fixPlanRoutes(app, c);
+  summaryRoutes(app, c);
   diagnosticsRoutes(app, c);
   eventRoutes(app, c.service, c.bus);
   auditRoutes(app, c.audit);

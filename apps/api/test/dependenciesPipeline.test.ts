@@ -26,6 +26,7 @@ import { FixPlanRepo } from '../src/db/fixPlanRepo';
 import { IndexRepo } from '../src/db/indexRepo';
 import { LlmCallRepo } from '../src/db/llmCallRepo';
 import { ScanRepo } from '../src/db/scanRepo';
+import { SummaryRepo } from '../src/db/summaryRepo';
 import { EventBus } from '../src/events/EventBus';
 import { GitService } from '../src/git/GitService';
 import type { GitHubClient, RepoMeta } from '../src/github/GitHubClient';
@@ -212,6 +213,7 @@ beforeAll(async () => {
   });
   const service = new ScanService({ db, scans, lifecycle, audit, queue: runner, queueCapacity: 10 });
   container = {
+    summaries: new SummaryRepo(db),
     config, db, scans, bus, audit, lifecycle, runner, service,
     git, github: github as unknown as GitHubClient, indexRepo, gitVersion: null, llm, llmCalls, budget, findings, fixPlans, sandbox: null,
   };

@@ -25,6 +25,7 @@ import { FixPlanRepo } from './db/fixPlanRepo';
 import { IndexRepo } from './db/indexRepo';
 import { LlmCallRepo } from './db/llmCallRepo';
 import { ScanRepo } from './db/scanRepo';
+import { SummaryRepo } from './db/summaryRepo';
 import { EventBus } from './events/EventBus';
 import { GitService } from './git/GitService';
 import { GitHubClient } from './github/GitHubClient';
@@ -47,6 +48,7 @@ export type Container = {
   lifecycle: ScanLifecycle; runner: JobRunner; service: ScanService;
   git: GitService; github: GitHubClient; indexRepo: IndexRepo; gitVersion: string | null;
   llm: LlmClient; llmCalls: LlmCallRepo; budget: BudgetTracker; findings: FindingRepo; fixPlans: FixPlanRepo;
+  summaries: SummaryRepo;
   /** Docker sandbox for dependency install/usage analysis; null/absent when disabled. */
   sandbox?: ContainerSandbox | null;
 };
@@ -88,6 +90,7 @@ export function createContainer(config: Config, overrides: ContainerOverrides = 
   const indexRepo = new IndexRepo(db);
   const findings = new FindingRepo(db);
   const fixPlans = new FixPlanRepo(db);
+  const summaries = new SummaryRepo(db);
   const indexer = new RepoIndexer(git, { maxFiles: config.maxFiles, maxFileBytes: config.maxFileBytes });
 
   const llmCalls = new LlmCallRepo(db);
@@ -152,5 +155,5 @@ export function createContainer(config: Config, overrides: ContainerOverrides = 
     config,
   });
   const service = new ScanService({ db, scans, lifecycle, audit, queue: runner, queueCapacity: config.queueCapacity });
-  return { config, db, scans, bus, audit, lifecycle, runner, service, git, github, indexRepo, gitVersion: null, llm, llmCalls, budget, findings, fixPlans, sandbox };
+  return { config, db, scans, bus, audit, lifecycle, runner, service, git, github, indexRepo, gitVersion: null, llm, llmCalls, budget, findings, fixPlans, summaries, sandbox };
 }
