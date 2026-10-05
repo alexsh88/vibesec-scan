@@ -174,8 +174,11 @@ describe('credentials analyzer, end to end through the real pipeline', () => {
 
     // The Supabase anon JWT must never be reported (role is public by design).
     expect(items.some((f) => f.ruleId === 'secret/jwt' || f.ruleId === 'secret/supabase-service-role')).toBe(false);
-    // The fixture password is dropped by the (mock) FP filter as test code.
-    expect(items.some((f) => f.location.file === 'test/fixtures/sample.ts')).toBe(false);
+    // I6: the fixture password is judged a false positive (test code) by the (mock) FP filter, but
+    // the AI verdict must never make a finding disappear — it stays present, downgraded to 'info'.
+    const fixtureFinding = items.find((f) => f.location.file === 'test/fixtures/sample.ts');
+    expect(fixtureFinding).toBeDefined();
+    expect(fixtureFinding!.severity).toBe('info');
 
     const auditItems = container.audit.list({ action: 'secret.verification_attempted' }).items;
     expect(auditItems.length).toBeGreaterThan(0);

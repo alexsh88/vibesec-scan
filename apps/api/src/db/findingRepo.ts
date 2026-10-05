@@ -1,4 +1,5 @@
 import { FindingSchema, type Category, type Finding, type Severity } from '@vibesec/shared';
+import { AppError } from '../errors/AppError';
 import { SEVERITY_RANK } from '../findings/helpers';
 import type { Db } from './database';
 
@@ -26,18 +27,29 @@ function escapeLike(value: string): string {
   return value.replace(/\\/g, '\\\\').replace(/%/g, '\\%').replace(/_/g, '\\_');
 }
 
+/** M2: a decoded cursor must be a real, boundable offset. Anything else (garbage base64, NaN, a
+ *  negative number, or a technically-`Number.isInteger`-true-but-unsafe value like `1e308`, which
+ *  `better-sqlite3` cannot bind as a 64-bit integer and would otherwise throw a raw 500) is rejected
+ *  with a 400 before it ever reaches a SQL bind parameter. 1,000,000 is far beyond any real result
+ *  set; it only exists to keep `offset` itself boundable. */
+const MAX_CURSOR_OFFSET = 1_000_000;
+
 function encodeCursor(offset: number): string {
   return Buffer.from(String(offset), 'utf8').toString('base64url');
 }
 
 function decodeCursor(cursor: string | undefined): number {
   if (!cursor) return 0;
+  let n: number;
   try {
-    const n = Number(Buffer.from(cursor, 'base64url').toString('utf8'));
-    return Number.isInteger(n) && n >= 0 ? n : 0;
+    n = Number(Buffer.from(cursor, 'base64url').toString('utf8'));
   } catch {
-    return 0;
+    throw new AppError('VALIDATION', 'permanent', 'Invalid pagination cursor');
   }
+  if (!Number.isSafeInteger(n) || n < 0 || n > MAX_CURSOR_OFFSET) {
+    throw new AppError('VALIDATION', 'permanent', 'Invalid pagination cursor');
+  }
+  return n;
 }
 
 export class FindingRepo {
@@ -69,6 +81,13 @@ export class FindingRepo {
     return row ? (JSON.parse(row.data_json) as Finding) : undefined;
   }
 
+  /**
+   * M6 (accepted limitation): pagination here is plain offset-based. If findings are still being
+   * inserted for a scan that is actively running, a row can shift between pages fetched a moment
+   * apart (a new finding sorting ahead of the current offset pushes everything down one slot, so a
+   * row can be skipped or repeated across `cursor`s). This is tolerated because the UI only paginates
+   * a scan's findings after it has reached a terminal state, by which point the result set is frozen.
+   */
   list(scanId: string, filter: FindingFilter): { items: Finding[]; nextCursor: string | null } {
     const limit = Math.min(Math.max(filter.limit ?? 50, 1), 200);
     const offset = decodeCursor(filter.cursor);

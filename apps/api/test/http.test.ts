@@ -205,4 +205,14 @@ describe('HTTP API', () => {
     expect((await app.inject({ method: 'GET', url: `/api/scans/${scanId}/findings?severity=urgent` })).statusCode).toBe(400);
     expect((await app.inject({ method: 'GET', url: `/api/scans/missing/findings` })).statusCode).toBe(404);
   });
+
+  it('M2: returns 400 (not 500) for a pagination cursor decoding to an unsafe integer', async () => {
+    await start();
+    const { scanId } = (await createScan()).json();
+    await c.runner.whenIdle();
+    const unsafeCursor = Buffer.from('1e308', 'utf8').toString('base64url');
+    const res = await app.inject({ method: 'GET', url: `/api/scans/${scanId}/findings?cursor=${unsafeCursor}` });
+    expect(res.statusCode).toBe(400);
+    expect(res.json().error.code).toBe('VALIDATION');
+  });
 });

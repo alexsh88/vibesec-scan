@@ -64,6 +64,29 @@ describe('parseGitLogPatch', () => {
   it('returns nothing for empty output', () => {
     expect(parseGitLogPatch('')).toEqual([]);
   });
+
+  it('I7: does not let an embedded \\r spoof a new diff section — a lone CR is not a line separator', () => {
+    const sha = 'f'.repeat(40);
+    const text = `\0COMMIT ${sha}\n` + header('real.txt') +
+      '@@ -0,0 +1,1 @@\n+before\rdiff --git a/x b/x\r+++ b/../../evil\rafter\n';
+    expect(parseGitLogPatch(text)).toEqual([
+      { commit: sha, file: 'real.txt', lines: [{ line: 1, text: 'before\rdiff --git a/x b/x\r+++ b/../../evil\rafter' }] },
+    ]);
+  });
+
+  it.each([
+    '/etc/passwd',
+    '../../etc/passwd',
+    'a/../../evil',
+    'C:\\Windows\\System32\\evil',
+    'a\\evil',
+    'a\0evil',
+  ])('I7: rejects an unsafe +++ target path %s (the whole chunk is skipped, like /dev/null)', (unsafe) => {
+    const sha = 'h'.repeat(40);
+    const text = `\0COMMIT ${sha}\n` +
+      `diff --git a/x b/x\nindex 1111111..2222222 100644\n--- a/x\n+++ b/${unsafe}\n@@ -0,0 +1 @@\n+pwned\n`;
+    expect(parseGitLogPatch(text)).toEqual([]);
+  });
 });
 
 describe('scanHistory', () => {
@@ -92,13 +115,15 @@ describe('scanHistory', () => {
       ],
       commitsScanned: 2,
       truncated: true,
+      skippedChunks: 0,
     });
     expect(touches).toBeGreaterThan(0);
   });
 
-  it('skips chunks above maxChunkBytes', async () => {
+  it('M5: skips chunks above maxChunkBytes and counts them as skippedChunks', async () => {
     const result = await scanHistory({ logPatch: async () => ({ text: patch, truncated: false }), scan: fakeScan, signal: new AbortController().signal, maxChunkBytes: 20 });
     expect(result.candidates.map((c) => c.file)).toEqual(['other.txt']);
+    expect(result.skippedChunks).toBe(1);
   });
 
   it('rejects when already aborted without calling logPatch', async () => {

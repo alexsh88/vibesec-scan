@@ -81,6 +81,16 @@ describe('finding helpers', () => {
     expect(githubPermalink({ owner: 'acme', name: 'app' }, 'abc123', 'src/my file.ts', 3, 3)).toBe('https://github.com/acme/app/blob/abc123/src/my%20file.ts#L3');
     expect(githubPermalink({ owner: 'acme', name: 'app' }, 'abc123', 'a.ts', 3, 7)).toBe('https://github.com/acme/app/blob/abc123/a.ts#L3-L7');
   });
+
+  it('I7: percent-encodes dots-only path segments so they cannot act as path traversal in a permalink', () => {
+    expect(githubPermalink({ owner: 'acme', name: 'app' }, 'sha1', '../../evil.ts', 1, 1))
+      .toBe('https://github.com/acme/app/blob/sha1/%2E%2E/%2E%2E/evil.ts#L1');
+    expect(githubPermalink({ owner: 'acme', name: 'app' }, 'sha1', './weird.ts', 1, 1))
+      .toBe('https://github.com/acme/app/blob/sha1/%2E/weird.ts#L1');
+    // An ordinary filename containing dots is untouched.
+    expect(githubPermalink({ owner: 'acme', name: 'app' }, 'sha1', 'a/file.name.ts', 1, 1))
+      .toBe('https://github.com/acme/app/blob/sha1/a/file.name.ts#L1');
+  });
   it('maps severities to provisional scores and bumps severities with clamping', () => {
     expect(['critical', 'high', 'medium', 'low', 'info'].map((s) => provisionalScore(s as never))).toEqual([90, 70, 50, 25, 5]);
     expect(bumpSeverity('high', 1)).toBe('critical');

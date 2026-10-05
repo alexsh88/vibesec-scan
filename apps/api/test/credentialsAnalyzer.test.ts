@@ -7,6 +7,7 @@ import { createCredentialsAnalyzer, type CredentialsAnalyzerDeps } from '../src/
 import { credentialsFpMockResponder } from '../src/analyzers/credentials/fpFilter';
 import type { SecretVerifier, VerifyResult } from '../src/analyzers/credentials/verifiers';
 import type { AnalyzerContext } from '../src/analyzers/types';
+import { AppError } from '../src/errors/AppError';
 import type { IndexedFile } from '../src/index/types';
 import type { LlmClient, StructuredCall, StructuredResult } from '../src/llm/LlmClient';
 import type { LlmRequest } from '../src/llm/transport';
@@ -158,12 +159,18 @@ describe('createCredentialsAnalyzer', () => {
     expect(hf.explanation).toContain('removed from the current code');
   });
 
-  it('drops a candidate the FP filter flags as a false positive (test-path heuristic)', async () => {
+  it('I6: downgrades (never drops) a candidate the FP filter flags as a false positive (test-path heuristic)', async () => {
     const value = fake.genericSecretValue(24);
     const files = await writeRepoFiles({ 'test/fixtures/sample.ts': `export const password = "${value}";\n` });
     const analyzer = createCredentialsAnalyzer({ llm: stubLlm(), git: fakeGit(NO_HISTORY), verifier: stubVerifier() });
     const findings = await analyzer.run(makeCtx(files, { options: { historyDepth: 0 } }));
-    expect(findings).toHaveLength(0);
+    expect(findings).toHaveLength(1);
+    const f = findings[0]!;
+    expect(f.severity).toBe('info');
+    expect(f.confidence).toBe('low');
+    expect(f.riskScore).toBe(5);
+    expect(f.riskFactors).toContainEqual(expect.objectContaining({ factor: 'ai_false_positive' }));
+    expect(f.explanation).toContain('AI triage');
   });
 
   it('keeps a candidate the FP filter judges real, at medium confidence when its confidence is not high', async () => {
@@ -269,7 +276,7 @@ describe('createCredentialsAnalyzer', () => {
     }
   });
 
-  it('calls verifier.forget even when a verification call throws', async () => {
+  it('M3: a throwing verifier degrades that candidate to unknown with a single warning, instead of failing the analyzer', async () => {
     const files = await writeRepoFiles({ 'src/config.ts': `export const token = "${fake.github()}";\n` });
     const forget = vi.fn();
     const verifier: Pick<SecretVerifier, 'verify' | 'forget'> = {
@@ -277,8 +284,37 @@ describe('createCredentialsAnalyzer', () => {
       forget,
     };
     const analyzer = createCredentialsAnalyzer({ llm: stubLlm(), git: fakeGit(NO_HISTORY), verifier });
-    await expect(analyzer.run(makeCtx(files, { options: { historyDepth: 0, verifySecrets: true } }))).rejects.toThrow('network exploded');
+    const warnings: string[][] = [];
+    const findings = await analyzer.run(makeCtx(files, { options: { historyDepth: 0, verifySecrets: true }, warnings }));
+    expect(findings).toHaveLength(1);
+    expect(findings[0]!.secret!.liveness).toBe('unknown');
+    expect(warnings.filter(([code]) => code === 'CREDENTIALS_VERIFICATION_FAILED')).toHaveLength(1);
     expect(forget).toHaveBeenCalledWith('scan-1');
+  });
+
+  it('M3: cancellation from a verification call still propagates (is not degraded into a warning)', async () => {
+    const files = await writeRepoFiles({ 'src/config.ts': `export const token = "${fake.github()}";\n` });
+    const forget = vi.fn();
+    const verifier: Pick<SecretVerifier, 'verify' | 'forget'> = {
+      verify: async () => { throw new AppError('CANCELLED', 'cancelled', 'scan cancelled'); },
+      forget,
+    };
+    const analyzer = createCredentialsAnalyzer({ llm: stubLlm(), git: fakeGit(NO_HISTORY), verifier });
+    await expect(analyzer.run(makeCtx(files, { options: { historyDepth: 0, verifySecrets: true } })))
+      .rejects.toMatchObject({ code: 'CANCELLED' });
+    expect(forget).toHaveBeenCalledWith('scan-1');
+  });
+
+  it('I5: dedupes a secret repeated on multiple lines of the same file into one finding, keeping the lowest line and noting the extra occurrences', async () => {
+    const value = fake.github();
+    const files = await writeRepoFiles({
+      'src/config.ts': `const a = "${value}";\nconst b = "${value}";\nconst c = "${value}";\n`,
+    });
+    const analyzer = createCredentialsAnalyzer({ llm: stubLlm(), git: fakeGit(NO_HISTORY), verifier: stubVerifier() });
+    const findings = await analyzer.run(makeCtx(files, { options: { historyDepth: 0, verifySecrets: false } }));
+    expect(findings).toHaveLength(1);
+    expect(findings[0]!.location.startLine).toBe(1);
+    expect(findings[0]!.explanation).toContain('Found on 3 lines in this file');
   });
 });
 

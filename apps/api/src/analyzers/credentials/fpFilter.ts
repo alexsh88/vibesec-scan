@@ -150,9 +150,17 @@ export async function filterCandidates(
   return verdicts;
 }
 
-/** True only when the model is confident-enough that the candidate is NOT a real credential. A
- *  'low'-confidence negative verdict, or a missing verdict, is not enough to drop it. */
-export function shouldDrop(v: FpVerdict | undefined): boolean {
+/**
+ * True only when the model is confident-enough that the candidate is NOT a real credential. A
+ * 'low'-confidence negative verdict, or a missing verdict, is not enough to flag it as a false
+ * positive.
+ *
+ * I6: this used to be named `shouldDrop` and its result was used to filter the candidate out of the
+ * scan entirely — a prompt-injected or simply wrong AI verdict could silently make a real finding
+ * disappear. The AI verdict must never be able to drop a finding; the caller (credentialsAnalyzer)
+ * now only uses this to downgrade severity/confidence, never to omit the finding.
+ */
+export function isLikelyFalsePositive(v: FpVerdict | undefined): boolean {
   return v !== undefined && v.isLikelyReal === false && v.confidence !== 'low';
 }
 

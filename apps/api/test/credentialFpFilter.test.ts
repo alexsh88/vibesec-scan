@@ -7,7 +7,7 @@ import { z } from 'zod';
 import { ScanOptionsSchema } from '@vibesec/shared';
 import type { SecretCandidate } from '../src/analyzers/credentials/scanText';
 import {
-  credentialsFpMockResponder, FP_FILTER_PROMPT_VERSION, filterCandidates, shouldDrop, type FpVerdict,
+  credentialsFpMockResponder, FP_FILTER_PROMPT_VERSION, filterCandidates, isLikelyFalsePositive, type FpVerdict,
 } from '../src/analyzers/credentials/fpFilter';
 import { loadConfig } from '../src/config';
 import { LlmCallRepo } from '../src/db/llmCallRepo';
@@ -225,7 +225,7 @@ describe('filterCandidates', () => {
   });
 });
 
-describe('shouldDrop', () => {
+describe('isLikelyFalsePositive', () => {
   const v = (isLikelyReal: boolean, confidence: FpVerdict['confidence']): FpVerdict => ({ isLikelyReal, confidence, reason: 'r' });
 
   it.each([
@@ -236,8 +236,8 @@ describe('shouldDrop', () => {
     [v(true, 'medium'), false],
     [v(true, 'low'), false],
     [undefined, false],
-  ] as const)('shouldDrop(%o) -> %s', (verdict, expected) => {
-    expect(shouldDrop(verdict)).toBe(expected);
+  ] as const)('isLikelyFalsePositive(%o) -> %s', (verdict, expected) => {
+    expect(isLikelyFalsePositive(verdict)).toBe(expected);
   });
 });
 
@@ -262,8 +262,8 @@ describe('credentialsFpMockResponder', () => {
 
       const verdicts = await filterCandidates(client, scanId, [testCand, srcCand], new AbortController().signal);
 
-      expect(shouldDrop(verdicts.get('test-cand'))).toBe(true);
-      expect(shouldDrop(verdicts.get('src-cand'))).toBe(false);
+      expect(isLikelyFalsePositive(verdicts.get('test-cand'))).toBe(true);
+      expect(isLikelyFalsePositive(verdicts.get('src-cand'))).toBe(false);
       expect(verdicts.get('src-cand')?.isLikelyReal).toBe(true);
     } finally {
       await rm(dir, { recursive: true, force: true });

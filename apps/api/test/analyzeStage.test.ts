@@ -200,6 +200,29 @@ describe('analyzeStage', () => {
     expect(findings.list(ctx.scanId, {}).items).toHaveLength(1);
   });
 
+  it('I5: dedupes by fingerprint before emitting finding events (safety net for an analyzer that returns duplicates)', async () => {
+    const { ctx, findings, indexRepo, events } = setup(['secret']);
+    const dupFingerprint = 'dup-fp';
+    const f1 = makeFinding({
+      scanId: ctx.scanId, category: 'secret', id: 'dup-1', fingerprint: dupFingerprint,
+      location: { file: 'a.ts', startLine: 1, endLine: 1, snippet: 's', permalink: 'p' },
+    });
+    const f2 = makeFinding({
+      scanId: ctx.scanId, category: 'secret', id: 'dup-2', fingerprint: dupFingerprint,
+      location: { file: 'a.ts', startLine: 2, endLine: 2, snippet: 's', permalink: 'p' },
+    });
+    const analyzer = makeAnalyzer({ id: 'credentials', category: 'secret', run: async () => [f1, f2] });
+    const stage = analyzeStage({ analyzers: [analyzer], findings, indexRepo, git: fakeGit });
+
+    await stage.run(ctx);
+
+    // DB also dedupes via ON CONFLICT (scan_id, fingerprint) DO NOTHING -> only the first row persists.
+    expect(findings.list(ctx.scanId, {}).items).toHaveLength(1);
+    const findingEvents = events.filter((e): e is Extract<ScanEvent, { type: 'finding' }> => e.type === 'finding');
+    expect(findingEvents).toHaveLength(1);
+    expect(findingEvents[0]!.finding.id).toBe('dup-1');
+  });
+
   it('uses a generic message in the warning when the thrown error is not an AppError', async () => {
     const { ctx, findings, indexRepo, warnings } = setup(['secret', 'sast']);
     const leaky = makeAnalyzer({ id: 'credentials', category: 'secret', run: async () => { throw new Error('token=super-secret-value'); } });

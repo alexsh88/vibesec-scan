@@ -35,11 +35,28 @@ function decodeGitPathToken(token: string): string {
   return Buffer.from(bytes).toString('utf8');
 }
 
-/** Target path from a `+++ ` header (prefix already stripped); null for /dev/null. */
+/**
+ * I7: rejects a target path that could escape the intended location of a scanned file — absolute
+ * (POSIX or a Windows drive letter), containing a `..` segment, containing a backslash, or containing
+ * a NUL byte. A path this parser builds ends up in Finding.location (and from there into a GitHub
+ * permalink via `githubPermalink`, which applies its own segment-encoding defense too), so a hostile
+ * repo must never be able to point it somewhere else via a crafted `+++` header.
+ */
+function isUnsafeTargetPath(path: string): boolean {
+  if (path.startsWith('/')) return true;
+  if (/^[A-Za-z]:[\\/]/.test(path)) return true;
+  if (path.includes('\\')) return true;
+  if (path.includes('\0')) return true;
+  return path.split('/').some((segment) => segment === '..');
+}
+
+/** Target path from a `+++ ` header (prefix already stripped); null for /dev/null or an unsafe path
+ *  (both are treated the same way by the caller: the chunk is skipped). */
 function targetPath(rest: string): string | null {
   if (rest === '/dev/null') return null;
   const decoded = decodeGitPathToken(rest);
-  return decoded.startsWith('b/') ? decoded.slice(2) : decoded;
+  const path = decoded.startsWith('b/') ? decoded.slice(2) : decoded;
+  return isUnsafeTargetPath(path) ? null : path;
 }
 
 /**
@@ -63,7 +80,14 @@ export function parseGitLogPatch(text: string): AddedChunk[] {
     current = [];
   };
 
-  for (const raw of text.split(/\r\n|\r|\n/)) {
+  // I7: split on '\n' ONLY — never on a lone '\r'. git's own line terminator is always '\n' (or
+  // '\r\n' on a CRLF checkout); a bare '\r' can appear INSIDE a line's own content (e.g. a value that
+  // itself contains a carriage return). Splitting on a lone '\r' would chop that content into extra
+  // "lines", one of which could start with `diff --git `/`+++ b/...` and be misread as a real header
+  // — forging a spoofed file/commit or silently truncating the real content after the embedded CR.
+  // Each resulting line may still carry one trailing '\r' (from a CRLF terminator); strip exactly one.
+  for (const rawLine of text.split('\n')) {
+    const raw = rawLine.endsWith('\r') ? rawLine.slice(0, -1) : rawLine;
     if (raw.startsWith(COMMIT_MARKER)) {
       flush();
       commit = raw.slice(COMMIT_MARKER.length).trim();
@@ -81,6 +105,11 @@ export function parseGitLogPatch(text: string): AddedChunk[] {
     }
     if (inHeader) {
       if (raw.startsWith('+++ ')) file = targetPath(raw.slice(4));
+      // M5 (accepted limitation): a repo can mark a path `-diff`/`-text`/`binary` in .gitattributes to
+      // make git treat it as binary for diffing purposes even though it's really text — `git log -p`
+      // then only ever prints "Binary files ... differ" for that path, and this scanner (like any tool
+      // reading `git log -p` output) never sees its added lines in history. Only `git log -p --text`
+      // (or diffing blob contents directly) would see through that; not implemented here.
       else if (raw.startsWith('Binary files ') && raw.endsWith(' differ')) binary = true;
       const hunk = raw.match(HUNK_HEADER_RE);
       if (!hunk) continue;
@@ -124,7 +153,7 @@ export async function scanHistory<C>(opts: {
   signal: AbortSignal;
   touch?: () => void;
   maxChunkBytes?: number;
-}): Promise<{ candidates: C[]; commitsScanned: number; truncated: boolean }> {
+}): Promise<{ candidates: C[]; commitsScanned: number; truncated: boolean; skippedChunks: number }> {
   if (opts.signal.aborted) throw cancelled();
   const { text, truncated } = await opts.logPatch(opts.signal);
   if (opts.signal.aborted) throw cancelled();
@@ -135,13 +164,19 @@ export async function scanHistory<C>(opts: {
 
   const candidates: C[] = [];
   let n = 0;
+  // M5: an oversized chunk is skipped rather than scanned (to bound worst-case memory/CPU on a huge
+  // added blob) — count how many so the caller can warn that the history scan was only partial.
+  let skippedChunks = 0;
   for (const chunk of parseGitLogPatch(text)) {
     if (opts.signal.aborted) throw cancelled();
     if (n++ % 50 === 0) opts.touch?.();
     const joined = chunk.lines.map((l) => l.text).join('\n');
-    if (Buffer.byteLength(joined, 'utf8') > maxChunkBytes) continue;
+    if (Buffer.byteLength(joined, 'utf8') > maxChunkBytes) {
+      skippedChunks++;
+      continue;
+    }
     const lineOffset = (line: number): number => chunk.lines[line - 1]?.line ?? line;
     candidates.push(...opts.scan(chunk.file, joined, { source: 'history', commit: chunk.commit, lineOffset }));
   }
-  return { candidates, commitsScanned: commits.size, truncated };
+  return { candidates, commitsScanned: commits.size, truncated, skippedChunks };
 }

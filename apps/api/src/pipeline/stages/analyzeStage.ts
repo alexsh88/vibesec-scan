@@ -18,11 +18,29 @@ type AnalyzerOutcome =
   | { analyzer: Analyzer; ok: true }
   | { analyzer: Analyzer; ok: false; cancelled: boolean; appErr: AppError };
 
+/** I5 safety net: `replaceForAnalyzer` persists via `ON CONFLICT (scan_id, fingerprint) DO NOTHING`,
+ *  so only the first-inserted row per fingerprint actually survives — mirror that here (same
+ *  insertion order) so a `finding` event is never emitted for a duplicate that was never persisted. */
+function dedupeByFingerprint(findings: readonly Finding[]): Finding[] {
+  const seen = new Set<string>();
+  const result: Finding[] = [];
+  for (const f of findings) {
+    if (seen.has(f.fingerprint)) continue;
+    seen.add(f.fingerprint);
+    result.push(f);
+  }
+  return result;
+}
+
 /**
  * Runs one analyzer to completion: persists its findings and emits summary events as soon as it finishes,
  * independent of the others. Never throws — every failure (thrown error or invalid finding from
  * `replaceForAnalyzer`'s schema check) is captured and classified so the caller can decide whether it is
  * a per-analyzer failure (warn and continue) or a cancellation (propagate).
+ *
+ * M6 (accepted): on a resumed scan, this re-runs the analyzer and re-emits `finding` events for
+ * findings that were already persisted by an earlier attempt. That's intentional, not a bug — SSE/
+ * event consumers are expected to dedupe by finding id, so a duplicate emission is harmless.
  */
 async function runAnalyzer(
   analyzer: Analyzer, actx: AnalyzerContext, deps: Pick<AnalyzeStageDeps, 'findings'>, ctx: PipelineContext,
@@ -30,7 +48,7 @@ async function runAnalyzer(
   try {
     const result: Finding[] = await analyzer.run(actx);
     deps.findings.replaceForAnalyzer(ctx.scanId, analyzer.id, result);
-    for (const finding of result) {
+    for (const finding of dedupeByFingerprint(result)) {
       ctx.emit({ type: 'finding', finding: FindingSummarySchema.parse(finding) });
     }
     return { analyzer, ok: true };
