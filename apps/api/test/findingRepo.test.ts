@@ -99,3 +99,18 @@ describe('finding helpers', () => {
     expect(bumpSeverity('low', -5)).toBe('info');
   });
 });
+
+describe('FindingRepo.all / update', () => {
+  it('lists every finding with its analyzer and rewrites/removes in place', () => {
+    const { repo, scanId } = setup();
+    const a = finding(scanId);
+    const b = finding(scanId, { category: 'sast', ruleId: 'sast/sqli' });
+    repo.replaceForAnalyzer(scanId, 'secrets', [a]);
+    repo.replaceForAnalyzer(scanId, 'sast', [b]);
+    expect(repo.all(scanId).map((r) => r.analyzer).sort()).toEqual(['sast', 'secrets']);
+    repo.update(scanId, [{ ...a, severity: 'critical', riskScore: 95 }], [b.id]);
+    expect(repo.get(scanId, a.id)?.severity).toBe('critical');
+    expect(repo.get(scanId, b.id)).toBeUndefined();
+    expect(repo.list(scanId, { severity: 'critical' }).items).toHaveLength(1);
+  });
+});

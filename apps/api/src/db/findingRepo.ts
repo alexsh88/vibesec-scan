@@ -76,6 +76,33 @@ export class FindingRepo {
     })();
   }
 
+  /** Every finding of a scan with the analyzer that produced it (post-analysis stages: verify, score). */
+  all(scanId: string): { analyzer: string; finding: Finding }[] {
+    const rows = this.db.prepare(`SELECT analyzer, data_json FROM findings WHERE scan_id = ? ORDER BY id`)
+      .all(scanId) as { analyzer: string; data_json: string }[];
+    return rows.map((r) => ({ analyzer: r.analyzer, finding: JSON.parse(r.data_json) as Finding }));
+  }
+
+  /**
+   * Atomically rewrites existing findings in place (matched by id) and deletes `removeIds`.
+   * Used by VERIFYING (dedupe/skeptic) and SCORING; re-running a stage is idempotent.
+   */
+  update(scanId: string, findings: readonly Finding[], removeIds: readonly string[] = []): void {
+    const parsed = findings.map((f) => FindingSchema.parse(f));
+    this.db.transaction(() => {
+      const del = this.db.prepare(`DELETE FROM findings WHERE scan_id = ? AND id = ?`);
+      for (const id of removeIds) del.run(scanId, id);
+      const upd = this.db.prepare(
+        `UPDATE findings SET title = ?, severity = ?, severity_rank = ?, risk_score = ?, file = ?, start_line = ?, data_json = ?
+         WHERE scan_id = ? AND id = ?`,
+      );
+      for (const f of parsed) {
+        upd.run(f.title, f.severity, SEVERITY_RANK[f.severity], f.riskScore, f.location.file, f.location.startLine,
+          JSON.stringify(f), scanId, f.id);
+      }
+    })();
+  }
+
   get(scanId: string, id: string): Finding | undefined {
     const row = this.db.prepare(`SELECT data_json FROM findings WHERE scan_id = ? AND id = ?`).get(scanId, id) as DataRow | undefined;
     return row ? (JSON.parse(row.data_json) as Finding) : undefined;
