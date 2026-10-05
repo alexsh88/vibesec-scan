@@ -26,7 +26,7 @@ export type FpVerdict = { isLikelyReal: boolean; confidence: 'high' | 'medium' |
 /** Candidate types where an LLM read actually earns its cost. High-precision prefixed tokens
  *  (github/aws/stripe-live/slack/openai/anthropic/sendgrid/twilio/supabase-service-role) are
  *  already unambiguous from their prefix alone, so they skip the LLM entirely. */
-const JUDGEMENT_TYPES: ReadonlySet<SecretType> = new Set<SecretType>([
+export const JUDGEMENT_TYPES: ReadonlySet<SecretType> = new Set<SecretType>([
   'generic-secret', 'jwt', 'database-url', 'private-key', 'stripe-test-key', 'google-api-key',
 ]);
 

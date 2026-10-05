@@ -56,13 +56,20 @@ function buildSnippet(lines: readonly string[], match: SecretMatch, allMatches: 
   for (let ln = windowStart; ln <= windowEnd; ln++) {
     let lineText = lines[ln - 1] ?? '';
     for (const other of allMatches) {
-      if (ln < other.line || ln > other.endLine) continue;
-      if (lineText.includes(other.value)) {
-        lineText = lineText.split(other.value).join(redact(other.value));
-      } else if (other.endLine > other.line) {
-        // Multi-line credential (e.g. PEM) whose raw value can't appear as a substring of a single
-        // physical line — blank this line defensively so no body fragment leaks.
-        lineText = ln === other.line ? redact(other.value) : '';
+      if (ln >= other.line && ln <= other.endLine) {
+        if (lineText.includes(other.value)) {
+          lineText = lineText.split(other.value).join(redact(other.value));
+        } else if (other.endLine > other.line) {
+          // Multi-line credential (e.g. PEM) whose raw value can't appear as a substring of a single
+          // physical line — blank this line defensively so no body fragment leaks.
+          lineText = ln === other.line ? redact(other.value) : '';
+        }
+      }
+      // A paired AWS secret key (found within +/-5 lines, not tied to `other`'s own line range) must
+      // also never survive into the snippet, even when it lands on a context line that has no match
+      // of its own to trigger redaction.
+      if (other.pairedSecret && lineText.includes(other.pairedSecret)) {
+        lineText = lineText.split(other.pairedSecret).join(redact(other.pairedSecret));
       }
     }
     out.push(lineText.length > SNIPPET_LINE_LIMIT ? lineText.slice(0, SNIPPET_LINE_LIMIT) : lineText);
