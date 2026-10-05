@@ -60,7 +60,7 @@ describe('FindingRepo', () => {
   it('counts by severity and category', () => {
     const { repo, scanId } = setup();
     repo.replaceForAnalyzer(scanId, 'x', [finding(scanId, { severity: 'critical' }), finding(scanId), finding(scanId, { category: 'sast' })]);
-    expect(repo.counts(scanId)).toEqual({ total: 3, bySeverity: { critical: 1, high: 2 }, byCategory: { secret: 2, sast: 1 } });
+    expect(repo.counts(scanId)).toEqual({ total: 3, bySeverity: { critical: 1, high: 2 }, byCategory: { secret: 2, sast: 1 }, byScanStatus: { new: 3, existing: 0, fixed: 0 } });
   });
   it('returns undefined for a finding of another scan', () => {
     const a = setup();

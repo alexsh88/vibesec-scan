@@ -11,6 +11,8 @@ const FindingQuerySchema = z.object({
   file: z.string().max(1000).optional(),
   q: z.string().max(200).optional(),
   triage: z.enum(['open', 'suppressed', 'all']).default('all'),
+  /** Omitted: the scan's current findings (new + existing); 'fixed' = in the previous scan, gone in this one. */
+  scanStatus: z.enum(['new', 'existing', 'fixed']).optional(),
   cursor: z.string().max(100).optional(),
   limit: z.coerce.number().int().min(1).max(200).optional(),
 });

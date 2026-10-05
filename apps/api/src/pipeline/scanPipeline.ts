@@ -16,6 +16,7 @@ import { cloneStage } from './stages/cloneStage';
 import { withFullScanCache } from './stages/fullCache';
 import { indexStage, type IndexDeps } from './stages/indexStage';
 import { resolveStage, type ResolveDeps } from './stages/resolveStage';
+import { applyScanStatus } from './stages/scanStatus';
 import { scoreStage } from './stages/scoreStage';
 import { createSynthesizeStage } from './stages/synthesizeStage';
 import { verifyStage } from './stages/verifyStage';
@@ -25,7 +26,7 @@ export type ScanPipelineDeps = Omit<ResolveDeps, 'git' | 'scans'> & Omit<IndexDe
   git: Pick<GitService, 'remoteUrl' | 'resolveRef' | 'ensureCheckout' | 'removeScanDir' | 'repoDir' | 'diffNameStatus' | 'fetchCommit'>;
   scans: Pick<ScanRepo,
     | 'updateRepoMeta' | 'setCommitSha' | 'getRow' | 'getDto' | 'setCacheKeys' | 'findFullCacheSource' | 'findIncrementalBase'
-    | 'setReuse' | 'getDiagnostics'>;
+    | 'findPreviousCompleted' | 'setReuse' | 'getDiagnostics'>;
   indexRepo: Pick<IndexRepo, 'replace' | 'files' | 'imports' | 'entrypoints' | 'stats'>;
   analyzers: readonly Analyzer[];
   findings: FindingRepo;
@@ -46,7 +47,8 @@ export type ScanPipelineDeps = Omit<ResolveDeps, 'git' | 'scans'> & Omit<IndexDe
 };
 
 /**
- * SCORING = risk scoring, then the repo's triage suppressions. Each step is idempotent and runs even if an earlier one failed (findings then keep
+ * SCORING = risk scoring, then the repo's triage suppressions, then new/existing/fixed against the
+ * previous scan. Each step is idempotent and runs even if an earlier one failed (findings then keep
  * their pre-scoring values); the first failure is re-thrown afterwards so it surfaces as a warning.
  */
 function scoringStage(deps: ScanPipelineDeps): StageSpec {
@@ -67,6 +69,7 @@ function scoringStage(deps: ScanPipelineDeps): StageSpec {
       };
       await step(() => score.run(ctx));
       await step(() => deps.suppressions.applySuppressions(ctx.scanId));
+      await step(() => applyScanStatus({ scans: deps.scans, findings: deps.findings }, ctx.scanId));
       if (failure) throw failure;
     },
   };
@@ -74,7 +77,7 @@ function scoringStage(deps: ScanPipelineDeps): StageSpec {
 
 /**
  * RESOLVING (+ full-scan cache) → CLONING → INDEXING → ANALYZING (incremental when a base exists) →
- * VERIFYING → SCORING (+ suppressions) → SYNTHESIZING. Every stage is idempotent, so
+ * VERIFYING → SCORING (+ suppressions, new/existing/fixed) → SYNTHESIZING. Every stage is idempotent, so
  * JobRunner's resume (skip checkpointed stages, re-run the interrupted one) is safe.
  */
 export function createScanPipeline(deps: ScanPipelineDeps): Pipeline {

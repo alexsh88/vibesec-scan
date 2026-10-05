@@ -199,7 +199,7 @@ describe('HTTP API', () => {
     ]);
     const list = (await app.inject({ method: 'GET', url: `/api/scans/${scanId}/findings` })).json();
     expect(list.items.map((f: { id: string }) => f.id)).toEqual(['f2', 'f1']);
-    expect(list.counts).toEqual({ total: 2, bySeverity: { critical: 1, high: 1 }, byCategory: { secret: 2 } });
+    expect(list.counts).toEqual({ total: 2, bySeverity: { critical: 1, high: 1 }, byCategory: { secret: 2 }, byScanStatus: { new: 2, existing: 0, fixed: 0 } });
     expect((await app.inject({ method: 'GET', url: `/api/scans/${scanId}/findings?severity=critical` })).json().items).toHaveLength(1);
     expect((await app.inject({ method: 'GET', url: `/api/scans/${scanId}/findings/f1` })).json().title).toBe('High one');
     expect((await app.inject({ method: 'GET', url: `/api/scans/${scanId}/findings/nope` })).statusCode).toBe(404);

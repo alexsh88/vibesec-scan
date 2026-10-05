@@ -151,13 +151,14 @@ describe('scan pipeline (real git)', () => {
       explanation: 'e', impact: 'i', remediation: { summary: 'r' }, scanStatus: 'new',
     };
     findings.replaceForAnalyzer(id, 'credentials', [f]);
+    findings.saveAnalyzerResult(id, 'credentials', [f]);
     scans.setCheckpoint(id, { completedStages: ['RESOLVING', 'CLONING', 'INDEXING', 'ANALYZING'], data: { commitSha: repo.shas[1] } });
 
     const dto = await run(id);
     expect(dto.state).toBe('COMPLETED');
     const states = events.listAfter(id, 0).flatMap((e) => (e.event.type === 'state' ? [e.event.state] : []));
     expect(states).toEqual(['VERIFYING', 'SCORING', 'SYNTHESIZING', 'COMPLETED']);
-    const after = findings.all(id);
+    const after = findings.all(id, { includeFixed: true });
     expect(after).toHaveLength(1);
     expect(after[0]!.finding.riskFactors.length + after[0]!.finding.riskScore).toBeGreaterThan(0);
     expect(summaries.get(id)?.riskGrade).toBe('A');
@@ -168,7 +169,7 @@ describe('scan pipeline (real git)', () => {
       emit: () => {}, warn: () => {}, touch: () => {},
     };
     for (const name of ['VERIFYING', 'SCORING', 'SYNTHESIZING'] as const) await pipeline.stages.find((s) => s.name === name)!.run(ctx);
-    expect(findings.all(id)).toEqual(after);
+    expect(findings.all(id, { includeFixed: true })).toEqual(after);
     expect(summaries.get(id)?.riskGrade).toBe('A');
   }, 60_000);
 

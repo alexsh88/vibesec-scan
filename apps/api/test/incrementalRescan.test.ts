@@ -1,14 +1,14 @@
 // End-to-end incremental rescans (spec §11) over a local git copy of fixtures/vuln-app with four commits,
 // through the real container wiring and HTTP API in mock-LLM mode:
 //   v0  the vuln-app as is                                      → base scan (full)
-//   v1  api/src/routes/logs.ts rewritten (path traversal gone, command injection added)
+//   v1  api/src/routes/logs.ts rewritten: its path traversal is gone, a command injection is new
 //                                                               → incremental: only changed/affected files are analyzed
 //   v2  a comment appended to most source files (> 40% changed) → full scan + info warning
 //   v3  README tweak, but the newest "base" points at a commit the repo does not have
 //                                                               → full scan + info warning
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import type { ScanDto } from '@vibesec/shared';
-import { startVulnAppHarness, vulnAppFakeFetch, type VulnAppHarness } from '../scripts/vulnApp';
+import type { Finding, ScanDto } from '@vibesec/shared';
+import { findingsOf, startVulnAppHarness, vulnAppFakeFetch, type VulnAppHarness } from '../scripts/vulnApp';
 
 const MOCK_ENV = { SCAN_MODE: 'mock', LLM_REQUESTS_PER_MINUTE: '100000', LLM_INPUT_TOKENS_PER_MINUTE: '1000000000' };
 const LOGS = 'api/src/routes/logs.ts';
@@ -67,11 +67,18 @@ const callsOf = (scanId: string, analyzer: string) => (h.container.db.prepare('S
 const reviewedPaths = (scanId: string, analyzer: string) =>
   [...coverageOf(scanId, analyzer)].filter(([, s]) => s === 'reviewed' || s === 'reviewed-fast').map(([p]) => p).sort();
 
+async function list(scanId: string, query = ''): Promise<{ items: Finding[]; counts: { total: number; byScanStatus: Record<'new' | 'existing' | 'fixed', number> } }> {
+  const res = await h.app.inject({ method: 'GET', url: `/api/scans/${scanId}/findings?limit=200${query}` });
+  expect(res.statusCode).toBe(200);
+  return res.json();
+}
+
 describe('incremental rescans over fixtures/vuln-app (mock LLM)', () => {
   it('scans the base commit in full', async () => {
     base = (await h.scan({}, h.repo.shas[0])).scanId;
     expect(dto(base)).toMatchObject({ commitSha: h.repo.shas[0], cacheHit: 'none', reuse: null });
     expect(['COMPLETED', 'COMPLETED_WITH_WARNINGS']).toContain(dto(base).state);
+    expect(findingsOf(h.container, base).every((f) => f.scanStatus === 'new')).toBe(true);
   }, 120_000);
 
   it('rescans only the changed/affected files and re-attaches the rest', async () => {
@@ -108,6 +115,36 @@ describe('incremental rescans over fixtures/vuln-app (mock LLM)', () => {
     expect(coverageOf(incremental, 'taint').get('api/src/routes/invoices.ts')).toBe('cached');
     expect(callsOf(incremental, 'taint')).toBeGreaterThan(0);
     expect(callsOf(incremental, 'taint')).toBeLessThan(callsOf(base, 'taint'));
+  }, 120_000);
+
+  it('reports the fixed vulnerability as fixed, the new one as new and the rest as existing', async () => {
+    const current = await list(incremental);
+    const byFile = (items: Finding[], file: string) => items.filter((f) => f.location.file === file);
+
+    // Re-attached, re-validated taint flow (SQL injection traced from the unchanged invoices route): existing.
+    const sqli = current.items.find((f) => f.category === 'taint' && f.location.file === 'api/src/services/invoiceService.ts');
+    expect(sqli).toMatchObject({ ruleId: 'taint/sql-injection', scanStatus: 'existing', scanId: incremental });
+    expect(sqli!.taintTrace![0]).toMatchObject({ kind: 'source', file: 'api/src/routes/invoices.ts' });
+    expect(sqli!.location.permalink).toContain(h.repo.shas[1]!);
+
+    const fresh = byFile(current.items, LOGS).find((f) => f.ruleId === 'taint/command-injection');
+    expect(fresh?.scanStatus).toBe('new');
+
+    const fixed = await list(incremental, '&scanStatus=fixed');
+    const goneTraversal = byFile(fixed.items, LOGS).find((f) => f.ruleId === 'taint/path-traversal');
+    expect(goneTraversal).toMatchObject({ scanStatus: 'fixed', scanId: incremental });
+    expect(current.items.some((f) => f.scanStatus === 'fixed')).toBe(false);
+
+    const statuses = new Set(current.items.map((f) => f.scanStatus));
+    expect(statuses.has('existing')).toBe(true);
+    expect(current.counts.total).toBe(current.items.length);
+    expect(current.counts.byScanStatus.fixed).toBe(fixed.items.length);
+    expect(current.counts.byScanStatus.new + current.counts.byScanStatus.existing).toBe(current.counts.total);
+    // Findings of untouched files keep their identity across the rescan.
+    const baseFps = new Set(findingsOf(h.container, base).map((f) => f.fingerprint));
+    for (const f of current.items.filter((x) => x.location.file !== LOGS && x.category !== 'dependency')) {
+      expect(baseFps.has(f.fingerprint), `${f.ruleId} ${f.location.file}`).toBe(true);
+    }
   }, 120_000);
 
   it('falls back to a full scan with an info warning when the diff is too large', async () => {

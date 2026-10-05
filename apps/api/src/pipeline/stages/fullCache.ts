@@ -5,7 +5,7 @@
 // Runs as part of RESOLVING, right after the commit SHA is known (the GitHub metadata call before it
 // also re-checks access, so a private repo's cached results are only served to a caller whose token
 // can still read it). On a hit the new scan record gets cache_hit 'full', base_scan_id = the source,
-// copies of the findings, analyzer outputs, coverage, index, fix plan and summary
+// copies of the findings (fixed rows included), analyzer outputs, coverage, index, fix plan and summary
 // (finding ids re-derived per scan, references remapped), the source's warnings, and it then skips every
 // remaining stage (JobRunner SKIP_REMAINING_STAGES) — the SSE stream goes straight to the terminal state.
 // Copying (rather than pointing at the source) keeps every read API unchanged.
@@ -56,7 +56,7 @@ function remapIds<T>(value: T, ids: ReadonlyMap<string, string>): T {
 type CopyResult = { reuse: ReuseStats; warnings: ScanWarning[]; summary: ReturnType<SummaryRepo['get']> };
 
 function copyScan(deps: FullCacheDeps, source: ScanRow, scanId: string): CopyResult {
-  const rows = deps.findings.all(source.id);
+  const rows = deps.findings.all(source.id, { includeFixed: true });
   const ids = new Map<string, string>();
   const retarget = (f: Finding): Finding => {
     const id = copiedFindingId(scanId, f.id);

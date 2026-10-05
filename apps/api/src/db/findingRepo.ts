@@ -4,7 +4,11 @@ import { SEVERITY_RANK } from '../findings/helpers';
 import type { Db } from './database';
 
 export type TriageFilter = 'open' | 'suppressed' | 'all';
+export type ScanStatus = Finding['scanStatus'];
 export type FindingRow = { analyzer: string; finding: Finding };
+
+/** `fixed` rows are findings of the previous scan that this scan no longer has (P7 new/existing/fixed). */
+const NOT_FIXED_SQL = `json_extract(data_json, '$.scanStatus') IS NOT 'fixed'`;
 
 export type FindingFilter = {
   category?: Category;
@@ -12,14 +16,18 @@ export type FindingFilter = {
   file?: string;
   q?: string;
   triage?: TriageFilter;
+  /** Omitted: the scan's current findings (new + existing); 'fixed' lists what the previous scan had and this one no longer does. */
+  scanStatus?: ScanStatus;
   cursor?: string;
   limit?: number;
 };
 
+/** Counts of the scan's current findings (fixed ones excluded), plus the new/existing/fixed split. */
 export type FindingCounts = {
   total: number;
   bySeverity: Partial<Record<Severity, number>>;
   byCategory: Partial<Record<Category, number>>;
+  byScanStatus: Record<ScanStatus, number>;
 };
 
 type DataRow = { data_json: string };
@@ -80,18 +88,35 @@ export class FindingRepo {
     })();
   }
 
-  /** Every finding of a scan with the analyzer that produced it (post-analysis stages: verify, score). */
-  all(scanId: string): FindingRow[] {
-    const rows = this.db.prepare(`SELECT analyzer, data_json FROM findings WHERE scan_id = ? ORDER BY id`)
+  /**
+   * Every current finding of a scan with the analyzer that produced it (post-analysis stages: verify,
+   * score, synthesis, exports). `fixed` rows (findings of the previous scan this one no longer has) are
+   * left out unless `includeFixed`.
+   */
+  all(scanId: string, opts: { includeFixed?: boolean } = {}): FindingRow[] {
+    const where = opts.includeFixed ? '' : ` AND ${NOT_FIXED_SQL}`;
+    const rows = this.db.prepare(`SELECT analyzer, data_json FROM findings WHERE scan_id = ?${where} ORDER BY id`)
       .all(scanId) as { analyzer: string; data_json: string }[];
     return rows.map((r) => ({ analyzer: r.analyzer, finding: JSON.parse(r.data_json) as Finding }));
   }
 
-  /** Atomically replaces every finding row of a scan — the full-scan cache copy. */
+  /** Atomically replaces every finding row of a scan (fixed ones included) — the full-scan cache copy. */
   replaceAll(scanId: string, rows: readonly FindingRow[]): void {
     const parsed = rows.map((r) => ({ analyzer: r.analyzer, finding: FindingSchema.parse(r.finding) }));
     this.db.transaction(() => {
       this.db.prepare(`DELETE FROM findings WHERE scan_id = ?`).run(scanId);
+      this.insertRows(scanId, parsed);
+    })();
+  }
+
+  /** Atomically replaces the scan's `fixed` rows (idempotent re-runs of the new/existing/fixed comparison). */
+  replaceFixed(scanId: string, rows: readonly FindingRow[]): void {
+    const parsed = rows.map((r) => ({ analyzer: r.analyzer, finding: FindingSchema.parse(r.finding) }));
+    if (parsed.some((r) => r.finding.scanStatus !== 'fixed')) {
+      throw new AppError('INTERNAL', 'permanent', 'replaceFixed only stores fixed findings');
+    }
+    this.db.transaction(() => {
+      this.db.prepare(`DELETE FROM findings WHERE scan_id = ? AND json_extract(data_json, '$.scanStatus') = 'fixed'`).run(scanId);
       this.insertRows(scanId, parsed);
     })();
   }
@@ -128,6 +153,12 @@ export class FindingRepo {
     const row = this.db.prepare(`SELECT findings_json FROM analyzer_results WHERE scan_id = ? AND analyzer = ?`)
       .get(scanId, analyzer) as { findings_json: string } | undefined;
     return row ? (JSON.parse(row.findings_json) as Finding[]) : [];
+  }
+
+  /** The analyzers that completed for a scan (they stored their output). */
+  analyzersWithResults(scanId: string): Set<string> {
+    const rows = this.db.prepare(`SELECT analyzer FROM analyzer_results WHERE scan_id = ?`).all(scanId) as Array<{ analyzer: string }>;
+    return new Set(rows.map((r) => r.analyzer));
   }
 
   /** Every analyzer output stored for a scan (the full-scan cache copies them along). */
@@ -186,6 +217,12 @@ export class FindingRepo {
     // finding); filtering via json_extract keeps `all` (the default) a plain no-op clause.
     if (filter.triage === 'open') clauses.push(`json_extract(data_json, '$.triage.status') IS NULL`);
     else if (filter.triage === 'suppressed') clauses.push(`json_extract(data_json, '$.triage.status') IS NOT NULL`);
+    if (filter.scanStatus) {
+      clauses.push(`json_extract(data_json, '$.scanStatus') = ?`);
+      params.push(filter.scanStatus);
+    } else {
+      clauses.push(NOT_FIXED_SQL);
+    }
     const rows = this.db.prepare(
       `SELECT data_json FROM findings WHERE ${clauses.join(' AND ')}
        ORDER BY severity_rank, risk_score DESC, file, start_line, id
@@ -196,16 +233,23 @@ export class FindingRepo {
     return { items, nextCursor: hasMore ? encodeCursor(offset + limit) : null };
   }
 
+  /** Counts over the scan's current findings (fixed rows excluded), plus the new/existing/fixed split. */
   counts(scanId: string): FindingCounts {
-    const total = (this.db.prepare(`SELECT COUNT(*) as c FROM findings WHERE scan_id = ?`).get(scanId) as { c: number }).c;
+    const current = `scan_id = ? AND ${NOT_FIXED_SQL}`;
+    const total = (this.db.prepare(`SELECT COUNT(*) as c FROM findings WHERE ${current}`).get(scanId) as { c: number }).c;
     const bySeverity: Partial<Record<Severity, number>> = {};
-    for (const row of this.db.prepare(`SELECT severity, COUNT(*) as c FROM findings WHERE scan_id = ? GROUP BY severity`).all(scanId) as SeverityCountRow[]) {
+    for (const row of this.db.prepare(`SELECT severity, COUNT(*) as c FROM findings WHERE ${current} GROUP BY severity`).all(scanId) as SeverityCountRow[]) {
       bySeverity[row.severity] = row.c;
     }
     const byCategory: Partial<Record<Category, number>> = {};
-    for (const row of this.db.prepare(`SELECT category, COUNT(*) as c FROM findings WHERE scan_id = ? GROUP BY category`).all(scanId) as CategoryCountRow[]) {
+    for (const row of this.db.prepare(`SELECT category, COUNT(*) as c FROM findings WHERE ${current} GROUP BY category`).all(scanId) as CategoryCountRow[]) {
       byCategory[row.category] = row.c;
     }
-    return { total, bySeverity, byCategory };
+    const byScanStatus: Record<ScanStatus, number> = { new: 0, existing: 0, fixed: 0 };
+    const statusRows = this.db.prepare(
+      `SELECT json_extract(data_json, '$.scanStatus') AS s, COUNT(*) as c FROM findings WHERE scan_id = ? GROUP BY s`,
+    ).all(scanId) as Array<{ s: string; c: number }>;
+    for (const row of statusRows) if (row.s === 'new' || row.s === 'existing' || row.s === 'fixed') byScanStatus[row.s] = row.c;
+    return { total, bySeverity, byCategory, byScanStatus };
   }
 }

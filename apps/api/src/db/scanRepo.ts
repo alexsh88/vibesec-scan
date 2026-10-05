@@ -147,6 +147,18 @@ export class ScanRepo {
     ).get(repoId, commitSha, keys.resultOptionsHash, keys.analyzerVersionsHash, excludeId) as ScanRow | undefined;
   }
 
+  /**
+   * new/existing/fixed: the latest completed scan of the same repo (any options or commit) that was
+   * requested no later than `scanId` (a scan never compares itself against a newer one).
+   */
+  findPreviousCompleted(repoId: string, scanId: string): ScanRow | undefined {
+    return this.db.prepare(
+      `SELECT * FROM scans WHERE repo_id = ? AND state IN ${COMPLETED_SQL} AND id <> ?
+         AND created_at <= (SELECT created_at FROM scans WHERE id = ?)
+       ORDER BY finished_at DESC, rowid DESC LIMIT 1`,
+    ).get(repoId, scanId, scanId) as ScanRow | undefined;
+  }
+
   findActiveDuplicate(repoId: string, ref: string | null, optionsHash: string): ScanRow | undefined {
     return this.db.prepare(
       `SELECT * FROM scans WHERE repo_id = ? AND ref IS ? AND options_hash = ? AND state NOT IN ${TERMINAL_SQL}
