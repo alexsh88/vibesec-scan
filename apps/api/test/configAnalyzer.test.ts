@@ -222,8 +222,8 @@ describe('createConfigAnalyzer: .env redaction', () => {
 });
 
 describe('createConfigAnalyzer: hints and additional issues', () => {
-  it('confirmed hints become findings (hint location, reason appended, producedBy rule+llm); refuted hints are dropped', async () => {
-    const files = await writeRepoFiles({ '.github/workflows/ci.yml': WORKFLOW, Dockerfile: DOCKERFILE_NO_USER });
+  it('confirmed hints become findings (hint location, reason appended, producedBy rule+llm) at their original severity', async () => {
+    const files = await writeRepoFiles({ '.github/workflows/ci.yml': WORKFLOW_SINGLE_HINT, Dockerfile: DOCKERFILE_NO_USER });
     const { llm, calls } = stubLlm(async (call) => {
       const ids = hintIdsOf(call.prompt);
       const ghId = ids.find((id) => id.includes('ci.yml'))!;
@@ -239,12 +239,55 @@ describe('createConfigAnalyzer: hints and additional issues', () => {
     const findings = await createConfigAnalyzer({ llm }).run(makeCtx(files));
 
     expect(calls.length).toBeGreaterThan(0);
-    expect(findings).toHaveLength(1);
-    const f = findings[0]!;
-    expect(f.ruleId).toBe('config/gha-pull-request-target-checkout');
+    expect(findings).toHaveLength(2);
+    const f = findings.find((x) => x.ruleId === 'config/gha-pull-request-target-checkout')!;
     expect(f.location.file).toBe('.github/workflows/ci.yml');
     expect(f.producedBy).toEqual(['config:rule', 'config:llm']);
     expect(f.explanation).toContain('checks out untrusted PR head');
+    expect(f.severity).toBe('critical'); // unchanged by confirmation
+    expect(f.riskFactors).toEqual([]);
+  });
+
+  it('a refuted hint is downgraded to info/low with an ai_refuted riskFactor, never dropped', async () => {
+    const files = await writeRepoFiles({ Dockerfile: DOCKERFILE_NO_USER });
+    const { llm } = stubLlm(async (call) => {
+      const dockerId = hintIdsOf(call.prompt)[0]!;
+      return okResult({
+        hintVerdicts: [{ hintId: dockerId, confirmed: false, reason: 'base image already drops privileges' }],
+        issues: [],
+      });
+    });
+    const findings = await createConfigAnalyzer({ llm }).run(makeCtx(files));
+
+    expect(findings).toHaveLength(1);
+    const f = findings[0]!;
+    expect(f.ruleId).toBe('config/docker-root-user');
+    expect(f.severity).toBe('info');
+    expect(f.confidence).toBe('low');
+    expect(f.producedBy).toEqual(['config:rule', 'config:llm']);
+    expect(f.explanation).toContain('AI review judged this a likely false positive: base image already drops privileges');
+    expect(f.riskFactors).toHaveLength(1);
+    expect(f.riskFactors[0]).toMatchObject({ factor: 'ai_refuted', reason: 'base image already drops privileges' });
+    expect(f.riskFactors[0]!.effect).toBeLessThan(0);
+    expect(() => FindingSchema.parse(f)).not.toThrow();
+  });
+
+  it('a hint the AI response never mentions keeps its original severity, drops to low confidence, and gets an ai_unreviewed riskFactor', async () => {
+    const files = await writeRepoFiles({ Dockerfile: DOCKERFILE_NO_USER });
+    const { llm } = stubLlm(async () => okResult({ hintVerdicts: [], issues: [] }));
+    const findings = await createConfigAnalyzer({ llm }).run(makeCtx(files));
+
+    expect(findings).toHaveLength(1);
+    const f = findings[0]!;
+    expect(f.ruleId).toBe('config/docker-root-user');
+    expect(f.severity).toBe('medium'); // unchanged
+    expect(f.confidence).toBe('low');
+    expect(f.producedBy).toEqual(['config:rule']);
+    expect(f.riskFactors).toEqual([{
+      factor: 'ai_unreviewed', effect: 0,
+      reason: 'AI review returned no verdict for this hint; kept at its original severity (fail-open)',
+    }]);
+    expect(() => FindingSchema.parse(f)).not.toThrow();
   });
 
   it('verifies additional issues before they become findings: drops a hallucinated one, keeps a real one', async () => {
@@ -305,7 +348,7 @@ describe('createConfigAnalyzer: hints and additional issues', () => {
   it('produces Findings that satisfy FindingSchema and never puts a credential value into a finding', async () => {
     const files = await writeRepoFiles({ '.env': 'API_KEY=zK9pQ7xT2vL8mN4r\n' });
     const { llm } = stubLlm(async () => okResult({
-      hintVerdicts: [],
+      hintVerdicts: [], // the .env file's own 'config/env-file-committed' hint goes unmentioned -> ai_unreviewed
       issues: [{
         ruleId: 'config/debug-mode-enabled', title: 't', severity: 'medium', confidence: 'medium',
         file: '.env', startLine: 1, endLine: 1, snippet: 'API_KEY=zK…',
@@ -313,9 +356,13 @@ describe('createConfigAnalyzer: hints and additional issues', () => {
       }],
     }));
     const findings = await createConfigAnalyzer({ llm }).run(makeCtx(files));
-    expect(findings).toHaveLength(1);
-    expect(() => FindingSchema.parse(findings[0])).not.toThrow();
+    expect(findings).toHaveLength(2);
+    for (const f of findings) expect(() => FindingSchema.parse(f)).not.toThrow();
     expect(JSON.stringify(findings)).not.toContain('zK9pQ7xT2vL8mN4r');
+
+    const hintFinding = findings.find((f) => f.ruleId === 'config/env-file-committed')!;
+    expect(hintFinding.confidence).toBe('low');
+    expect(hintFinding.riskFactors.some((r) => r.factor === 'ai_unreviewed')).toBe(true);
   });
 });
 

@@ -1,9 +1,13 @@
 // AI config analyzer (P6, Task B): Claude reviews workflows/Dockerfiles/env/IaC and writes the
 // findings. The deterministic rules in this directory (githubActions.ts, dockerfile.ts,
 // envExposure.ts, aggregated by configIssues() in index.ts) are HINTS — "these lines matched a
-// known-dangerous pattern, confirm or refute each, then look for anything else." A hint becomes a
-// finding only when Claude confirms it. If the AI step fails for a batch, that batch's hints are
-// emitted as findings anyway, at confidence 'low' with a warning (fail-open for security).
+// known-dangerous pattern, confirm or refute each, then look for anything else." A hint ALWAYS
+// becomes a finding: Claude confirming it keeps its original severity (producedBy adds
+// 'config:llm'); Claude refuting it downgrades it to info/low confidence with an 'ai_refuted'
+// riskFactor explaining why (never dropped — same product rule as credentials); and a hint Claude
+// never returned a verdict for (whole-batch AI failure, budget skip, or simply omitted from an
+// otherwise-successful response) stays at its original severity but low confidence with an
+// 'ai_unreviewed' riskFactor (fail-open for security).
 //
 // .env values are NEVER sent to the model (and never land in a finding): redacted to "<key>=<first
 // two chars>…" before anything is read, numbered, or verified against.
@@ -17,8 +21,9 @@ import { open } from 'node:fs/promises';
 import { join, resolve, sep } from 'node:path';
 import { isMap, isScalar, parseDocument } from 'yaml';
 import { z } from 'zod';
-import type { Finding } from '@vibesec/shared';
+import type { Finding, Severity } from '@vibesec/shared';
 import { toAppError } from '../../../errors/AppError';
+import { provisionalScore } from '../../../findings/helpers';
 import { verifyIssueLocation } from '../../../findings/verify';
 import type { LlmClient, StructuredCall } from '../../../llm/LlmClient';
 import type { MockResponder } from '../../../llm/mockTransport';
@@ -35,7 +40,7 @@ import { isEnvFile, isEnvTemplateFile } from './envExposure';
 import { isGithubActionsWorkflow } from './githubActions';
 import { configIssues } from './index';
 
-export const CONFIG_PROMPT_VERSION = 'config-v1';
+export const CONFIG_PROMPT_VERSION = 'config-v2';
 /** Appears verbatim in the system prompt; `configMockResponder` keys on it. */
 export const CONFIG_TASK_MARKER = 'Task: config-review';
 
@@ -166,11 +171,24 @@ const SYSTEM_PROMPT = [
   'Firebase/Firestore/Storage rules, Vercel/Netlify config, Terraform, and Kubernetes manifests.',
   '',
   'Each file is wrapped in an <untrusted_file> block with 1-based line numbers. Some files are',
-  'followed by one or more <hint> blocks: a deterministic pattern-matcher already flagged that line',
-  'as a known-dangerous pattern (its ruleId, severity, line and matched snippet are given). For EVERY',
-  'hint you are given, decide whether it is a real issue in this file or a false positive, by looking',
-  'at the actual file content — not just the hint text — and return exactly one entry per hintId in',
-  '"hintVerdicts": { hintId, confirmed, reason }. A hint becomes a finding only when you confirm it.',
+  'followed by one or more <hint> blocks: a high-precision deterministic pattern-matcher already',
+  'flagged that line as a known-dangerous pattern (its ruleId, severity, line and matched snippet are',
+  'given). These rules have a low false-positive rate by design, so start from the presumption that',
+  'each hint is real. For EVERY hint you are given, decide whether it is a real issue in this file or',
+  'a false positive, by looking at the actual file content — not just the hint text — and return',
+  'exactly one entry per hintId in "hintVerdicts": { hintId, confirmed, reason }.',
+  '',
+  'Refuting a hint (confirmed: false) requires concrete, visible evidence in THIS file that the',
+  'dangerous pattern is actually safe here — for example: the `curl|wget … | sh` target is a pinned,',
+  'checksum- or signature-verified script (the verification step is visible in the file, not assumed);',
+  'a later USER instruction in the same build stage switches off root before the container runs; or the',
+  'matched line is unreachable/commented out. Noting that the file "looks like a demo/test/example" is',
+  'NOT by itself a reason to refute — demo and test files ship in real images and run with the same',
+  'privileges as anything else. If you are not sure, or the evidence is anything less than concrete and',
+  'visible in the file, confirm the hint (confirmed: true) rather than guessing it away: an unconfirmed',
+  'hint still gets a human look, but a wrongly refuted one disappears from review entirely. A hint is',
+  'never dropped outright by your verdict — refuting it only lowers its severity — so there is no harm',
+  'in confirming when unsure.',
   '',
   'Separately, look for ANY other configuration/infrastructure security issue in the file, hinted or',
   'not — for example (not exhaustive): a Supabase table created without enabling row-level security,',
@@ -334,6 +352,49 @@ function overlaps(a: RawCodeIssue, b: RawCodeIssue): boolean {
   return a.file === b.file && a.startLine <= b.endLine && b.startLine <= a.endLine;
 }
 
+// --- hint-verdict outcomes (never let an AI verdict make a deterministic hint disappear) ----------
+// Same product rule already applied to credentials (see credentials/credentialsAnalyzer.ts
+// buildFinding's I6 comment): the AI may DOWNGRADE a deterministic signal, but it may never make it
+// disappear. A refuted hint and an unreviewed hint both still become findings below, just at reduced
+// severity/confidence with a riskFactor recording why.
+
+const SEV_ORDER: readonly Severity[] = ['info', 'low', 'medium', 'high', 'critical'];
+const sevIndex = (s: Severity): number => SEV_ORDER.indexOf(s);
+const AI_REFUTED_REASON_MAX = 200;
+
+/** A hint Claude reviewed and refuted: downgraded to info/low, never dropped. */
+function buildRefutedHintFinding(
+  ctx: Pick<AnalyzerContext, 'scanId' | 'repo' | 'commitSha'>,
+  hint: RawCodeIssue,
+  reason: string,
+): Finding {
+  const finding = issueToFinding(ctx, 'config', hint, ['config:rule', 'config:llm']);
+  const truncatedReason = reason.slice(0, AI_REFUTED_REASON_MAX);
+  finding.riskFactors = [{ factor: 'ai_refuted', effect: sevIndex('info') - sevIndex(hint.severity), reason: truncatedReason }];
+  finding.severity = 'info';
+  finding.confidence = 'low';
+  finding.riskScore = provisionalScore('info');
+  finding.explanation = `${finding.explanation} AI review judged this a likely false positive: ${truncatedReason}`;
+  return finding;
+}
+
+/**
+ * A hint Claude never returned a verdict for — either the whole batch's AI call failed/was
+ * budget-skipped, or the model's otherwise-successful response simply omitted this hintId. Fail-open:
+ * kept at its original severity, dropped to low confidence, flagged as unreviewed.
+ */
+function buildUnreviewedHintFinding(
+  ctx: Pick<AnalyzerContext, 'scanId' | 'repo' | 'commitSha'>,
+  hint: RawCodeIssue,
+): Finding {
+  const finding = issueToFinding(ctx, 'config', { ...hint, confidence: 'low' }, ['config:rule']);
+  finding.riskFactors = [{
+    factor: 'ai_unreviewed', effect: 0,
+    reason: 'AI review returned no verdict for this hint; kept at its original severity (fail-open)',
+  }];
+  return finding;
+}
+
 // --- service ---------------------------------------------------------------------------------
 
 export type ConfigAnalyzerDeps = {
@@ -446,10 +507,11 @@ export function createConfigAnalyzer(deps: ConfigAnalyzerDeps): Analyzer {
         };
 
         const keepHintsUnconfirmed = (status: CoverageStatus) => {
-          // Fail-open for security: an unconfirmed hint still becomes a finding, just at low confidence,
-          // rather than silently disappearing because the AI step was unavailable.
+          // Fail-open for security: an unconfirmed hint still becomes a finding, just at low confidence
+          // with an 'ai_unreviewed' riskFactor, rather than silently disappearing because the AI step
+          // was unavailable.
           for (const entry of batchHintEntries) {
-            findings.push(issueToFinding(ctx, 'config', { ...entry.hint, confidence: 'low' }, ['config:rule']));
+            findings.push(buildUnreviewedHintFinding(ctx, entry.hint));
           }
           for (const f of batch) record(f.path, status);
           if (!warnedUnavailable) {
@@ -463,16 +525,30 @@ export function createConfigAnalyzer(deps: ConfigAnalyzerDeps): Analyzer {
           const result = await deps.llm.structured(call);
 
           const confirmedHintIssues: RawCodeIssue[] = [];
+          const verdictedHintIds = new Set<string>();
           for (const v of result.output.hintVerdicts) {
             const entry = batchHintById.get(v.hintId);
             if (!entry) continue;
-            if (!v.confirmed) continue; // refuted hints are dropped (counted only via debug logging upstream, if any)
-            const confirmedIssue: RawCodeIssue = {
-              ...entry.hint,
-              explanation: `${entry.hint.explanation} AI review: ${v.reason}`.slice(0, 4_000),
-            };
-            confirmedHintIssues.push(confirmedIssue);
-            findings.push(issueToFinding(ctx, 'config', confirmedIssue, ['config:rule', 'config:llm']));
+            verdictedHintIds.add(v.hintId);
+            if (v.confirmed) {
+              const confirmedIssue: RawCodeIssue = {
+                ...entry.hint,
+                explanation: `${entry.hint.explanation} AI review: ${v.reason}`.slice(0, 4_000),
+              };
+              confirmedHintIssues.push(confirmedIssue);
+              findings.push(issueToFinding(ctx, 'config', confirmedIssue, ['config:rule', 'config:llm']));
+            } else {
+              // Refuted, not dropped: downgraded to info/low with an 'ai_refuted' riskFactor (see
+              // buildRefutedHintFinding above) — the AI may downgrade a deterministic signal, never
+              // make it disappear.
+              findings.push(buildRefutedHintFinding(ctx, entry.hint, v.reason));
+            }
+          }
+          // A hintId the model's response simply never mentioned: same fail-open treatment as a
+          // whole-batch AI failure (keepHintsUnconfirmed), just scoped to the missing ones.
+          for (const entry of batchHintEntries) {
+            if (verdictedHintIds.has(entry.id)) continue;
+            findings.push(buildUnreviewedHintFinding(ctx, entry.hint));
           }
 
           for (const raw of result.output.issues) {
