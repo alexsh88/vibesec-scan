@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { FindingSchema, ScanOptionsSchema, type ScanDto, type ScanOptions } from '@vibesec/shared';
 import { createCredentialsAnalyzer, type CredentialsAnalyzerDeps } from '../src/analyzers/credentials/credentialsAnalyzer';
 import { credentialsFpMockResponder } from '../src/analyzers/credentials/fpFilter';
+import { redact } from '../src/analyzers/credentials/rules';
 import type { SecretVerifier, VerifyResult } from '../src/analyzers/credentials/verifiers';
 import type { AnalyzerContext } from '../src/analyzers/types';
 import { AppError } from '../src/errors/AppError';
@@ -144,12 +145,12 @@ describe('createCredentialsAnalyzer', () => {
     const ctx = makeCtx(files, { options: { historyDepth: 50, verifySecrets: false } });
     const findings = await analyzer.run(ctx);
 
-    const dupFindings = findings.filter((f) => f.secret!.redacted === findingRedacted(dup));
+    const dupFindings = findings.filter((f) => f.secret!.redacted === redact(dup, 'github-token'));
     expect(dupFindings).toHaveLength(1);
     expect(dupFindings[0]!.secret!.inHistoryOnly).toBe(false);
     expect(dupFindings[0]!.location.permalink).toContain(ctx.commitSha);
 
-    const historyOnlyFindings = findings.filter((f) => f.secret!.redacted === findingRedacted(historyOnly));
+    const historyOnlyFindings = findings.filter((f) => f.secret!.redacted === redact(historyOnly, 'github-token'));
     expect(historyOnlyFindings).toHaveLength(1);
     const hf = historyOnlyFindings[0]!;
     expect(hf.secret!.inHistoryOnly).toBe(true);
@@ -317,9 +318,3 @@ describe('createCredentialsAnalyzer', () => {
     expect(findings[0]!.explanation).toContain('Found on 3 lines in this file');
   });
 });
-
-/** redact() is pure and deterministic, so this reproduces what the analyzer must have stored. */
-function findingRedacted(value: string): string {
-  if (value.length < 12) return value.length <= 2 ? value : `${value.slice(0, 2)}…`;
-  return `${value.slice(0, 4)}…${value.slice(-4)}`;
-}
