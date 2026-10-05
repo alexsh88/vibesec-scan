@@ -94,7 +94,7 @@ export function createContainer(config: Config, overrides: ContainerOverrides = 
       : null;
   const analyzers = [
     createCredentialsAnalyzer({ llm, git, verifier }),
-    createDependenciesAnalyzer({ osv, registry, sandbox, indexRepo, llm, fixPlans, sandboxEnabled: sandbox !== null }),
+    createDependenciesAnalyzer({ osv, registry, sandbox, indexRepo, llm, fixPlans, sandboxEnabled: sandbox !== null, sandboxInstall: config.sandbox.install }),
   ];
 
   const pipeline = overrides.pipeline ?? createScanPipeline({

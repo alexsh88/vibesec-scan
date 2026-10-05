@@ -40,7 +40,14 @@ other scans, and the availability of the service.
 
 ## Two phases
 
-### Phase A: install (`install()`)
+Phase B (offline usage analysis over the source) is what reachability needs, and it runs whenever the sandbox is
+available: it never depends on phase A. Phase A is **opt-in** (`SANDBOX_INSTALL=true`, default `false`) and only
+refines phase B: for PyPI it yields the distribution → module mapping read from the installed metadata (merged into
+the import names phase B looks for), for npm the installed tree is used to cross-check the lockfile's resolved
+versions (`SANDBOX_VERSION_MISMATCH` warning). A failing install (monorepos, private registries, …) only produces a
+`SANDBOX_INSTALL_PARTIAL` warning; phase B still runs.
+
+### Phase A: install (`install()`, opt-in)
 
 ```
            per-scan  --internal  network (no route out)                   default bridge
@@ -51,7 +58,15 @@ other scans, and the availability of the service.
  └───────────────────────────────┘        └──────────────────────┘
 ```
 
-* **npm:** only `package.json` and the one lockfile that is used are copied into a fresh staging dir.
+* **Where it installs:** into a size-capped tmpfs at `/out` (`--tmpfs /out:…,size=SANDBOX_MAX_DEPS_MB,uid=10001`,
+  default 1536 MB), which is the install **disk quota**: a bigger install hits `ENOSPC` and fails with
+  `SANDBOX_INSTALL_FAILED` (`installed dependencies exceed … MB`) while it runs, not afterwards. Nothing installed
+  ever reaches the host disk; the tmpfs is charged to the container's memory cgroup, so the install container's
+  `--memory` is 2 GB plus the quota. Inputs come from `/in` (read-only, staged by the host) and the container
+  writes only small result files to `/res`: `tree.json` (npm/pnpm), or pip's `report.json` plus
+  `distmap.json` for PyPI. Verified on Docker Desktop 28.5 (tmpfs `size=`/`uid=` honoured).
+* **npm:** only `package.json` and the one lockfile that is used are copied into a fresh staging dir (`/in`, then
+  copied into `/out/work` by the fixed script).
   `.npmrc`, `.yarnrc(.yml)` and `pnpm-workspace.yaml` are **never** copied, because they can carry tokens,
   alternate registries, `yarnPath` (arbitrary JS) or plugins. The repo's `packageManager` field is replaced by
   our pinned version: corepack runs with `COREPACK_ENABLE_NETWORK=0` and the versions baked into the image.
@@ -63,14 +78,18 @@ other scans, and the availability of the service.
     `nodeLinker=node-modules`
   * no lockfile: `npm install --package-lock-only --ignore-scripts`, then `npm ci`
 
-  The tree comes from `npm ls --all --json` (`pnpm ls --json` for pnpm). A non-zero exit with JSON output is
-  accepted. The repository checkout itself is **not** mounted during install.
+  The tree comes from `npm ls --all --json` (`pnpm ls --json` for pnpm) written to `/res/tree.json`. A non-zero
+  exit with JSON output is accepted. The repository checkout itself is **not** mounted during install.
 * **PyPI:** the caller converts the lockfile (poetry / uv / Pipfile / requirements) into pinned
   `name==version` lines **on the host**. `install()` takes this `requirements: string[]` instead of a
   manifest dir, so no build backend, `setup.py` or pip config from the repo is ever involved. Each line must be
   a plain PEP 508 requirement. Options (`-r`, `--index-url`, `-e`), URLs, paths and hashes are dropped, each
-  with a warning. The install runs
-  `pip install --isolated --only-binary=:all: --index-url https://pypi.org/simple --proxy … --target /out/deps --report /out/report.json -r /in/requirements.txt`.
+  with a warning. The install runs a fixed driver staged by the host (`python /in/vibesec_install.py <pip args>`,
+  source: `PYPI_INSTALL_DRIVER` in `dockerSandbox.ts`), which calls
+  `pip install --isolated --only-binary=:all: --index-url https://pypi.org/simple --proxy … --target /out/deps --report /res/report.json -r /in/requirements.txt`
+  and then, still inside the container, maps every installed `*.dist-info` to its top-level modules
+  (`top_level.txt`, else the `RECORD` paths; links and files > 4 MB skipped, ≤ 5000 dists × 50 modules) into
+  `/res/distmap.json`. The host reads it with the capped no-follow reader and validates every name.
 * **Egress:** the per-scan network is created with `--internal`. Its only other member is the proxy container,
   which is also attached to the default bridge, so the proxy is the only way out. Docker's embedded DNS does
   not resolve external names on an internal network (verified: `EAI_AGAIN`). The proxy (`proxy/proxy.mjs`)
@@ -79,35 +98,39 @@ other scans, and the availability of the service.
   * It allows only exact, case-insensitive host matches, with no wildcards and no suffix matching.
   * IP literals are always refused.
   * Only port 443 is allowed (80 and everything else get 403).
-  * It resolves the allowlisted name itself and refuses private, loopback, link-local or multicast answers.
+  * It resolves the allowlisted name itself and refuses non-public answers: RFC 1918, loopback, link-local,
+    CGNAT, multicast, `198.18.0.0/15`, `192.0.0.0/24`, and on IPv6 `::`/`::1`, v4-mapped and v4-compatible
+    (`::a.b.c.d`) forms of those, NAT64 (`64:ff9b::/96`, `64:ff9b:1::/48`), 6to4 (`2002::/16`), ULA
+    (`fc00::/7`), link-local, site-local (`fec0::/10`), documentation and multicast. Unparseable answers are refused.
   * It enforces a per-connection idle timeout (30 s) and at most 64 concurrent connections.
   * It logs every decision as one JSON line. Denied targets come back to the caller as warnings (`sandbox
     proxy denied egress to …`), which is a useful signal on its own (for example, a lockfile pointing at a git
     host).
-* **After install:** an offline helper container (see below) removes caches and reports the size with `du`.
-  Installs larger than `SANDBOX_MAX_DEPS_MB` (default 1536) fail and are deleted. The host then checks that
-  every path component down to the deps dir is a real directory, not a link.
+* **After install:** the host reads the result files (capped, never following links) and deletes the run dir
+  through the offline helper container (see below). Nothing of the install is kept.
 
 ### Phase B: analyze (`analyze()`)
 
-`--network none`, with these mounts: `/src` (the repo checkout, read-only), `/deps` (the phase-A deps dir,
-read-only, and only if it is under this scan's sandbox dir with no link components), `/in/packages.json`
-(read-only; `{ ecosystem, packages: [{ name, importNames }] }`) and `/out` (read-write). The container runs our analyzer (`node /opt/vibesec/analyze.mjs` or
+`--network none`, with these mounts: `/src` (the repo checkout, read-only), `/in/packages.json`
+(read-only; `{ ecosystem, packages: [{ name, importNames }] }`) and `/out` (read-write). Installed dependencies
+are never mounted: the analyzers only parse the source. The container runs our analyzer (`node /opt/vibesec/analyze.mjs` or
 `python /opt/vibesec/analyze.py`), and the host reads `/out/usages.json`, capped at 50 MB.
 
 ## Container flags (every container: install, analyze, proxy, helper)
 
 ```
 docker run --rm --init --pull never --name vibesec-<phase>-<scan8>-<rand6> --label vibesec.scan=<scanId>
-  --hostname sandbox --user 10001:10001 --read-only --tmpfs /tmp:rw,noexec,nosuid,nodev,size=256m
+  --label vibesec.instance=<instance id> --hostname sandbox --user 10001:10001 --read-only --tmpfs /tmp:rw,noexec,nosuid,nodev,size=256m
   --cap-drop ALL --security-opt no-new-privileges --pids-limit 512 --memory 2g --memory-swap 2g --cpus 2
   --ulimit core=0 --network <internal-net | none | bridge (proxy only)>
   --env K=V ...            # explicit, fixed values only
   --mount type=bind,source=<abs host path>,target=/out[,readonly] ...
+  [--tmpfs /out:rw,noexec,nosuid,nodev,size=<quota>,uid=10001,gid=10001,mode=0700]   # phase A only
   [--workdir ...] <prefix>/sandbox-<kind>:v1 <fixed command>
 ```
 
-* The proxy gets 256 MB, 0.5 CPU and 64 pids. Helpers get 256 MB, 1 CPU and 64 pids.
+* The proxy gets 256 MB, 0.5 CPU and 64 pids. Helpers get 256 MB, 1 CPU and 64 pids. Phase-A installs get
+  2 GB + the tmpfs quota of memory.
 * No `--privileged`, no added capabilities, no devices, no host namespaces, and no Docker socket.
 * `--pull never`: only locally built images ever run.
 * **Deadlines:** 180 s for install (`SANDBOX_INSTALL_TIMEOUT_MS`) and 120 s for analyze
@@ -134,16 +157,20 @@ docker run --rm --init --pull never --name vibesec-<phase>-<scan8>-<rand6> --lab
   *helper* container (`sandbox-node`, `--network none`, the same hardening) over the directory mounted at `/w`.
   The host then removes only the emptied, host-owned directories. If the helper cannot run, the directory is
   left for the next sweep.
-* `/out` is created with mode `1777` (sticky), so uid 10001 can add entries but cannot replace the host-made
-  `work`, `cache` and `tmp` dirs.
-* `sweep(scanId)` removes containers, networks and volumes labeled `vibesec.scan=<scanId>`, plus the scan's
-  staging dir (via the helper). `sweep()` with no argument removes **all** labeled leftovers. Call it on startup
-  only when no other process is running scans against the same Docker daemon.
+* The phase-A results dir `/res` is created with mode `1777` (sticky), so uid 10001 can add result files but
+  cannot replace host-made entries.
+* Every container and network also carries `vibesec.instance=<id>`: the API instance's id, a UUID persisted in
+  `<WORK_DIR>/sandbox-instance.id` (stable across restarts). `sweep(scanId)` removes this instance's containers,
+  networks and volumes labeled `vibesec.scan=<scanId>`, plus the scan's staging dir (via the helper).
+  `sweep()` with no argument (on startup) removes **this instance's** leftovers only, so several API instances
+  can share one Docker daemon without sweeping each other's running scans.
 
 ## Fallback
 
 `availability()` runs `docker version` plus `docker image inspect` of the three images, with the result cached
-for 30 s. When Docker or the images are missing, the network cannot be created, or the daemon refuses a
+for 30 s. **Docker Engine ≥ 26 is required**: before 26, containers on an `--internal` network could still resolve
+names through the embedded DNS forwarding to external resolvers (CVE-2024-29018), a DNS exfiltration channel out
+of phase A; older engines report `SANDBOX_UNAVAILABLE`. When Docker or the images are missing, the network cannot be created, or the daemon refuses a
 container (exit 125), the result is `{ ok: false, code: 'SANDBOX_UNAVAILABLE' }`. The caller then falls back to
 lockfile-only analysis and records the `SANDBOX_UNAVAILABLE` warning. `SANDBOX_ENABLED=false` disables the
 sandbox entirely; that check is the caller's responsibility.
@@ -155,16 +182,19 @@ sandbox entirely; that check is the caller's responsibility.
   Firecracker / Kata microVMs**, on dedicated nodes with no cloud credentials.
 * **Registry content:** the allowlist stops exfiltration to arbitrary hosts, but a malicious package can still
   be *downloaded*, and data could in principle be encoded into requests to the allowlisted registries
-  (package-name lookups). This is acceptable because no attacker code runs in phase A.
+  (package-name lookups). This is acceptable because no attacker code runs in phase A. The same holds for
+  domain fronting through the allowlisted CDNs (the proxy checks the CONNECT host, not the TLS SNI / HTTP Host
+  inside the tunnel): only the package manager speaks through the tunnel.
 * **Phase B** executes no attacker code, only our analyzer *parsing* attacker files. A parser bug is contained
   by `--network none`, the read-only mounts and the resource limits.
-* **Disk:** the size cap is checked *after* install. During install, writes are bounded only by the deadline
-  and the host disk, so put `WORK_DIR` on a quota'd volume in production.
-* **pnpm and yarn workspaces / monorepos:** only the one manifest dir is staged, so workspace installs fail
-  (`SANDBOX_INSTALL_FAILED`) and the caller falls back.
+* **Disk:** phase A writes into the size-capped tmpfs (memory-backed), so the quota is enforced during the
+  install; the host only receives the small result files (≤ 50 MB tree, ≤ 8 MB module map).
+* **pnpm and yarn workspaces / monorepos, private registries:** only the one manifest dir is staged and only the
+  public registries are reachable, so such installs fail (`SANDBOX_INSTALL_FAILED`). That only loses the phase-A
+  refinements; phase B is unaffected.
 * **Docker Desktop (Windows / macOS):**
-  * Bind-mount I/O is slow. A one-package npm install takes about 20–60 s end to end, the helper `du` and
-    `rm` about 2–10 s, and container start 1–4 s.
+  * Bind-mount I/O is slow (phase A now installs into a tmpfs, so only the inputs/results cross it). Container
+    start takes 1–4 s and the cleanup helper about 2–10 s.
   * Container-made symlinks are opaque to Windows (see above).
   * Paths are passed as absolute Windows paths in `--mount source=` (verified on Docker Desktop 28.5).
 * **Linux hosts:** host dirs handed to the container are `chmod 0777` / `1777` so uid 10001 can write them.

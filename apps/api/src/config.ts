@@ -59,6 +59,8 @@ const EnvSchema = z.object({
   SANDBOX_INSTALL_TIMEOUT_MS: z.coerce.number().int().positive().default(180_000),
   SANDBOX_ANALYZE_TIMEOUT_MS: z.coerce.number().int().positive().default(120_000),
   SANDBOX_MAX_DEPS_MB: z.coerce.number().int().positive().default(1536),
+  /** Opt-in phase A (dependency install behind the egress proxy); phase B never needs it. */
+  SANDBOX_INSTALL: z.enum(['true', 'false']).default('false'),
 });
 
 export type Config = {
@@ -71,7 +73,7 @@ export type Config = {
   models: { fast: string; deep: string; synthesis: string };
   llmConcurrency: number; llmRequestsPerMinute: number; llmInputTokensPerMinute: number; llmTimeoutMs: number; llmRecordingsDir: string;
   /** Docker sandbox for dependency install (phase A) and offline usage analysis (phase B). */
-  sandbox: { enabled: boolean; imagePrefix: string; installTimeoutMs: number; analyzeTimeoutMs: number; maxDepsBytes: number };
+  sandbox: { enabled: boolean; install: boolean; imagePrefix: string; installTimeoutMs: number; analyzeTimeoutMs: number; maxDepsBytes: number };
 };
 
 export function loadConfig(env: Record<string, string | undefined> = process.env): Config {
@@ -113,7 +115,7 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     // an absolute override is used as-is (#M-6).
     llmRecordingsDir: isAbsolute(e.LLM_RECORDINGS_DIR) ? e.LLM_RECORDINGS_DIR : resolve(REPO_ROOT, e.LLM_RECORDINGS_DIR),
     sandbox: {
-      enabled: e.SANDBOX_ENABLED === 'true', imagePrefix: e.SANDBOX_IMAGE_PREFIX,
+      enabled: e.SANDBOX_ENABLED === 'true', install: e.SANDBOX_INSTALL === 'true', imagePrefix: e.SANDBOX_IMAGE_PREFIX,
       installTimeoutMs: e.SANDBOX_INSTALL_TIMEOUT_MS, analyzeTimeoutMs: e.SANDBOX_ANALYZE_TIMEOUT_MS,
       maxDepsBytes: e.SANDBOX_MAX_DEPS_MB * 1024 * 1024,
     },

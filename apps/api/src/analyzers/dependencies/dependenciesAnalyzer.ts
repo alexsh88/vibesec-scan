@@ -18,6 +18,8 @@
 //     only (install scripts / typosquats / non-registry sources need no OSV). Chosen over throwing so
 //     a scan still reports the signals that are independent of OSV.
 //   - Docker sandbox unavailable / failing → import-index evidence (SANDBOX_UNAVAILABLE / SANDBOX_PARTIAL).
+//     Phase B (offline usage analysis) never needs phase A; the opt-in install (sandboxInstall) failing only
+//     loses its refinements (SANDBOX_INSTALL_PARTIAL).
 //   - Registry failing → fix plan from advisory versions (DEPENDENCY_FIX_PLAN_PARTIAL).
 // Cancellation (ctx.signal) always propagates.
 
@@ -51,6 +53,12 @@ export type DependenciesAnalyzerDeps = {
   llm: Pick<LlmClient, 'structured'>;
   fixPlans: Pick<FixPlanRepo, 'save'>;
   sandboxEnabled: boolean;
+  /**
+   * Opt-in phase A (SANDBOX_INSTALL, default false): install the dependencies in the sandbox to learn
+   * Python dist → module names from the installed metadata and to cross-check npm resolved versions.
+   * Phase B (offline usage analysis over the source) never depends on it.
+   */
+  sandboxInstall?: boolean;
   /** Parallel sandbox installs/analyses (default 2). */
   maxSandboxConcurrency?: number;
   /** Max vulnerable packages sent to the reachability judge (default 30). */
@@ -240,7 +248,9 @@ export function parseSandboxUsages(raw: unknown, ecosystem: Ecosystem): PackageU
 }
 
 /** Packages the sandbox analyzer looks for: vulnerable + signal nodes and all their ancestors (for transitive reachability). */
-function packagesOfInterest(graph: DepGraph, keys: ReadonlySet<string>): Array<{ name: string; importNames: string[] }> {
+function packagesOfInterest(
+  graph: DepGraph, keys: ReadonlySet<string>, extraImportNames: ReadonlyMap<string, string[]> = new Map(),
+): Array<{ name: string; importNames: string[] }> {
   const names = new Set<string>();
   const seen = new Set<string>();
   const stack = [...keys];
@@ -253,7 +263,10 @@ function packagesOfInterest(graph: DepGraph, keys: ReadonlySet<string>): Array<{
     names.add(n.name);
     stack.push(...n.parents);
   }
-  return [...names].sort().map((name) => ({ name, importNames: importNamesFor(graph.ecosystem, name) }));
+  return [...names].sort().map((name) => {
+    const extra = graph.ecosystem === 'PyPI' ? extraImportNames.get(normalizePypiName(name)) ?? [] : [];
+    return { name, importNames: [...new Set([...importNamesFor(graph.ecosystem, name), ...extra])].slice(0, 50) };
+  });
 }
 
 // --- severity --------------------------------------------------------------------------------
@@ -417,18 +430,28 @@ export function createDependenciesAnalyzer(deps: DependenciesAnalyzerDeps): Anal
             ctx.warn('SANDBOX_UNAVAILABLE', `Docker sandbox unavailable (${truncate(avail.reason, 200)}); dependency usage taken from the import index`);
           } else {
             const failed: string[] = [];
+            const installFailed: string[] = [];
+            const mismatches: string[] = [];
             await forEachLimit(sandboxTargets, deps.maxSandboxConcurrency ?? 2, async (w) => {
               checkAborted(signal);
               try {
-                const usages = await runSandbox(sandbox, ctx, w);
-                if (usages === null) failed.push(w.graph.lockfile);
-                else { w.usages = usages; w.usageSource = 'sandbox'; }
+                const r = await runSandbox(sandbox, ctx, w, deps.sandboxInstall === true);
+                if (r.installFailed) installFailed.push(w.graph.lockfile);
+                mismatches.push(...r.mismatches);
+                if (r.usages === null) failed.push(w.graph.lockfile);
+                else { w.usages = r.usages; w.usageSource = 'sandbox'; }
               } catch (err) {
                 if (isCancellation(err, signal)) throw toAppError(err);
                 failed.push(w.graph.lockfile);
               }
               ctx.touch();
             });
+            if (installFailed.length > 0) {
+              ctx.warn('SANDBOX_INSTALL_PARTIAL', `Sandbox dependency install failed for ${installFailed.sort().join(', ')}; usage analysis ran without installed metadata there`);
+            }
+            if (mismatches.length > 0) {
+              ctx.warn('SANDBOX_VERSION_MISMATCH', truncate(`Sandbox install resolved different versions than the lockfile for ${mismatches.sort().join(', ')}; findings use the lockfile versions`, 1000));
+            }
             if (failed.length > 0) {
               const code = failed.length === sandboxTargets.length ? 'SANDBOX_UNAVAILABLE' : 'SANDBOX_PARTIAL';
               ctx.warn(code, `Sandbox usage analysis failed for ${failed.sort().join(', ')}; used the import index there instead`);
@@ -584,26 +607,91 @@ export function createDependenciesAnalyzer(deps: DependenciesAnalyzerDeps): Anal
   };
 }
 
+const PY_MODULE_RE = /^[A-Za-z_][A-Za-z0-9_]{0,99}$/;
+const PY_DIST_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$/;
+
+/** Validated dist → module names from phase A (attacker-influenced metadata: names only, capped). */
+export function sanitizeDistModules(raw: unknown): Map<string, string[]> {
+  const out = new Map<string, string[]>();
+  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) return out;
+  for (const [dist, mods] of Object.entries(raw as Record<string, unknown>).slice(0, 5000)) {
+    if (!PY_DIST_RE.test(dist) || !Array.isArray(mods)) continue;
+    const valid = mods.filter((m): m is string => typeof m === 'string' && PY_MODULE_RE.test(m)).slice(0, 50);
+    if (valid.length > 0) out.set(normalizePypiName(dist), valid);
+  }
+  return out;
+}
+
+/** name → resolved versions from `npm ls --all --json` (object) or `pnpm ls --json` (array); bounded walk. */
+function treeVersions(tree: unknown): Map<string, Set<string>> {
+  const out = new Map<string, Set<string>>();
+  const stack: Array<{ v: unknown; depth: number }> = (Array.isArray(tree) ? tree : [tree]).map((v) => ({ v, depth: 0 }));
+  let seen = 0;
+  while (stack.length > 0 && seen < 200_000) {
+    const { v, depth } = stack.pop()!;
+    if (typeof v !== 'object' || v === null || depth > 200) continue;
+    for (const field of ['dependencies', 'devDependencies', 'optionalDependencies'] as const) {
+      const deps = (v as Record<string, unknown>)[field];
+      if (typeof deps !== 'object' || deps === null || Array.isArray(deps)) continue;
+      for (const [name, child] of Object.entries(deps as Record<string, unknown>)) {
+        seen++;
+        const version = typeof child === 'object' && child !== null ? (child as Record<string, unknown>).version : undefined;
+        if (typeof version === 'string') {
+          let set = out.get(name);
+          if (!set) { set = new Set(); out.set(name, set); }
+          set.add(version);
+        }
+        stack.push({ v: child, depth: depth + 1 });
+      }
+    }
+  }
+  return out;
+}
+
+type SandboxRun = { usages: PackageUsage[] | null; installFailed: boolean; mismatches: string[] };
+
+/**
+ * Phase B (offline usage analysis over the source) always runs; it reads only /src. Phase A (install)
+ * runs only when opted in, and only refines it: Python dist → module names from the installed
+ * metadata, and an npm resolved-version cross-check. An install failure never skips phase B.
+ */
 async function runSandbox(
-  sandbox: Pick<DockerSandbox, 'install' | 'analyze'>, ctx: AnalyzerContext, w: GraphWork,
-): Promise<PackageUsage[] | null> {
+  sandbox: Pick<DockerSandbox, 'install' | 'analyze'>, ctx: AnalyzerContext, w: GraphWork, withInstall: boolean,
+): Promise<SandboxRun> {
   const { graph } = w;
-  const install = graph.ecosystem === 'npm'
-    ? await sandbox.install({ scanId: ctx.scanId, signal: ctx.signal, ecosystem: 'npm', srcDir: ctx.repoDir, manifestDir: graph.manifestDir })
-    : await sandbox.install({
-      scanId: ctx.scanId, signal: ctx.signal, ecosystem: 'PyPI',
-      requirements: [...graph.nodes.values()].filter((n) => isValidVersion('PyPI', n.version)).map((n) => `${n.name}==${n.version}`).sort(),
-    });
-  ctx.touch();
-  if (!install.ok) return null;
+  let installFailed = false;
+  const mismatches: string[] = [];
+  let distModules = new Map<string, string[]>();
+  if (withInstall) {
+    const install = graph.ecosystem === 'npm'
+      ? await sandbox.install({ scanId: ctx.scanId, signal: ctx.signal, ecosystem: 'npm', srcDir: ctx.repoDir, manifestDir: graph.manifestDir })
+      : await sandbox.install({
+        scanId: ctx.scanId, signal: ctx.signal, ecosystem: 'PyPI',
+        requirements: [...graph.nodes.values()].filter((n) => isValidVersion('PyPI', n.version)).map((n) => `${n.name}==${n.version}`).sort(),
+      });
+    ctx.touch();
+    if (!install.ok) {
+      installFailed = true;
+    } else if (graph.ecosystem === 'PyPI') {
+      distModules = sanitizeDistModules(install.distModules);
+    } else if (install.tree !== null) {
+      const resolved = treeVersions(install.tree);
+      for (const { node } of w.vulnerable) {
+        const versions = resolved.get(node.name);
+        if (versions && !versions.has(node.version)) {
+          mismatches.push(`${node.name}@${node.version} (installed ${[...versions].slice(0, 3).join('/')}) in ${graph.lockfile}`);
+        }
+      }
+    }
+  }
   const keys = new Set([...w.vulnerable.map((v) => v.node.key), ...w.signals.map((s) => s.key)]);
   const analyzed = await sandbox.analyze({
-    scanId: ctx.scanId, ecosystem: graph.ecosystem, srcDir: ctx.repoDir, depsDir: install.depsDir,
-    packages: packagesOfInterest(graph, keys), signal: ctx.signal,
+    scanId: ctx.scanId, ecosystem: graph.ecosystem, srcDir: ctx.repoDir,
+    packages: packagesOfInterest(graph, keys, distModules), signal: ctx.signal,
   });
-  if (!analyzed.ok) return null;
+  if (!analyzed.ok) return { usages: null, installFailed, mismatches };
   const usages = parseSandboxUsages(analyzed.usages, graph.ecosystem);
-  return usages === null ? null : usages.filter((u) => underDir(u.file, graph.manifestDir));
+  return { usages: usages === null ? null : usages.filter((u) => underDir(u.file, graph.manifestDir)), installFailed, mismatches };
 }
 
 /**

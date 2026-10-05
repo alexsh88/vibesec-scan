@@ -1,5 +1,5 @@
 import { spawnSync } from 'node:child_process';
-import { existsSync, readdirSync, statSync } from 'node:fs';
+import { existsSync, readdirSync } from 'node:fs';
 import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -8,7 +8,7 @@ import { loadConfig } from '../src/config';
 import { AppError } from '../src/errors/AppError';
 import { ProcessError, runProcess, type RunOptions, type RunResult } from '../src/process/runProcess';
 import {
-  type ContainerSpec, DockerSandbox, dockerCliEnv, hardenedRunArgs, isSafeRequirement, PNPM_VERSION, YARN_BERRY_VERSION,
+  type ContainerSpec, DockerSandbox, dockerCliEnv, hardenedRunArgs, isSafeRequirement, PNPM_VERSION, PYPI_INSTALL_DRIVER, YARN_BERRY_VERSION,
 } from '../src/sandbox/dockerSandbox';
 import type { RunFn } from '../src/sandbox/types';
 
@@ -34,23 +34,8 @@ const isDetachedRun = (args: string[]) => isRun(args) && args[1] === '-d';
 const isHelperRun = (args: string[]) => isRun(args) && (flag(args, '--name') ?? '').startsWith('vibesec-helper-');
 const isWorkloadRun = (args: string[]) => isRun(args) && !isDetachedRun(args) && !isHelperRun(args);
 
-/** Host-side stand-in for the helper container's `du -sk` (test files are plain). */
-function treeBytes(dir: string): number {
-  if (!existsSync(dir)) return 0;
-  let total = 0;
-  for (const e of readdirSync(dir, { withFileTypes: true, recursive: true })) {
-    if (e.isFile()) total += statSync(join(e.parentPath, e.name)).size;
-  }
-  return total;
-}
-
-/** Simulates the helper container: post-install size report, or a successful cleanup. */
-const helperResult = (args: string[]): RunResult => {
-  const script = args.at(-1)!;
-  const sizeMatch = /du -sk \/w\/(\S+)/.exec(script);
-  if (sizeMatch) return ok(`SIZE_KB=${Math.ceil(treeBytes(join(mountSource(args, '/w')!, sizeMatch[1]!)) / 1024)}\n`);
-  return ok('CLEAN\n');
-};
+/** Simulates the helper container: a successful cleanup. */
+const helperResult = (_args: string[]): RunResult => ok('CLEAN\n');
 
 function fake(workload: Handler = () => ok(), overrides: Record<string, Handler> = {}) {
   const calls: Call[] = [];
@@ -105,19 +90,15 @@ afterEach(async () => {
 
 function sandbox(run: RunFn, extra: Partial<ConstructorParameters<typeof DockerSandbox>[0]> = {}) {
   return new DockerSandbox({
-    workDir: join(work, 'wd'), imagePrefix: 'vibesec', run,
+    workDir: join(work, 'wd'), imagePrefix: 'vibesec', run, instanceId: 'inst-1',
     hostEnv: { PATH: '/usr/bin', GITHUB_TOKEN: 'ghp_leak', ANTHROPIC_API_KEY: 'sk-ant-leak', DOCKER_HOST: 'npipe:////./pipe/docker_engine', AWS_SECRET_ACCESS_KEY: 'x' },
     ...extra,
   });
 }
 
-/** Simulates a successful npm install container: writes node_modules + tree.json into the /out mount. */
+/** Simulates a successful npm install container: the install itself stays in the tmpfs; only tree.json reaches /res. */
 const npmInstallOk: Handler = async (args) => {
-  const out = mountSource(args, '/out')!;
-  await mkdir(join(out, 'work', 'node_modules', 'lodash'), { recursive: true });
-  await writeFile(join(out, 'work', 'node_modules', 'lodash', 'package.json'), '{"name":"lodash","version":"4.17.21"}');
-  await mkdir(join(out, 'cache', 'npm'), { recursive: true });
-  await writeFile(join(out, 'tree.json'), JSON.stringify({ name: 'web', dependencies: { lodash: { version: '4.17.21' } } }));
+  await writeFile(join(mountSource(args, '/res')!, 'tree.json'), JSON.stringify({ name: 'web', dependencies: { lodash: { version: '4.17.21' } } }));
   return ok();
 };
 
@@ -148,6 +129,18 @@ describe('hardenedRunArgs', () => {
     expect(args.join(' ')).not.toMatch(/--cap-add|--device|docker\.sock|--pid |--ipc host|--network host|--userns host/);
   });
 
+  it('adds size-capped, sandbox-owned tmpfs mounts and the instance label; refuses odd tmpfs targets', () => {
+    const args = hardenedRunArgs({
+      name: 'n', scanId: SCAN, instanceId: 'inst-1', image: 'i', network: 'none', env: {}, command: [], mounts: [],
+      tmpfs: [{ target: '/out', sizeBytes: 1024 }],
+    });
+    expect(flagValues(args, '--tmpfs')).toContain('/out:rw,noexec,nosuid,nodev,size=1024,uid=10001,gid=10001,mode=0700');
+    expect(flagValues(args, '--label')).toEqual([`vibesec.scan=${SCAN}`, 'vibesec.instance=inst-1']);
+    for (const t of [{ target: '/out,size=0', sizeBytes: 1 }, { target: '/out', sizeBytes: 0 }]) {
+      expect(() => hardenedRunArgs({ name: 'n', scanId: SCAN, image: 'i', network: 'none', env: {}, command: [], mounts: [], tmpfs: [t] })).toThrow(/tmpfs/);
+    }
+  });
+
   it('refuses bind-mount sources that could smuggle extra --mount options', () => {
     expect(() => hardenedRunArgs({
       name: 'n', scanId: SCAN, image: 'i', network: 'none', env: {}, command: [],
@@ -165,6 +158,13 @@ describe('DockerSandbox.availability', () => {
     expect(inspect.args).toEqual(expect.arrayContaining(['vibesec/sandbox-node:v1', 'vibesec/sandbox-python:v1', 'vibesec/sandbox-proxy:v1']));
     await sb.availability(signal());
     expect(calls.filter((c) => c.args[0] === 'version')).toHaveLength(1);
+  });
+
+  it('refuses Docker Engine < 26 (CVE-2024-29018: internal networks leak DNS)', async () => {
+    const { run, calls } = fake(undefined, { version: () => ok('25.0.5\n') });
+    const r = await sandbox(run).availability(signal());
+    expect(r).toEqual({ ok: false, reason: expect.stringContaining('CVE-2024-29018') });
+    expect(calls.some((c) => c.args[0] === 'image')).toBe(false);
   });
 
   it('reports unavailable when the docker CLI cannot start', async () => {
@@ -189,7 +189,12 @@ describe('DockerSandbox.availability', () => {
 
 describe('DockerSandbox.install (npm)', () => {
   it('runs the install on a per-scan internal network behind the proxy, hardened, with no host env', async () => {
-    const { run, calls } = fake(npmInstallOk);
+    const staged: Record<string, string> = {};
+    const { run, calls } = fake(async (args, opts) => {
+      const inDir = mountSource(args, '/in')!;
+      for (const f of readdirSync(inDir)) staged[f] = await readFile(join(inDir, f), 'utf8');
+      return npmInstallOk(args, opts);
+    });
     const r = await sandbox(run).install({ scanId: SCAN, ecosystem: 'npm', srcDir: repo, manifestDir: 'web', signal: signal() });
     expect(r.ok).toBe(true);
     if (!r.ok) return;
@@ -212,12 +217,20 @@ describe('DockerSandbox.install (npm)', () => {
     expect(flag(install.args, '--name')).toMatch(/^vibesec-install-3f2b9c1e-[0-9a-f]{6}$/);
     expect(flag(install.args, '--label')).toBe(`vibesec.scan=${SCAN}`);
     expect(install.args).toContain('vibesec/sandbox-node:v1');
-    // Only the staging /out dir is mounted: the repository itself is not visible during install.
-    expect(flagValues(install.args, '--mount')).toHaveLength(1);
+    // Only the read-only inputs and the results dir are mounted: the repository itself is not visible during
+    // install, and the install lands in a size-capped tmpfs (the disk quota), never on the host.
+    expect(flagValues(install.args, '--mount')).toHaveLength(2);
+    expect(flagValues(install.args, '--mount').find((m) => m.includes('target=/in'))).toMatch(/,readonly$/);
+    expect(flagValues(install.args, '--mount').find((m) => m.includes('target=/res'))).not.toMatch(/readonly/);
     expect(mountSource(install.args, '/src')).toBeUndefined();
+    expect(mountSource(install.args, '/out')).toBeUndefined();
+    expect(flagValues(install.args, '--tmpfs')).toContain(`/out:rw,noexec,nosuid,nodev,size=${1536 * 1024 * 1024},uid=10001,gid=10001,mode=0700`);
+    expect(flag(install.args, '--memory')).toBe(`${2048 + 1536}m`);
+    expect(flagValues(install.args, '--label')).toContain('vibesec.instance=inst-1');
     const script = install.args.at(-1)!;
+    expect(script).toMatch(/^mkdir -p \/out\/work \/out\/tmp \/out\/cache && cp \/in\/\* \/out\/work\/ && cd \/out\/work && /);
     expect(script).toContain('npm ci --ignore-scripts --no-audit --no-fund');
-    expect(script).toContain('npm ls --all --json --long=false > /out/tree.json');
+    expect(script).toContain('npm ls --all --json --long=false > /res/tree.json');
     const env = flagValues(install.args, '--env');
     expect(env).toContain(`HTTPS_PROXY=http://${proxyName}:3128`);
     expect(env).toContain('npm_config_registry=https://registry.npmjs.org/');
@@ -232,17 +245,15 @@ describe('DockerSandbox.install (npm)', () => {
       expect(Object.keys(c.opts.env ?? {}).sort()).toEqual(['DOCKER_HOST', 'PATH']);
     }
 
-    // Results: deps dir, parsed tree, denied egress surfaced as a warning.
-    expect(r.depsDir.endsWith(join('work', 'node_modules'))).toBe(true);
-    expect(existsSync(join(r.depsDir, 'lodash', 'package.json'))).toBe(true);
+    // Results: parsed tree, denied egress surfaced as a warning; nothing of the install is left on the host.
+    expect(r).not.toHaveProperty('depsDir');
     expect(r.tree).toEqual({ name: 'web', dependencies: { lodash: { version: '4.17.21' } } });
     expect(r.warnings).toContain('sandbox proxy denied egress to evil.example');
+    expect(readdirSync(sandbox(run).scanRoot(SCAN))).toEqual([]);
 
     // Staging: .npmrc never copied; packageManager stripped (npm); lockfile copied.
-    const staged = join(r.depsDir, '..');
-    expect(existsSync(join(staged, '.npmrc'))).toBe(false);
-    expect(existsSync(join(staged, 'package-lock.json'))).toBe(true);
-    expect(JSON.parse(await readFile(join(staged, 'package.json'), 'utf8'))).not.toHaveProperty('packageManager');
+    expect(Object.keys(staged).sort()).toEqual(['package-lock.json', 'package.json']);
+    expect(JSON.parse(staged['package.json']!)).not.toHaveProperty('packageManager');
 
     // Teardown: proxy container removed and network removed.
     expect(calls.some((c) => c.args[0] === 'rm' && c.args.includes(proxyName))).toBe(true);
@@ -254,7 +265,7 @@ describe('DockerSandbox.install (npm)', () => {
     await writeFile(join(repo, 'web', 'pnpm-lock.yaml'), "lockfileVersion: '9.0'\n");
     let staged = '';
     const { run, calls } = fake(async (args) => {
-      staged = await readFile(join(mountSource(args, '/out')!, 'work', 'package.json'), 'utf8');
+      staged = await readFile(join(mountSource(args, '/in')!, 'package.json'), 'utf8');
       return ok();
     });
     await sandbox(run).install({ scanId: SCAN, ecosystem: 'npm', srcDir: repo, manifestDir: 'web', signal: signal() });
@@ -264,7 +275,7 @@ describe('DockerSandbox.install (npm)', () => {
     await rm(join(repo, 'web', 'pnpm-lock.yaml'));
     await writeFile(join(repo, 'web', 'yarn.lock'), '__metadata:\n  version: 8\n');
     const second = fake(async (args) => {
-      staged = await readFile(join(mountSource(args, '/out')!, 'work', 'package.json'), 'utf8');
+      staged = await readFile(join(mountSource(args, '/in')!, 'package.json'), 'utf8');
       return ok();
     });
     await sandbox(second.run).install({ scanId: SCAN, ecosystem: 'npm', srcDir: repo, manifestDir: 'web', signal: signal() });
@@ -276,7 +287,7 @@ describe('DockerSandbox.install (npm)', () => {
     await rm(join(repo, 'web', 'package-lock.json'));
     const { run, calls } = fake();
     await sandbox(run).install({ scanId: SCAN, ecosystem: 'npm', srcDir: repo, manifestDir: 'web', signal: signal() });
-    expect(calls.find((c) => isWorkloadRun(c.args))!.args.at(-1)).toMatch(/^npm install --ignore-scripts --package-lock-only .* && npm ci --ignore-scripts/);
+    expect(calls.find((c) => isWorkloadRun(c.args))!.args.at(-1)).toMatch(/&& cd \/out\/work && npm install --ignore-scripts --package-lock-only .* && npm ci --ignore-scripts/);
   });
 
   it('refuses a manifestDir that escapes the repository', async () => {
@@ -362,19 +373,17 @@ describe('DockerSandbox.install (npm)', () => {
     expect(calls.some((c) => isWorkloadRun(c.args) || isDetachedRun(c.args))).toBe(false);
   });
 
-  it('fails and deletes the install when the deps exceed the disk cap', async () => {
-    const { run } = fake(npmInstallOk);
-    const sb = sandbox(run, { maxDepsBytes: 10 });
+  it('the tmpfs quota is the disk cap: ENOSPC during install fails it (and nothing is kept)', async () => {
+    const { run, calls } = fake(() => ({ code: 1, stdout: '', stderr: 'npm ERR! code ENOSPC\nnpm ERR! nospc ENOSPC: no space left on device, write' }));
+    const sb = sandbox(run, { maxDepsBytes: 10 * 1024 * 1024 });
     const r = await sb.install({ scanId: SCAN, ecosystem: 'npm', srcDir: repo, manifestDir: 'web', signal: signal() });
-    expect(r).toMatchObject({ ok: false, code: 'SANDBOX_INSTALL_FAILED', message: expect.stringContaining('exceed') });
+    expect(r).toMatchObject({ ok: false, code: 'SANDBOX_INSTALL_FAILED', message: expect.stringContaining('exceed 10 MB') });
+    expect(flagValues(calls.find((c) => isWorkloadRun(c.args))!.args, '--tmpfs')).toContain('/out:rw,noexec,nosuid,nodev,size=10485760,uid=10001,gid=10001,mode=0700');
     expect((await import('node:fs')).readdirSync(sb.scanRoot(SCAN))).toEqual([]);
   });
 
   it('tolerates a missing tree.json with a warning', async () => {
-    const { run } = fake(async (args) => {
-      await mkdir(join(mountSource(args, '/out')!, 'work', 'node_modules'), { recursive: true });
-      return ok();
-    });
+    const { run } = fake(() => ok());
     const r = await sandbox(run).install({ scanId: SCAN, ecosystem: 'npm', srcDir: repo, manifestDir: 'web', signal: signal() });
     expect(r).toMatchObject({ ok: true, tree: null });
     if (r.ok) expect(r.warnings.join()).toContain('tree.json was not produced');
@@ -384,11 +393,13 @@ describe('DockerSandbox.install (npm)', () => {
 describe('DockerSandbox.install (PyPI)', () => {
   it('installs binary wheels only from pypi via the proxy, from a validated requirement list', async () => {
     let requirementsFile = '';
+    let driver = '';
     const { run, calls } = fake(async (args) => {
       requirementsFile = await readFile(join(mountSource(args, '/in')!, 'requirements.txt'), 'utf8');
-      const out = mountSource(args, '/out')!;
-      await mkdir(join(out, 'deps', 'requests'), { recursive: true });
-      await writeFile(join(out, 'report.json'), JSON.stringify({ version: '1', install: [{ metadata: { name: 'requests', version: '2.32.3' } }] }));
+      driver = await readFile(join(mountSource(args, '/in')!, 'vibesec_install.py'), 'utf8');
+      const res = mountSource(args, '/res')!;
+      await writeFile(join(res, 'report.json'), JSON.stringify({ version: '1', install: [{ metadata: { name: 'requests', version: '2.32.3' } }] }));
+      await writeFile(join(res, 'distmap.json'), JSON.stringify({ requests: ['requests'], PyYAML: ['yaml', '_yaml'] }));
       return ok();
     });
     const r = await sandbox(run).install({
@@ -404,11 +415,14 @@ describe('DockerSandbox.install (PyPI)', () => {
     if (r.ok) {
       expect(r.warnings.filter((w) => w.startsWith('skipped unsupported requirement'))).toHaveLength(5);
       expect(r.tree).toMatchObject({ install: [{ metadata: { name: 'requests' } }] });
-      expect(r.depsDir.endsWith(join('out', 'deps'))).toBe(true);
+      expect(r.distModules).toEqual({ requests: ['requests'], PyYAML: ['yaml', '_yaml'] });
     }
+    expect(driver).toBe(PYPI_INSTALL_DRIVER);
     const install = calls.find((c) => isWorkloadRun(c.args))!;
     expect(install.args).toContain('vibesec/sandbox-python:v1');
-    expect(install.args).toEqual(expect.arrayContaining(['--only-binary=:all:', '--isolated', '--no-input', '--disable-pip-version-check', '--target', '/out/deps', '--report', '/out/report.json']));
+    expect(install.args.slice(install.args.indexOf('vibesec/sandbox-python:v1') + 1, install.args.indexOf('vibesec/sandbox-python:v1') + 3)).toEqual(['python', '/in/vibesec_install.py']);
+    expect(install.args).toEqual(expect.arrayContaining(['--only-binary=:all:', '--isolated', '--no-input', '--disable-pip-version-check', '--target', '/out/deps', '--report', '/res/report.json']));
+    expect(flagValues(install.args, '--tmpfs').some((t) => t.startsWith('/out:'))).toBe(true);
     expect(flag(install.args, '--index-url')).toBe('https://pypi.org/simple');
     expect(flag(install.args, '--proxy')).toMatch(/^http:\/\/vibesec-proxy-3f2b9c1e-[0-9a-f]{6}:3128$/);
     expect(flagValues(install.args, '--mount').find((m) => m.includes('target=/in'))).toMatch(/,readonly$/);
@@ -433,7 +447,7 @@ describe('DockerSandbox.install (PyPI)', () => {
 });
 
 describe('DockerSandbox.analyze', () => {
-  it('runs offline with read-only /src, /deps, /in and a writable /out, and returns parsed usages', async () => {
+  it('runs offline with read-only /src and /in and a writable /out (never installed deps), and returns parsed usages', async () => {
     const { run, calls } = fake(async (args) => {
       const pk = JSON.parse(await readFile(join(mountSource(args, '/in')!, 'packages.json'), 'utf8'));
       expect(pk).toEqual({
@@ -444,9 +458,7 @@ describe('DockerSandbox.analyze', () => {
       return ok();
     });
     const sb = sandbox(run);
-    const depsDir = join(sb.scanRoot(SCAN), 'install-npm-abc', 'out', 'work', 'node_modules');
-    await mkdir(depsDir, { recursive: true });
-    const r = await sb.analyze({ scanId: SCAN, ecosystem: 'npm', srcDir: repo, depsDir, packages: ['lodash', { name: '@scope/x', importNames: ['@scope/x', '@scope/x-alias'] }], signal: signal() });
+    const r = await sb.analyze({ scanId: SCAN, ecosystem: 'npm', srcDir: repo, packages: ['lodash', { name: '@scope/x', importNames: ['@scope/x', '@scope/x-alias'] }], signal: signal() });
     expect(r).toEqual({ ok: true, usages: { usages: [{ package: 'lodash', file: 'a.js', line: 1 }] } });
 
     const a = calls.find((c) => isWorkloadRun(c.args))!;
@@ -455,7 +467,8 @@ describe('DockerSandbox.analyze', () => {
     expect(flag(a.args, '--name')).toMatch(/^vibesec-analyze-3f2b9c1e-/);
     const mounts = flagValues(a.args, '--mount');
     expect(mounts.find((m) => m.includes('target=/src'))).toMatch(/,readonly$/);
-    expect(mounts.find((m) => m.includes('target=/deps'))).toMatch(/,readonly$/);
+    expect(mounts.some((m) => m.includes('target=/deps'))).toBe(false);
+    expect(mounts).toHaveLength(3);
     expect(mounts.find((m) => m.includes('target=/in'))).toMatch(/,readonly$/);
     expect(mounts.find((m) => m.includes('target=/out'))).not.toMatch(/readonly/);
     expect(a.args.slice(-2)).toEqual(['node', '/opt/vibesec/analyze.mjs']);
@@ -483,13 +496,6 @@ describe('DockerSandbox.analyze', () => {
     const a = calls.find((c) => isWorkloadRun(c.args))!;
     expect(a.args).toContain('vibesec/sandbox-python:v1');
     expect(a.args.slice(-2)).toEqual(['python', '/opt/vibesec/analyze.py']);
-  });
-
-  it('refuses a depsDir outside this scan\'s sandbox dir (no arbitrary host mounts)', async () => {
-    const { run, calls } = fake();
-    const r = await sandbox(run).analyze({ scanId: SCAN, ecosystem: 'npm', srcDir: repo, depsDir: tmpdir(), packages: [], signal: signal() });
-    expect(r).toMatchObject({ ok: false, code: 'SANDBOX_ANALYZE_FAILED' });
-    expect(calls.some((c) => isRun(c.args))).toBe(false);
   });
 
   it('missing usages.json → SANDBOX_ANALYZE_FAILED; timeout → kill + SANDBOX_TIMEOUT', async () => {
@@ -538,8 +544,7 @@ describe('DockerSandbox.sweep', () => {
     const sb = sandbox(run);
     await mkdir(join(sb.scanRoot(SCAN), 'install-npm-x'), { recursive: true });
     await sb.sweep(SCAN);
-    const filter = `label=vibesec.scan=${SCAN}`;
-    expect(calls.find((c) => c.args[0] === 'ps')!.args).toEqual(['ps', '-aq', '--filter', filter]);
+    expect(calls.find((c) => c.args[0] === 'ps')!.args).toEqual(['ps', '-aq', '--filter', `label=vibesec.scan=${SCAN}`, '--filter', 'label=vibesec.instance=inst-1']);
     expect(calls.find((c) => c.args[0] === 'rm')!.args).toEqual(['rm', '-f', 'aaaaaaaaaaaa', 'bbbbbbbbbbbb']);
     expect(calls.find((c) => c.args[0] === 'network' && c.args[1] === 'rm')!.args).toEqual(['network', 'rm', 'cccccccccccc']);
     // Garbage from docker output is never passed back as argv.
@@ -547,10 +552,20 @@ describe('DockerSandbox.sweep', () => {
     expect(existsSync(sb.scanRoot(SCAN))).toBe(false);
   });
 
-  it('without a scan id sweeps everything labeled vibesec.scan and survives docker being down', async () => {
+  it('without a scan id sweeps only THIS instance\'s leftovers and survives docker being down', async () => {
     const { run, calls } = fake(undefined, { ps: () => { throw new ProcessError('spawn', 'ENOENT', ''); } });
     await sandbox(run).sweep();
-    expect(calls.find((c) => c.args[0] === 'ps')!.args).toEqual(['ps', '-aq', '--filter', 'label=vibesec.scan']);
+    expect(calls.find((c) => c.args[0] === 'ps')!.args).toEqual(['ps', '-aq', '--filter', 'label=vibesec.instance=inst-1']);
+  });
+
+  it('the default instance id is a UUID persisted under the work dir (stable across restarts)', async () => {
+    const { run } = fake();
+    const a = new DockerSandbox({ workDir: join(work, 'wd2'), imagePrefix: 'vibesec', run });
+    const id = await a.instanceId();
+    expect(id).toMatch(/^[0-9a-f-]{36}$/);
+    const b = new DockerSandbox({ workDir: join(work, 'wd2'), imagePrefix: 'vibesec', run });
+    expect(await b.instanceId()).toBe(id);
+    expect(await new DockerSandbox({ workDir: join(work, 'wd3'), imagePrefix: 'vibesec', run }).instanceId()).not.toBe(id);
   });
 
   it('rejects scan ids that are not plain identifiers', async () => {
@@ -560,11 +575,12 @@ describe('DockerSandbox.sweep', () => {
 });
 
 describe('sandbox config', () => {
-  it('defaults: enabled, vibesec prefix, 180 s / 120 s timeouts, 1.5 GiB deps cap', () => {
+  it('defaults: enabled, install (phase A) off, vibesec prefix, 180 s / 120 s timeouts, 1.5 GiB deps cap', () => {
     expect(loadConfig({}).sandbox).toEqual({
-      enabled: true, imagePrefix: 'vibesec', installTimeoutMs: 180_000, analyzeTimeoutMs: 120_000, maxDepsBytes: 1536 * 1024 * 1024,
+      enabled: true, install: false, imagePrefix: 'vibesec', installTimeoutMs: 180_000, analyzeTimeoutMs: 120_000, maxDepsBytes: 1536 * 1024 * 1024,
     });
     expect(loadConfig({ SANDBOX_ENABLED: 'false' }).sandbox.enabled).toBe(false);
+    expect(loadConfig({ SANDBOX_INSTALL: 'true' }).sandbox.install).toBe(true);
     expect(() => loadConfig({ SANDBOX_IMAGE_PREFIX: 'Evil Prefix;' })).toThrow();
   });
 });
@@ -592,39 +608,27 @@ describe('host never traverses container-written trees', () => {
     }
   });
 
-  it('refuses an install whose node_modules was replaced by a link (could alias a host dir)', async (ctx) => {
+  it('refuses an install result file planted as a link (could point at a host file)', async (ctx) => {
+    const target = join(work, 'host-file.json');
+    await writeFile(target, '{"stolen":true}');
     let planted = true;
     const { run } = fake(async (args) => {
-      const work = join(mountSource(args, '/out')!, 'work');
-      planted = await plantLink(join(repo, 'web', 'package.json'), join(work, 'node_modules'));
+      planted = await plantLink(target, join(mountSource(args, '/res')!, 'tree.json'));
       return ok();
     });
     const r = await sandbox(run).install({ scanId: SCAN, ecosystem: 'npm', srcDir: repo, manifestDir: 'web', signal: signal() });
     if (!planted) { ctx.skip(); return; }
-    expect(r).toMatchObject({ ok: false, code: 'SANDBOX_INSTALL_FAILED', message: expect.stringContaining('not a plain directory') });
+    expect(r).toMatchObject({ ok: true, tree: null });
+    if (r.ok) expect(r.warnings.join()).toMatch(/not a regular file/);
   });
 
-  it('analyze refuses a depsDir that is (or passes through) a link', async (ctx) => {
-    const { run, calls } = fake();
+  it('a successful install is cleaned up through the helper too (nothing of it stays on the host)', async () => {
+    const { run, calls } = fake(npmInstallOk);
     const sb = sandbox(run);
-    const parent = join(sb.scanRoot(SCAN), 'install-npm-abc', 'out', 'work');
-    await mkdir(parent, { recursive: true });
-    if (!await plantLink(join(repo, 'web', 'package.json'), join(parent, 'node_modules'))) { ctx.skip(); return; }
-    const r = await sb.analyze({ scanId: SCAN, ecosystem: 'npm', srcDir: repo, depsDir: join(parent, 'node_modules'), packages: [], signal: signal() });
-    expect(r).toMatchObject({ ok: false, code: 'SANDBOX_ANALYZE_FAILED' });
-    expect(calls.some((c) => isWorkloadRun(c.args))).toBe(false);
-  });
-
-  it('the post-install helper drops caches and reports the size; its failure is SANDBOX_UNAVAILABLE', async () => {
-    const good = fake(npmInstallOk);
-    await sandbox(good.run).install({ scanId: SCAN, ecosystem: 'npm', srcDir: repo, manifestDir: 'web', signal: signal() });
-    const post = good.calls.find((c) => isHelperRun(c.args))!;
-    expect(post.args.at(-1)).toContain('du -sk /w/work/node_modules');
-    expect(post.args.at(-1)).toContain('/w/cache /w/tmp');
-
-    const bad = fake(npmInstallOk, { helper: () => ({ code: 1, stdout: '', stderr: '' }) });
-    const r = await sandbox(bad.run).install({ scanId: SCAN, ecosystem: 'npm', srcDir: repo, manifestDir: 'web', signal: signal() });
-    expect(r).toMatchObject({ ok: false, code: 'SANDBOX_UNAVAILABLE' });
+    const r = await sb.install({ scanId: SCAN, ecosystem: 'npm', srcDir: repo, manifestDir: 'web', signal: signal() });
+    expect(r.ok).toBe(true);
+    expect(mountSource(calls.find((c) => isHelperRun(c.args))!.args, '/w')).toMatch(/install-npm-[0-9a-f]{6}$/);
+    expect(readdirSync(sb.scanRoot(SCAN))).toEqual([]);
   });
 });
 
@@ -679,6 +683,18 @@ describe.skipIf(!probeImage)('hardened container on the real Docker daemon', () 
     expect(r.stdout).toMatch(/CapEff:\s+0000000000000000/);
     expect(existsSync(join(out, 'ok'))).toBe(true); // Windows/Docker Desktop bind mount path conversion works
     expect(existsSync(join(src, 'pwned'))).toBe(false);
+  }, 60_000);
+
+  it('the install tmpfs is owned by the sandbox user and enforces its size (the phase-A disk quota)', async () => {
+    const args = hardenedRunArgs({
+      name: `vibesec-itest-q-${Date.now().toString(36)}`, scanId: 'itest', instanceId: 'itest', image: probeImage!, network: 'none',
+      mounts: [], env: {}, tmpfs: [{ target: '/out', sizeBytes: 8 * 1024 * 1024 }],
+      command: ['sh', '-c', '(touch /out/ok && echo OUT_OK); (dd if=/dev/zero of=/out/big bs=1048576 count=16 2>&1 | grep -qi "no space" && echo QUOTA_HIT || echo QUOTA_MISSED)'],
+    });
+    const r = await runProcess('docker', args, { env: dockerCliEnv(), timeoutMs: 60_000 });
+    expect(r.code, r.stderr).toBe(0);
+    expect(r.stdout).toContain('OUT_OK');
+    expect(r.stdout).toContain('QUOTA_HIT');
   }, 60_000);
 
   it('a runaway container is killed by name after the timeout (killing the CLI alone is not enough)', async () => {

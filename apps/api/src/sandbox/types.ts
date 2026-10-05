@@ -10,12 +10,12 @@ export type InstallResult =
   | {
     ok: true;
     ecosystem: Ecosystem;
-    /** Host dir with the installed packages (node_modules, or the pip --target dir for PyPI). Attacker-controlled
-     * content: never follow symlinks inside it on the host; mount it read-only into phase B instead. */
-    depsDir: string;
     /** npm/yarn: `npm ls --all --json` output; pnpm: `pnpm ls --json --depth Infinity`; PyPI: pip `--report` JSON.
      * Parsed but unvalidated — the caller validates. null when the tree command produced nothing usable. */
     tree: unknown;
+    /** PyPI only: { distribution name: top-level module names } extracted in-container from the installed
+     * `*.dist-info` (top_level.txt, else RECORD). Parsed but unvalidated — the caller validates. */
+    distModules?: unknown;
     warnings: string[];
   }
   | { ok: false; code: InstallFailureCode; message: string };
@@ -41,8 +41,6 @@ export type AnalyzeOptions = {
   scanId: string;
   ecosystem: Ecosystem;
   srcDir: string;
-  /** A depsDir returned by install() for the same scan (anything else is refused). */
-  depsDir?: string;
   /** Packages to look for. A bare string means `{ name, importNames: [name] }` (fine for npm; PyPI callers should pass
    * the import names, e.g. `{ name: 'pyyaml', importNames: ['yaml'] }`). */
   packages: Array<string | AnalyzerPackage>;
@@ -56,8 +54,11 @@ export type DockerSandboxOptions = {
   imagePrefix: string;
   installTimeoutMs?: number;
   analyzeTimeoutMs?: number;
-  /** Installed-deps disk cap; larger installs fail with SANDBOX_INSTALL_FAILED and are deleted. Default 1.5 GiB. */
+  /** Install disk quota: phase A writes only into a tmpfs of this size (ENOSPC → SANDBOX_INSTALL_FAILED). Default 1.5 GiB. */
   maxDepsBytes?: number;
+  /** Labels every sandbox container/network so a startup sweep() only touches this instance's leftovers.
+   *  Default: a UUID persisted in `<workDir>/sandbox-instance.id`. */
+  instanceId?: string;
   run?: RunFn;
   /** Base environment the docker CLI env allowlist is taken from (default process.env). */
   hostEnv?: NodeJS.ProcessEnv;

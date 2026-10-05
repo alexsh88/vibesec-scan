@@ -1,7 +1,7 @@
-import { randomBytes } from 'node:crypto';
+import { randomBytes, randomUUID } from 'node:crypto';
 import { constants as fsConstants } from 'node:fs';
 import { chmod, copyFile, lstat, mkdir, open, readFile, realpath, rm, writeFile } from 'node:fs/promises';
-import { isAbsolute, join, relative, resolve, sep } from 'node:path';
+import { isAbsolute, join, relative, resolve } from 'node:path';
 import { AppError } from '../errors/AppError';
 import { ProcessError, runProcess, type RunResult } from '../process/runProcess';
 import type {
@@ -46,9 +46,76 @@ const HELPER_TIMEOUT_MS = 120_000;
  */
 const HELPER_CLEAN = 'chmod -R u+rwX /w 2>/dev/null; find /w -mindepth 1 -depth -exec rm -rf {} + 2>/dev/null; '
   + 'if [ -n "$(find /w -mindepth 1 ! -type d 2>/dev/null | head -n 1)" ]; then echo LEFTOVER; else echo CLEAN; fi';
-const helperPostInstall = (depsRel: string) => 'chmod -R u+rwX /w 2>/dev/null; '
-  + 'find /w/cache /w/tmp -mindepth 1 -depth -exec rm -rf {} + 2>/dev/null; '
-  + `echo "SIZE_KB=$(du -sk /w/${depsRel} 2>/dev/null | cut -f1)"`;
+
+export const SANDBOX_INSTANCE_LABEL = 'vibesec.instance';
+/** Docker < 26: containers on an --internal network could still resolve external names via the embedded DNS
+ *  (CVE-2024-29018), i.e. a DNS exfiltration channel out of phase A. */
+export const MIN_DOCKER_MAJOR = 26;
+const MAX_DISTMAP_BYTES = 8 * 1024 * 1024;
+
+/**
+ * Fixed PyPI install driver, staged as /in/vibesec_install.py (never attacker-influenced). Runs pip with the argv
+ * the host chose, then — still inside the sandbox, over the tmpfs install — extracts { dist: [top-level modules] }
+ * from every `*.dist-info` (top_level.txt, else RECORD) into /res/distmap.json. Links and oversized files are skipped.
+ */
+export const PYPI_INSTALL_DRIVER = `import json, os, subprocess, sys
+
+os.makedirs('/out/tmp', exist_ok=True)
+rc = subprocess.call([sys.executable, '-m', 'pip', 'install'] + sys.argv[1:])
+if rc != 0:
+    sys.exit(rc)
+
+def read(path):
+    try:
+        if os.path.islink(path) or not os.path.isfile(path) or os.path.getsize(path) > 4 * 1024 * 1024:
+            return ''
+        with open(path, encoding='utf-8', errors='replace') as fh:
+            return fh.read()
+    except OSError:
+        return ''
+
+out = {}
+root = '/out/deps'
+try:
+    entries = sorted(os.listdir(root))[:20000]
+except OSError:
+    entries = []
+for d in entries:
+    p = os.path.join(root, d)
+    if not d.endswith('.dist-info') or os.path.islink(p) or not os.path.isdir(p):
+        continue
+    name = None
+    for line in read(os.path.join(p, 'METADATA')).splitlines():
+        if not line.strip():
+            break
+        if line.lower().startswith('name:'):
+            name = line.split(':', 1)[1].strip()
+            break
+    if not name:
+        name = d[:-len('.dist-info')].rsplit('-', 1)[0]
+    mods = [m.strip() for m in read(os.path.join(p, 'top_level.txt')).splitlines() if m.strip()]
+    if not mods:
+        for line in read(os.path.join(p, 'RECORD')).splitlines():
+            path = line.split(',', 1)[0].strip().strip('"')
+            top = path.split('/', 1)[0]
+            if not top or top.startswith('.') or top == '__pycache__' or top.endswith('.dist-info') or top.endswith('.data'):
+                continue
+            if '/' in path:
+                mod = top
+            elif top.endswith('.py'):
+                mod = top[:-3]
+            elif top.endswith('.so') or top.endswith('.pyd'):
+                mod = top.split('.', 1)[0]
+            else:
+                continue
+            if mod not in mods:
+                mods.append(mod)
+    out[name[:200]] = [m[:100] for m in mods[:50]]
+    if len(out) >= 5000:
+        break
+with open('/res/distmap.json', 'w', encoding='utf-8') as fh:
+    json.dump(out, fh)
+`;
 
 /**
  * Host environment variables the docker CLI may see. Everything else (GITHUB_TOKEN, ANTHROPIC_API_KEY, cloud
@@ -82,6 +149,10 @@ export type ContainerSpec = {
   workdir?: string;
   detach?: boolean;
   limits?: Limits;
+  /** Extra size-capped tmpfs mounts owned by the sandbox user (phase A installs into one: a hard disk quota). */
+  tmpfs?: Array<{ target: string; sizeBytes: number }>;
+  /** Owning API instance (label vibesec.instance): a startup sweep only removes its own leftovers. */
+  instanceId?: string;
 };
 
 /**
@@ -96,10 +167,22 @@ export function hardenedRunArgs(spec: ContainerSpec): string[] {
     '--rm', '--init', '--pull', 'never',
     '--name', spec.name,
     '--label', `${SANDBOX_LABEL}=${spec.scanId}`,
+  );
+  if (spec.instanceId !== undefined) {
+    if (!INSTANCE_ID_RE.test(spec.instanceId)) throw new Error('invalid sandbox instance id');
+    args.push('--label', `${SANDBOX_INSTANCE_LABEL}=${spec.instanceId}`);
+  }
+  args.push(
     '--hostname', 'sandbox',
     '--user', `${SANDBOX_UID}:${SANDBOX_UID}`,
     '--read-only',
     '--tmpfs', '/tmp:rw,noexec,nosuid,nodev,size=256m',
+  );
+  for (const t of spec.tmpfs ?? []) {
+    if (!/^\/[a-z]{1,16}$/.test(t.target) || !Number.isSafeInteger(t.sizeBytes) || t.sizeBytes <= 0) throw new Error(`invalid sandbox tmpfs ${t.target}`);
+    args.push('--tmpfs', `${t.target}:rw,noexec,nosuid,nodev,size=${t.sizeBytes},uid=${SANDBOX_UID},gid=${SANDBOX_UID},mode=0700`);
+  }
+  args.push(
     '--cap-drop', 'ALL',
     '--security-opt', 'no-new-privileges',
     '--pids-limit', String(l.pids),
@@ -123,6 +206,7 @@ export function hardenedRunArgs(spec: ContainerSpec): string[] {
 }
 
 const SCAN_ID_RE = /^[A-Za-z0-9][A-Za-z0-9-]{0,63}$/;
+const INSTANCE_ID_RE = /^[A-Za-z0-9][A-Za-z0-9-]{0,63}$/;
 const DOCKER_ID_RE = /^[0-9a-f]{12,64}$/;
 
 function assertScanId(scanId: string): void {
@@ -174,32 +258,6 @@ export async function readJsonCapped(path: string, maxBytes: number): Promise<un
   }
 }
 
-/**
- * Every path component from `base` (exclusive) down to `target` must be a real directory, not a symlink: the
- * container could have replaced e.g. node_modules with a link to a host path that a later bind mount would follow.
- * A missing leaf is created when `createLeaf` (e.g. an install without dependencies has no node_modules).
- */
-async function assertRealDirChain(base: string, target: string, createLeaf: boolean): Promise<void> {
-  const rel = relative(base, target);
-  if (rel === '' || rel.startsWith('..') || isAbsolute(rel)) throw new StageError('dependency dir is outside the sandbox dir');
-  const parts = rel.split(/[\\/]/);
-  let cur = base;
-  for (const [i, part] of parts.entries()) {
-    cur = join(cur, part);
-    let st;
-    try {
-      st = await lstat(cur);
-    } catch (err) {
-      if ((err as NodeJS.ErrnoException).code === 'ENOENT' && createLeaf && i === parts.length - 1) {
-        await mkdir(cur);
-        return;
-      }
-      throw new StageError(`dependency dir is not a plain directory (${(err as NodeJS.ErrnoException).code ?? 'error'})`);
-    }
-    if (st.isSymbolicLink() || !st.isDirectory()) throw new StageError('dependency dir is not a plain directory (symlink refused)');
-  }
-}
-
 /** Copies a repo file only if it is a regular file (never a symlink: a planted link could exfiltrate host files). */
 async function copyRegular(from: string, to: string): Promise<boolean> {
   let st;
@@ -234,15 +292,17 @@ export function isSafeRequirement(line: string): boolean {
 
 type NodePm = 'npm' | 'npm-nolock' | 'pnpm' | 'yarn' | 'yarn-berry';
 
-const NPM_LS = '(npm ls --all --json --long=false > /out/tree.json 2>/dev/null; exit 0)';
+const NPM_LS = '(npm ls --all --json --long=false > /res/tree.json 2>/dev/null; exit 0)';
 const NPM_CI = 'npm ci --ignore-scripts --no-audit --no-fund --loglevel=error';
+/** Inputs come read-only from /in; everything the install writes lands in the size-capped /out tmpfs. */
+const NODE_PREP = 'mkdir -p /out/work /out/tmp /out/cache && cp /in/* /out/work/ && cd /out/work';
 /** Fixed scripts: nothing attacker-controlled is ever interpolated into a shell command. */
 export const NODE_SCRIPTS: Record<NodePm, string> = {
-  npm: `${NPM_CI} && ${NPM_LS}`,
-  'npm-nolock': `npm install --ignore-scripts --package-lock-only --no-audit --no-fund --loglevel=error && ${NPM_CI} && ${NPM_LS}`,
-  pnpm: 'pnpm install --frozen-lockfile --ignore-scripts --reporter=silent && (pnpm ls --json --depth Infinity > /out/tree.json 2>/dev/null; exit 0)',
-  yarn: `yarn install --frozen-lockfile --ignore-scripts --non-interactive --no-progress --silent && ${NPM_LS}`,
-  'yarn-berry': `yarn install --immutable --mode=skip-build && ${NPM_LS}`,
+  npm: `${NODE_PREP} && ${NPM_CI} && ${NPM_LS}`,
+  'npm-nolock': `${NODE_PREP} && npm install --ignore-scripts --package-lock-only --no-audit --no-fund --loglevel=error && ${NPM_CI} && ${NPM_LS}`,
+  pnpm: `${NODE_PREP} && pnpm install --frozen-lockfile --ignore-scripts --reporter=silent && (pnpm ls --json --depth Infinity > /res/tree.json 2>/dev/null; exit 0)`,
+  yarn: `${NODE_PREP} && yarn install --frozen-lockfile --ignore-scripts --non-interactive --no-progress --silent && ${NPM_LS}`,
+  'yarn-berry': `${NODE_PREP} && yarn install --immutable --mode=skip-build && ${NPM_LS}`,
 };
 const NODE_PM_FIELD: Record<NodePm, string | null> = {
   npm: null, 'npm-nolock': null,
@@ -254,7 +314,8 @@ type ContainerOutcome =
   | { kind: 'timeout'; message: string }
   | { kind: 'unavailable'; message: string };
 
-type Staged = { depsDir: string; treeFile: string; build: (proxyUrl: string, network: string) => ContainerSpec };
+/** `treeFile` / `distmapFile`: names of the result files the install container writes into /res. */
+type Staged = { treeFile: string; distmapFile?: string; build: (proxyUrl: string, network: string) => ContainerSpec };
 
 export class DockerSandbox {
   private readonly run: RunFn;
@@ -264,6 +325,7 @@ export class DockerSandbox {
   private readonly analyzeTimeoutMs: number;
   private readonly maxDepsBytes: number;
   private availabilityCache: { at: number; value: SandboxAvailability } | null = null;
+  private instanceIdPromise: Promise<string> | null = null;
 
   constructor(private readonly opts: DockerSandboxOptions) {
     this.run = opts.run ?? runProcess;
@@ -281,6 +343,27 @@ export class DockerSandbox {
   /** Host dir holding everything the sandbox produced for one scan (removed by sweep). */
   scanRoot(scanId: string): string {
     return join(resolve(this.opts.workDir), 'sandbox', scanId);
+  }
+
+  /**
+   * This API instance's id (label vibesec.instance): opts.instanceId, else a UUID persisted next to the work dir
+   * so a restarted instance still recognizes (and sweeps) its own leftovers — and never another instance's.
+   */
+  instanceId(): Promise<string> {
+    this.instanceIdPromise ??= (async () => {
+      if (this.opts.instanceId !== undefined) {
+        if (!INSTANCE_ID_RE.test(this.opts.instanceId)) throw new Error('invalid sandbox instance id');
+        return this.opts.instanceId;
+      }
+      const file = join(resolve(this.opts.workDir), 'sandbox-instance.id');
+      const existing = (await readFile(file, 'utf8').catch(() => '')).trim();
+      if (INSTANCE_ID_RE.test(existing)) return existing;
+      const id = randomUUID();
+      await mkdir(resolve(this.opts.workDir), { recursive: true });
+      await writeFile(file, `${id}\n`);
+      return id;
+    })();
+    return this.instanceIdPromise;
   }
 
   private cli(args: string[], timeoutMs: number, signal?: AbortSignal, maxStdoutBytes = 1024 * 1024): Promise<RunResult> {
@@ -303,8 +386,15 @@ export class DockerSandbox {
     try {
       const v = await this.cli(['version', '--format', '{{.Server.Version}}'], 15_000, signal);
       const serverVersion = v.stdout.trim();
+      const major = Number(/^(\d+)\./.exec(serverVersion)?.[1] ?? NaN);
       if (v.code !== 0 || !serverVersion) {
         value = { ok: false, reason: `docker daemon not reachable: ${tail(v.stderr, 300)}` };
+      } else if (!(major >= MIN_DOCKER_MAJOR)) {
+        value = {
+          ok: false,
+          reason: `Docker Engine ${tail(serverVersion, 40)} is too old: the sandbox needs >= ${MIN_DOCKER_MAJOR} `
+            + '(CVE-2024-29018: --internal networks leak DNS to external resolvers)',
+        };
       } else {
         const images = [this.image('node'), this.image('python'), this.image('proxy')];
         const i = await this.cli(['image', 'inspect', '--format', '{{.Id}}', ...images], 15_000, signal);
@@ -322,7 +412,7 @@ export class DockerSandbox {
 
   /** Runs one container to completion; on timeout/cancel the container itself is killed (killing the CLI is not enough). */
   private async runContainer(spec: ContainerSpec, timeoutMs: number, signal: AbortSignal): Promise<ContainerOutcome> {
-    const args = hardenedRunArgs(spec);
+    const args = hardenedRunArgs({ ...spec, instanceId: await this.instanceId() });
     let result: RunResult;
     try {
       result = await this.cli(args, timeoutMs, signal, MAX_CONTAINER_STDOUT);
@@ -354,7 +444,7 @@ export class DockerSandbox {
   private async helper(scanId: string, hostDir: string, script: string): Promise<RunResult | null> {
     const name = `vibesec-helper-${shortId(scanId)}-${rand()}`;
     const args = hardenedRunArgs({
-      name, scanId, image: this.image('node'), network: 'none', limits: HELPER_LIMITS,
+      name, scanId, instanceId: await this.instanceId(), image: this.image('node'), network: 'none', limits: HELPER_LIMITS,
       mounts: [{ source: hostDir, target: '/w', readonly: false }], env: {}, command: ['sh', '-c', script],
     });
     try {
@@ -390,15 +480,17 @@ export class DockerSandbox {
     let proxyStarted = false;
     let networkCreated = false;
     try {
+      const instanceId = await this.instanceId();
       const n = await this.cli(
-        ['network', 'create', '--internal', '--driver', 'bridge', '--label', `${SANDBOX_LABEL}=${scanId}`, network],
+        ['network', 'create', '--internal', '--driver', 'bridge', '--label', `${SANDBOX_LABEL}=${scanId}`,
+          '--label', `${SANDBOX_INSTANCE_LABEL}=${instanceId}`, network],
         DOCKER_CMD_TIMEOUT_MS, signal,
       );
       if (n.code !== 0) return { unavailable: `could not create sandbox network: ${tail(n.stderr, 300)}` };
       networkCreated = true;
       proxyStarted = true; // set before the call: a timed-out `run -d` may still have created the container
       const p = await this.cli(hardenedRunArgs({
-        name: proxyName, scanId, image: this.image('proxy'), network: 'bridge', mounts: [], env: {},
+        name: proxyName, scanId, instanceId, image: this.image('proxy'), network: 'bridge', mounts: [], env: {},
         command: [], detach: true, limits: PROXY_LIMITS,
       }), DOCKER_CMD_TIMEOUT_MS, signal);
       if (p.code !== 0) return { unavailable: `could not start egress proxy: ${tail(p.stderr, 300)}` };
@@ -420,6 +512,12 @@ export class DockerSandbox {
     }
   }
 
+  /**
+   * Phase A (opt-in, SANDBOX_INSTALL): installs behind the egress proxy into a size-capped tmpfs at /out (the disk
+   * quota: ENOSPC fails the install, nothing reaches the host disk), and copies only small result files out to
+   * /res: the npm/pnpm tree, or pip's report plus the dist → module map extracted from the installed metadata.
+   * Nothing installed survives the container.
+   */
   async install(opts: InstallOptions): Promise<InstallResult> {
     assertScanId(opts.scanId);
     if (opts.signal.aborted) throw cancelled();
@@ -428,19 +526,18 @@ export class DockerSandbox {
 
     const runDir = join(this.scanRoot(opts.scanId), `install-${opts.ecosystem === 'npm' ? 'npm' : 'pypi'}-${rand()}`);
     const inDir = join(runDir, 'in');
-    const outDir = join(runDir, 'out');
-    let keep = false;
+    const resDir = join(runDir, 'res');
     let touched = false; // a container wrote into runDir: only the helper may delete it
     try {
-      await makeDirs(inDir, outDir, join(outDir, 'tmp'), join(outDir, 'cache'));
-      // Sticky: the container user may create entries in /out but not delete/replace the host-made work/cache/tmp.
-      await chmod(outDir, 0o1777);
+      await makeDirs(inDir, resDir);
+      // Sticky: the container user may create result files but not replace host-made entries.
+      await chmod(resDir, 0o1777);
       const warnings: string[] = [];
       let stage: Staged;
       try {
         stage = opts.ecosystem === 'npm'
-          ? await this.stageNpm(opts.scanId, opts.srcDir, opts.manifestDir, outDir)
-          : await this.stagePython(opts.scanId, opts.requirements, inDir, outDir, warnings);
+          ? await this.stageNpm(opts.scanId, opts.srcDir, opts.manifestDir, inDir, resDir)
+          : await this.stagePython(opts.scanId, opts.requirements, inDir, resDir, warnings);
       } catch (err) {
         if (err instanceof StageError) return { ok: false, code: 'SANDBOX_INSTALL_FAILED', message: err.message };
         throw err;
@@ -455,6 +552,10 @@ export class DockerSandbox {
       if (outcome.kind === 'unavailable') return { ok: false, code: 'SANDBOX_UNAVAILABLE', message: outcome.message };
       if (outcome.kind === 'timeout') return { ok: false, code: 'SANDBOX_TIMEOUT', message: `dependency install: ${outcome.message}` };
       if (outcome.result.code !== 0) {
+        const text = `${outcome.result.stderr}\n${outcome.result.stdout}`;
+        if (/ENOSPC|No space left on device/i.test(text)) {
+          return { ok: false, code: 'SANDBOX_INSTALL_FAILED', message: `installed dependencies exceed ${Math.round(this.maxDepsBytes / 1048576)} MB (install disk quota)` };
+        }
         const oom = outcome.result.code === 137 ? ' (killed, out of memory?)' : '';
         return {
           ok: false, code: 'SANDBOX_INSTALL_FAILED',
@@ -462,42 +563,40 @@ export class DockerSandbox {
         };
       }
 
-      // Drop caches and measure the install from inside a helper container (see HELPER_CLEAN for why not on the host).
-      const post = await this.helper(opts.scanId, outDir, helperPostInstall(relative(outDir, stage.depsDir).split(sep).join('/')));
-      const sizeKb = Number(/SIZE_KB=(\d*)/.exec(post?.stdout ?? '')?.[1] || 0);
-      if (!post) return { ok: false, code: 'SANDBOX_UNAVAILABLE', message: 'sandbox helper container failed after install' };
-      if (sizeKb * 1024 > this.maxDepsBytes) {
-        return { ok: false, code: 'SANDBOX_INSTALL_FAILED', message: `installed dependencies exceed ${Math.round(this.maxDepsBytes / 1048576)} MB` };
-      }
-      try {
-        await assertRealDirChain(runDir, stage.depsDir, true);
-      } catch (err) {
-        if (err instanceof StageError) return { ok: false, code: 'SANDBOX_INSTALL_FAILED', message: err.message };
-        throw err;
-      }
       let tree: unknown = null;
       try {
-        tree = await readJsonCapped(stage.treeFile, MAX_TREE_BYTES);
+        tree = await readJsonCapped(join(resDir, stage.treeFile), MAX_TREE_BYTES);
       } catch (err) {
         if (!(err instanceof StageError)) throw err;
         warnings.push(`dependency tree unavailable: ${err.message}`);
       }
-      keep = true;
-      return { ok: true, ecosystem: opts.ecosystem, depsDir: stage.depsDir, tree, warnings };
+      let distModules: unknown;
+      if (stage.distmapFile !== undefined) {
+        try {
+          distModules = await readJsonCapped(join(resDir, stage.distmapFile), MAX_DISTMAP_BYTES);
+        } catch (err) {
+          if (!(err instanceof StageError)) throw err;
+          warnings.push(`installed module map unavailable: ${err.message}`);
+        }
+      }
+      return { ok: true, ecosystem: opts.ecosystem, tree, ...(distModules !== undefined ? { distModules } : {}), warnings };
     } finally {
-      if (!keep) await (touched ? this.removeTree(opts.scanId, runDir) : rm(runDir, RM_OPTS));
+      await (touched ? this.removeTree(opts.scanId, runDir) : rm(runDir, RM_OPTS));
     }
   }
 
-  private async stageNpm(scanId: string, srcDir: string, manifestDir: string, outDir: string): Promise<Staged> {
+  /** Container limits for an install: the /out tmpfs is charged to the container's memory cgroup, so add it on top. */
+  private installLimits(): Limits {
+    return { ...SANDBOX_LIMITS, memory: `${Math.ceil(2048 + this.maxDepsBytes / 1048576)}m` };
+  }
+
+  private async stageNpm(scanId: string, srcDir: string, manifestDir: string, inDir: string, resDir: string): Promise<Staged> {
     const root = await realpath(resolve(srcDir)).catch(() => { throw new StageError('repository checkout not found'); });
     const dir = resolve(root, manifestDir);
     if (!within(root, dir)) throw new StageError('manifest directory escapes the repository');
     const realDir = await realpath(dir).catch(() => { throw new StageError('manifest directory not found'); });
     if (!within(root, realDir)) throw new StageError('manifest directory escapes the repository');
 
-    const work = join(outDir, 'work');
-    await makeDirs(work);
     const has = async (f: string) => (await lstat(join(realDir, f)).catch(() => null)) !== null;
     let pm: NodePm;
     let lockfiles: string[];
@@ -513,14 +612,14 @@ export class DockerSandbox {
 
     // Only the manifest and the chosen lockfile: .npmrc / .yarnrc(.yml) / pnpm-workspace.yaml can carry registry
     // credentials, alternate registries, yarnPath (arbitrary JS) or plugins, and are never copied.
-    if (!await copyRegular(join(realDir, 'package.json'), join(work, 'package.json'))) throw new StageError('package.json not found');
-    for (const f of lockfiles) await copyRegular(join(realDir, f), join(work, f));
-    if (pm === 'yarn' && (await readFile(join(work, 'yarn.lock'), 'utf8')).includes('__metadata:')) pm = 'yarn-berry';
+    if (!await copyRegular(join(realDir, 'package.json'), join(inDir, 'package.json'))) throw new StageError('package.json not found');
+    for (const f of lockfiles) await copyRegular(join(realDir, f), join(inDir, f));
+    if (pm === 'yarn' && (await readFile(join(inDir, 'yarn.lock'), 'utf8')).includes('__metadata:')) pm = 'yarn-berry';
 
     // The repo's `packageManager` field would make corepack fetch an arbitrary version: pin ours (cached in the image).
     let pkg: unknown;
     try {
-      pkg = JSON.parse(await readFile(join(work, 'package.json'), 'utf8'));
+      pkg = JSON.parse(await readFile(join(inDir, 'package.json'), 'utf8'));
     } catch {
       throw new StageError('package.json is not valid JSON');
     }
@@ -529,22 +628,22 @@ export class DockerSandbox {
     delete manifest.packageManager;
     const field = NODE_PM_FIELD[pm];
     if (field) manifest.packageManager = field;
-    await writeFile(join(work, 'package.json'), JSON.stringify(manifest, null, 2));
+    await writeFile(join(inDir, 'package.json'), JSON.stringify(manifest, null, 2));
 
     const script = NODE_SCRIPTS[pm];
     return {
-      depsDir: join(work, 'node_modules'),
-      treeFile: join(outDir, 'tree.json'),
+      treeFile: 'tree.json',
       build: (proxyUrl, network) => ({
         name: `vibesec-install-${shortId(scanId)}-${rand()}`, scanId, image: this.image('node'), network,
-        mounts: [{ source: outDir, target: '/out', readonly: false }],
-        env: nodeInstallEnv(proxyUrl), workdir: '/out/work',
+        mounts: [{ source: inDir, target: '/in', readonly: true }, { source: resDir, target: '/res', readonly: false }],
+        tmpfs: [{ target: '/out', sizeBytes: this.maxDepsBytes }], limits: this.installLimits(),
+        env: nodeInstallEnv(proxyUrl), workdir: '/tmp',
         command: ['sh', '-c', script],
       }),
     };
   }
 
-  private async stagePython(scanId: string, requirements: string[], inDir: string, outDir: string, warnings: string[]): Promise<Staged> {
+  private async stagePython(scanId: string, requirements: string[], inDir: string, resDir: string, warnings: string[]): Promise<Staged> {
     const safe: string[] = [];
     for (const raw of requirements.slice(0, MAX_REQUIREMENTS)) {
       const line = raw.trim();
@@ -555,46 +654,40 @@ export class DockerSandbox {
     if (requirements.length > MAX_REQUIREMENTS) warnings.push(`only the first ${MAX_REQUIREMENTS} requirements were installed`);
     if (safe.length === 0) throw new StageError('no installable pinned requirements');
     await writeFile(join(inDir, 'requirements.txt'), `${safe.join('\n')}\n`);
+    await writeFile(join(inDir, 'vibesec_install.py'), PYPI_INSTALL_DRIVER);
     return {
-      depsDir: join(outDir, 'deps'),
-      treeFile: join(outDir, 'report.json'),
+      treeFile: 'report.json',
+      distmapFile: 'distmap.json',
       build: (proxyUrl, network) => ({
         name: `vibesec-install-${shortId(scanId)}-${rand()}`, scanId, image: this.image('python'), network,
-        mounts: [{ source: inDir, target: '/in', readonly: true }, { source: outDir, target: '/out', readonly: false }],
+        mounts: [{ source: inDir, target: '/in', readonly: true }, { source: resDir, target: '/res', readonly: false }],
+        tmpfs: [{ target: '/out', sizeBytes: this.maxDepsBytes }], limits: this.installLimits(),
         env: {
           HOME: '/tmp', TMPDIR: '/out/tmp', PYTHONDONTWRITEBYTECODE: '1',
           HTTPS_PROXY: proxyUrl, HTTP_PROXY: proxyUrl, https_proxy: proxyUrl, http_proxy: proxyUrl,
         },
         workdir: '/tmp',
         // Wheels only (--only-binary=:all:): no sdist build, so no setup.py / build backend ever executes.
-        // --isolated ignores PIP_* env and pip.conf; index and proxy are given explicitly.
+        // --isolated ignores PIP_* env and pip.conf; index and proxy are given explicitly. The fixed driver
+        // (/in/vibesec_install.py) runs pip with exactly these arguments, then writes /res/distmap.json.
         command: [
-          'python', '-m', 'pip', 'install', '--isolated', '--only-binary=:all:', '--no-input', '--disable-pip-version-check',
+          'python', '/in/vibesec_install.py',
+          '--isolated', '--only-binary=:all:', '--no-input', '--disable-pip-version-check',
           '--no-cache-dir', '--no-compile', '--no-warn-script-location', '--progress-bar', 'off',
           '--index-url', 'https://pypi.org/simple', '--proxy', proxyUrl,
-          '--target', '/out/deps', '--report', '/out/report.json', '-r', '/in/requirements.txt',
+          '--target', '/out/deps', '--report', '/res/report.json', '-r', '/in/requirements.txt',
         ],
       }),
     };
   }
 
+  /** Phase B: offline usage analysis over the read-only source checkout (the analyzers never read installed deps). */
   async analyze(opts: AnalyzeOptions): Promise<AnalyzeResult> {
     assertScanId(opts.scanId);
     if (opts.signal.aborted) throw cancelled();
     const scanRoot = this.scanRoot(opts.scanId);
-    if (opts.depsDir !== undefined && !within(scanRoot, resolve(opts.depsDir))) {
-      return { ok: false, code: 'SANDBOX_ANALYZE_FAILED', message: 'depsDir is not a sandbox install of this scan' };
-    }
     const packages = normalizePackages(opts.packages);
     if (!packages) return { ok: false, code: 'SANDBOX_ANALYZE_FAILED', message: 'invalid package list' };
-    if (opts.depsDir !== undefined) {
-      try {
-        await assertRealDirChain(scanRoot, resolve(opts.depsDir), false);
-      } catch (err) {
-        if (err instanceof StageError) return { ok: false, code: 'SANDBOX_ANALYZE_FAILED', message: err.message };
-        throw err;
-      }
-    }
     const avail = await this.availability(opts.signal);
     if (!avail.ok) return { ok: false, code: 'SANDBOX_UNAVAILABLE', message: avail.reason };
 
@@ -605,9 +698,11 @@ export class DockerSandbox {
     try {
       await makeDirs(inDir, outDir);
       await writeFile(join(inDir, 'packages.json'), JSON.stringify({ ecosystem: opts.ecosystem, packages }));
-      const mounts: BindMount[] = [{ source: resolve(opts.srcDir), target: '/src', readonly: true }];
-      if (opts.depsDir !== undefined) mounts.push({ source: resolve(opts.depsDir), target: '/deps', readonly: true });
-      mounts.push({ source: inDir, target: '/in', readonly: true }, { source: outDir, target: '/out', readonly: false });
+      const mounts: BindMount[] = [
+        { source: resolve(opts.srcDir), target: '/src', readonly: true },
+        { source: inDir, target: '/in', readonly: true },
+        { source: outDir, target: '/out', readonly: false },
+      ];
       const node = opts.ecosystem === 'npm';
       touched = true;
       const outcome = await this.runContainer({
@@ -636,14 +731,18 @@ export class DockerSandbox {
   }
 
   /**
-   * Removes every container, network and volume labeled vibesec.scan(=scanId) plus the host staging dir.
-   * Call on scan finish (with the id) and on startup (without: removes ALL sandbox leftovers of every scan).
+   * Removes every container, network and volume of THIS instance (label vibesec.instance=<id>) labeled
+   * vibesec.scan(=scanId), plus the host staging dir. Call on scan finish (with the id) and on startup (without:
+   * removes all of this instance's leftovers — never those of another API instance sharing the daemon).
    */
   async sweep(scanId?: string): Promise<void> {
     if (scanId !== undefined) assertScanId(scanId);
-    const filter = scanId === undefined ? `label=${SANDBOX_LABEL}` : `label=${SANDBOX_LABEL}=${scanId}`;
+    const instance = `label=${SANDBOX_INSTANCE_LABEL}=${await this.instanceId()}`;
+    const filters = scanId === undefined
+      ? ['--filter', instance]
+      : ['--filter', `label=${SANDBOX_LABEL}=${scanId}`, '--filter', instance];
     const ids = async (args: string[]) => {
-      const r = await this.quiet([...args, '--filter', filter]);
+      const r = await this.quiet([...args, ...filters]);
       return r && r.code === 0 ? r.stdout.split(/\s+/).filter((s) => DOCKER_ID_RE.test(s)) : [];
     };
     const containers = await ids(['ps', '-aq']);

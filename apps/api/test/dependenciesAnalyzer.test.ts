@@ -137,16 +137,21 @@ type SandboxFake = NonNullable<DependenciesAnalyzerDeps['sandbox']>;
 function fakeSandbox(opts: {
   available?: boolean;
   installFails?: (manifestDir: string) => boolean;
+  analyzeFails?: (o: Parameters<SandboxFake['analyze']>[0]) => boolean;
   usages?: unknown;
+  tree?: unknown;
+  distModules?: Record<string, string[]>;
 } = {}) {
   return {
     availability: vi.fn(async () => (opts.available === false ? { ok: false as const, reason: 'docker not running' } : { ok: true as const, serverVersion: '27' })),
     install: vi.fn(async (o: Parameters<SandboxFake['install']>[0]) => {
       const md = o.ecosystem === 'npm' ? o.manifestDir : 'py';
       if (opts.installFails?.(md)) return { ok: false as const, code: 'SANDBOX_INSTALL_FAILED' as const, message: 'boom' };
-      return { ok: true as const, ecosystem: o.ecosystem, depsDir: join(dir, '.deps', md || 'root'), tree: null, warnings: [] };
+      return { ok: true as const, ecosystem: o.ecosystem, tree: opts.tree ?? null, warnings: [], ...(opts.distModules ? { distModules: opts.distModules } : {}) };
     }),
-    analyze: vi.fn(async (_o: Parameters<SandboxFake['analyze']>[0]) => ({ ok: true as const, usages: opts.usages ?? { version: 1, usages: [] } })),
+    analyze: vi.fn(async (o: Parameters<SandboxFake['analyze']>[0]) => (opts.analyzeFails?.(o)
+      ? { ok: false as const, code: 'SANDBOX_ANALYZE_FAILED' as const, message: 'boom' }
+      : { ok: true as const, usages: opts.usages ?? { version: 1, usages: [] } })),
     sweep: vi.fn(async () => {}),
   };
 }
@@ -351,7 +356,7 @@ describe('createDependenciesAnalyzer', () => {
         { package: 'express', file: 'src/app.ts', line: 2, symbol: 'default', kind: 'import' },
       ] },
     });
-    const { analyzer, llmCalls } = setup({ sandbox, sandboxEnabled: true });
+    const { analyzer, llmCalls } = setup({ sandbox, sandboxEnabled: true, sandboxInstall: true });
     const { ctx, warnings } = makeCtx(files);
     const findings = await analyzer.run(ctx);
     expect(warnings).toEqual([]);
@@ -382,7 +387,8 @@ describe('createDependenciesAnalyzer', () => {
     const svc = npmProject({ dependencies: { lodash: '4.17.15' }, packages: { 'node_modules/lodash': { version: '4.17.15' } } });
     const files = await baseRepo({ 'svc/package.json': svc.packageJson, 'svc/package-lock.json': svc.packageLock, 'svc/index.js': "const _ = require('lodash');\n" });
     const sandbox = fakeSandbox({
-      installFails: (md) => md === 'svc',
+      // the svc graph only looks for lodash (the root graph also looks for express, qs, …)
+      analyzeFails: (o) => !(o.packages as Array<{ name: string }>).some((p) => p.name === 'express'),
       usages: { version: 1, usages: [{ package: 'lodash', file: 'src/app.ts', line: 3, symbol: 'merge', kind: 'call' }] },
     });
     const edges = [...BASE_EDGES, { from: 'svc/index.js', specifier: 'lodash', kind: 'package' as const, to: null, pkg: 'lodash', line: 1 }];
@@ -400,6 +406,57 @@ describe('createDependenciesAnalyzer', () => {
     expect(sub.producedBy).toEqual(['osv', 'index']);
     expect(sub.dependency!.reachability).toBe('imported'); // judge failed open
     expect(root.id).not.toBe(sub.id);
+  });
+
+  it('phase B (offline usage analysis) runs without any install by default (SANDBOX_INSTALL=false)', async () => {
+    const files = await baseRepo();
+    const sandbox = fakeSandbox({ usages: { version: 1, usages: [{ package: 'lodash', file: 'src/app.ts', line: 3, symbol: 'merge', kind: 'call' }] } });
+    const { analyzer } = setup({ sandbox, sandboxEnabled: true });
+    const { ctx, warnings } = makeCtx(files);
+    const findings = await analyzer.run(ctx);
+    expect(sandbox.install).not.toHaveBeenCalled();
+    expect(sandbox.analyze).toHaveBeenCalledTimes(1);
+    expect(sandbox.analyze.mock.calls[0]![0]).not.toHaveProperty('depsDir');
+    expect(warnings).toEqual([]);
+    expect(vulnOf(findings, 'lodash')!.producedBy).toEqual(['osv', 'sandbox']);
+  });
+
+  it('an install failure (opt-in phase A) never disables phase B', async () => {
+    const files = await baseRepo();
+    const sandbox = fakeSandbox({
+      installFails: () => true,
+      usages: { version: 1, usages: [{ package: 'lodash', file: 'src/app.ts', line: 3, symbol: 'merge', kind: 'call' }] },
+    });
+    const { analyzer } = setup({ sandbox, sandboxEnabled: true, sandboxInstall: true });
+    const { ctx, warnings } = makeCtx(files);
+    const findings = await analyzer.run(ctx);
+    expect(sandbox.install).toHaveBeenCalledTimes(1);
+    expect(sandbox.analyze).toHaveBeenCalledTimes(1);
+    expect(warnings.map((w) => w[0])).toEqual(['SANDBOX_INSTALL_PARTIAL']);
+    expect(vulnOf(findings, 'lodash')!.producedBy).toEqual(['osv', 'sandbox']);
+  });
+
+  it('phase A npm tree: a resolved version that differs from the lockfile is reported', async () => {
+    const files = await baseRepo();
+    const sandbox = fakeSandbox({ tree: { name: 'app', dependencies: { lodash: { version: '4.17.21' }, express: { version: '4.17.1', dependencies: { qs: { version: '6.7.0' } } } } } });
+    const { analyzer } = setup({ sandbox, sandboxEnabled: true, sandboxInstall: true });
+    const { ctx, warnings } = makeCtx(files);
+    await analyzer.run(ctx);
+    const mismatch = warnings.filter((w) => w[0] === 'SANDBOX_VERSION_MISMATCH');
+    expect(mismatch).toHaveLength(1);
+    expect(mismatch[0]![1]).toContain('lodash@4.17.15');
+    expect(mismatch[0]![1]).not.toContain('qs@');
+  });
+
+  it('phase A PyPI: dist -> module names from the installed metadata feed the usage analysis', async () => {
+    const files = await writeRepo({ 'requirements.txt': 'acme-utils==1.0.0\n', 'app.py': 'import acmeu\n' });
+    const sandbox = fakeSandbox({ distModules: { 'acme-utils': ['acmeu', 'acme_extra'], 'Not Valid!': ['x'], other: ['bad-name', 'ok_mod'] } });
+    const osv = fakeOsv({ 'acme-utils@1.0.0': [adv('PYSEC-1', 'high', ['1.0.1'])] });
+    const { analyzer } = setup({ sandbox, sandboxEnabled: true, sandboxInstall: true, osv, edges: [] });
+    await analyzer.run(makeCtx(files).ctx);
+    expect(sandbox.install.mock.calls[0]![0]).toMatchObject({ ecosystem: 'PyPI', requirements: ['acme-utils==1.0.0'] });
+    const pkgs = sandbox.analyze.mock.calls[0]![0].packages as Array<{ name: string; importNames: string[] }>;
+    expect(pkgs.find((p) => p.name === 'acme-utils')!.importNames).toEqual(expect.arrayContaining(['acme_utils', 'acmeu', 'acme_extra']));
   });
 
   it('skips the sandbox when nothing is vulnerable, or when it is disabled', async () => {
@@ -475,7 +532,7 @@ describe('createDependenciesAnalyzer', () => {
     const files = await baseRepo();
     const ac = new AbortController();
     const sandbox = fakeSandbox();
-    sandbox.install.mockImplementation(async () => { ac.abort(); throw new AppError('CANCELLED', 'cancelled', 'cancelled'); });
+    sandbox.analyze.mockImplementation(async () => { ac.abort(); throw new AppError('CANCELLED', 'cancelled', 'cancelled'); });
     const { analyzer } = setup({ sandbox, sandboxEnabled: true });
     await expect(analyzer.run(makeCtx(files, ac.signal).ctx)).rejects.toMatchObject({ kind: 'cancelled' });
     expect(sandbox.sweep).toHaveBeenCalledWith('scan-1');
