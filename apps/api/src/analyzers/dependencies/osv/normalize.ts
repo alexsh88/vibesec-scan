@@ -222,7 +222,9 @@ function computeSeverity(
       if (score !== null) v3.push({ score, vector: e.score });
     }
   }
-  const pool = v4.length > 0 ? v4 : v3;
+  // Prefer the EXACT v3 score (official FIRST formula); the v4 score is a documented approximation
+  // (see cvssV4Score), so it is only used when no parseable v3 vector was published.
+  const pool = v3.length > 0 ? v3 : v4;
   if (pool.length > 0) {
     const best = pool.reduce((a, b) => (b.score > a.score ? b : a));
     return { severity: severityFromScore(best.score), cvss: best.score, cvssVector: best.vector };

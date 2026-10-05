@@ -66,6 +66,17 @@ describe('normalizeOsv (fixtures)', () => {
     expect(advisory?.fixedVersions).toEqual(['2.0.0']);
   });
 
+  it('both CVSS v3 and v4 published: prefers the EXACT v3 score over the approximate v4 one', () => {
+    const record = fixture('cvss-v4') as Record<string, unknown>;
+    const v3 = 'CVSS:3.1/AV:N/AC:H/PR:L/UI:R/S:U/C:L/I:L/A:N'; // exact 3.7 (low)
+    const both = { ...record, severity: [...(record.severity as unknown[]), { type: 'CVSS_V3', score: v3 }] };
+    const advisory = normalizeOsv(both, { ecosystem: 'npm', name: 'example-pkg', version: '1.0.0' });
+    expect(advisory).toMatchObject({ cvss: 3.7, cvssVector: v3, severity: 'low' });
+    // v4-first ordering in the input must not matter
+    const reversed = { ...record, severity: [{ type: 'CVSS_V3', score: v3 }, ...(record.severity as unknown[])] };
+    expect(normalizeOsv(reversed, { ecosystem: 'npm', name: 'example-pkg', version: '1.0.0' })?.cvss).toBe(3.7);
+  });
+
   it('database_specific.severity only: no CVSS vectors published -> maps MODERATE to medium', () => {
     const record = fixture('db-severity-only');
     const advisory = normalizeOsv(record, { ecosystem: 'npm', name: 'sample-pkg', version: '1.0.0' });

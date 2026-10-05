@@ -55,7 +55,7 @@ export type OsvAdvisory = {
   aliases: string[];
   summary: string;
   details: string;            // may be long; truncate before prompting
-  severity: Severity;         // from CVSS (v3/v4 base score) or database_specific severity, else 'medium'
+  severity: Severity;         // from CVSS (exact v3 preferred; approximate v4 only without v3) or database_specific severity, else 'medium'
   cvss: number | null;        // base score 0–10 when computable
   cvssVector: string | null;
   /** Fixed versions for this package (ascending, ecosystem-ordered); empty when no fix exists. */
