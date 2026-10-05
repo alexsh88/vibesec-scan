@@ -6,6 +6,18 @@ export const TaintStepSchema = z.object({
   file: z.string(), line: z.number().int().positive(), code: z.string(), note: z.string(),
 });
 
+export const TriageStatusSchema = z.enum(['false_positive', 'accepted_risk', 'wont_fix']);
+export type TriageStatus = z.infer<typeof TriageStatusSchema>;
+
+/** Set by PUT/DELETE .../triage (P7 Task A); persisted on the finding JSON, re-applied across scans by fingerprint. */
+export const TriageSchema = z.object({
+  status: TriageStatusSchema,
+  reason: z.string().max(1000),
+  at: z.string(),
+  expiresAt: z.string().optional(),
+});
+export type Triage = z.infer<typeof TriageSchema>;
+
 export const AdvisorySchema = z.object({
   id: z.string(), aliases: z.array(z.string()), summary: z.string(),
   severity: SeveritySchema, cvss: z.number().nullable(), fixedIn: z.string().nullable(), url: z.string().nullable(),
@@ -47,6 +59,7 @@ export const FindingSchema = z.object({
   remediation: z.object({ summary: z.string(), patch: z.string().optional() }),
   scanStatus: z.enum(['new', 'existing', 'fixed']),
   producedBy: z.array(z.string()).optional(),
+  triage: TriageSchema.optional(),
 });
 export type Finding = z.infer<typeof FindingSchema>;
 

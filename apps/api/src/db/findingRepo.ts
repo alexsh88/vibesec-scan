@@ -3,11 +3,14 @@ import { AppError } from '../errors/AppError';
 import { SEVERITY_RANK } from '../findings/helpers';
 import type { Db } from './database';
 
+export type TriageFilter = 'open' | 'suppressed' | 'all';
+
 export type FindingFilter = {
   category?: Category;
   severity?: Severity;
   file?: string;
   q?: string;
+  triage?: TriageFilter;
   cursor?: string;
   limit?: number;
 };
@@ -128,6 +131,10 @@ export class FindingRepo {
       const like = `%${escapeLike(filter.q)}%`;
       params.push(like, like, like);
     }
+    // Triage isn't its own column (it lives on the finding JSON so it round-trips with the rest of the
+    // finding); filtering via json_extract keeps `all` (the default) a plain no-op clause.
+    if (filter.triage === 'open') clauses.push(`json_extract(data_json, '$.triage.status') IS NULL`);
+    else if (filter.triage === 'suppressed') clauses.push(`json_extract(data_json, '$.triage.status') IS NOT NULL`);
     const rows = this.db.prepare(
       `SELECT data_json FROM findings WHERE ${clauses.join(' AND ')}
        ORDER BY severity_rank, risk_score DESC, file, start_line, id

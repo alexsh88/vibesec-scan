@@ -36,6 +36,8 @@ import { BudgetTracker } from '../src/llm/budget';
 import { createScanPipeline } from '../src/pipeline/scanPipeline';
 import { ScanLifecycle } from '../src/scans/ScanLifecycle';
 import { ScanService } from '../src/scans/ScanService';
+import { SuppressionRepo } from '../src/suppressions/suppressionRepo';
+import { SuppressionService } from '../src/suppressions/suppressionService';
 import { fake } from './fakeCredentials';
 import { createFixtureRepo, type FixtureRepo } from './fixtures/gitRepo';
 import { memoryDb } from './helpers';
@@ -125,6 +127,7 @@ beforeAll(async () => {
 
   container = {
     summaries: new SummaryRepo(db),
+    suppressions: new SuppressionService(new SuppressionRepo(db), findings, scans, audit),
     config, db, scans, bus, audit, lifecycle, runner, service,
     git, github: github as unknown as GitHubClient, indexRepo, gitVersion: null, llm, llmCalls, budget, findings, fixPlans: new FixPlanRepo(db),
   };

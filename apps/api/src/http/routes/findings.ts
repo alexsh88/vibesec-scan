@@ -1,16 +1,24 @@
 import type { FastifyInstance } from 'fastify';
-import { CategorySchema, SeveritySchema } from '@vibesec/shared';
+import { CategorySchema, SeveritySchema, TriageStatusSchema } from '@vibesec/shared';
 import { z } from 'zod';
 import type { Container } from '../../container';
 import { AppError } from '../../errors/AppError';
+import { requestMeta } from './scans';
 
 const FindingQuerySchema = z.object({
   category: CategorySchema.optional(),
   severity: SeveritySchema.optional(),
   file: z.string().max(1000).optional(),
   q: z.string().max(200).optional(),
+  triage: z.enum(['open', 'suppressed', 'all']).default('all'),
   cursor: z.string().max(100).optional(),
   limit: z.coerce.number().int().min(1).max(200).optional(),
+});
+
+const TriageBodySchema = z.object({
+  status: TriageStatusSchema,
+  reason: z.string().min(1).max(1000),
+  expiresAt: z.iso.datetime().optional(),
 });
 
 type IdParams = { Params: { id: string } };
@@ -30,5 +38,16 @@ export function findingRoutes(app: FastifyInstance, c: Container): void {
     const finding = c.findings.get(req.params.id, req.params.findingId);
     if (!finding) throw new AppError('NOT_FOUND', 'permanent', 'Finding not found');
     return finding;
+  });
+
+  app.put<FindingParams>('/api/scans/:id/findings/:findingId/triage', async (req) => {
+    c.service.get(req.params.id); // 404 for unknown scans
+    const body = TriageBodySchema.parse(req.body);
+    return c.suppressions.setTriage(req.params.id, req.params.findingId, body, requestMeta(req));
+  });
+
+  app.delete<FindingParams>('/api/scans/:id/findings/:findingId/triage', async (req) => {
+    c.service.get(req.params.id); // 404 for unknown scans
+    return c.suppressions.clearTriage(req.params.id, req.params.findingId, requestMeta(req));
   });
 }

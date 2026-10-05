@@ -40,6 +40,8 @@ import { RateLimiter, Semaphore } from '../src/llm/rateLimiter';
 import { createScanPipeline } from '../src/pipeline/scanPipeline';
 import { ScanLifecycle } from '../src/scans/ScanLifecycle';
 import { ScanService } from '../src/scans/ScanService';
+import { SuppressionRepo } from '../src/suppressions/suppressionRepo';
+import { SuppressionService } from '../src/suppressions/suppressionService';
 import { createFixtureRepo, type FixtureRepo } from './fixtures/gitRepo';
 import { npmProject } from './fixtures/npmProject';
 import { memoryDb } from './helpers';
@@ -214,6 +216,7 @@ beforeAll(async () => {
   const service = new ScanService({ db, scans, lifecycle, audit, queue: runner, queueCapacity: 10 });
   container = {
     summaries: new SummaryRepo(db),
+    suppressions: new SuppressionService(new SuppressionRepo(db), findings, scans, audit),
     config, db, scans, bus, audit, lifecycle, runner, service,
     git, github: github as unknown as GitHubClient, indexRepo, gitVersion: null, llm, llmCalls, budget, findings, fixPlans, sandbox: null,
   };
