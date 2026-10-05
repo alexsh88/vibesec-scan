@@ -48,10 +48,25 @@ function RouteError() {
   );
 }
 
+/**
+ * Shown (full-page, replacing the root — not nested inside AppShell) only on the very first paint
+ * of a path whose matched routes include a `lazy` one still downloading its chunk. This is a CSR-only
+ * SPA (no server loaders), so this is the sole hydration gap React Router can hit; without a root
+ * `hydrateFallbackElement` it warns "No HydrateFallback element provided" and renders nothing.
+ */
+function RootHydrateFallback() {
+  return (
+    <div className="flex min-h-dvh items-center justify-center bg-background" aria-busy="true" aria-label="Loading">
+      <span className="size-2 animate-pulse-dot rounded-full bg-signal" />
+    </div>
+  );
+}
+
 export const router = createBrowserRouter([
   {
     element: <AppShell />,
     errorElement: <RouteError />,
+    hydrateFallbackElement: <RootHydrateFallback />,
     children: [
       { index: true, element: <ConnectPage /> },
       {

@@ -193,14 +193,19 @@ export type TriageInput = { status: TriageStatus; reason: string; expiresAt?: st
 
 export type CoverageStatus = 'reviewed' | 'reviewed-fast' | 'cached' | 'not-relevant' | 'budget-skipped' | 'failed';
 
+/** apps/api/src/index/types.ts SkipReason */
+export type SkipReason = 'vendor' | 'binary' | 'too_large' | 'minified' | 'generated' | 'symlink' | 'submodule' | 'file_limit';
+
 /** apps/api/src/index/types.ts IndexStats */
 export type IndexStats = {
   totalFiles: number;
   indexedFiles: number;
-  skipped: Partial<Record<string, number>>;
+  skipped: Partial<Record<SkipReason, number>>;
   byLanguage: Partial<Record<string, number>>;
   imports: number;
   entrypoints: number;
+  /** true when MAX_FILES was reached and the rest were marked file_limit */
+  truncated?: boolean;
 };
 
 export type LlmTotals = {

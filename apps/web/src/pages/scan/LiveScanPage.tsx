@@ -17,14 +17,12 @@ import {
   deriveTimeline,
   mergeWarnings,
   newestFirstFindings,
-  useLiveDiagnostics,
   useNow,
   useReducedMotion,
 } from '@/components/live/liveModel';
-import { LiveStyles } from '@/components/live/LiveStyles';
 import { CachePanel, CostMeter, WarningsList } from '@/components/live/Meters';
 import { StageTimeline } from '@/components/live/StageTimeline';
-import { useFindings } from '@/hooks/queries';
+import { useDiagnostics, useFindings } from '@/hooks/queries';
 import { useScanContext } from '@/hooks/useScanContext';
 import { hasResults, STATE_LABEL } from '@/lib/scanState';
 import { SEVERITY_ORDER } from '@/lib/taxonomy';
@@ -41,7 +39,7 @@ export default function LiveScanPage() {
   // Only auto-open results for a scan the user actually watched finish (not one opened after the fact).
   const [watchedLive] = useState(() => !isTerminalState(scan.state));
 
-  const diagnostics = useLiveDiagnostics(scanId, running);
+  const diagnostics = useDiagnostics(scanId, { refetchInterval: running ? 3_000 : false });
   const timeline = useMemo(() => deriveTimeline(events.events, current, scan.cacheHit), [events.events, current, scan.cacheHit]);
   const warnings = useMemo(() => mergeWarnings(events.warnings, scan.warnings), [events.warnings, scan.warnings]);
   const lanes = useMemo(
@@ -72,7 +70,6 @@ export default function LiveScanPage() {
 
   return (
     <Page wide>
-      <LiveStyles />
       <PageHeader
         eyebrow={running ? 'Live scan' : 'Scan run'}
         title={running ? `Scanning ${scan.repo.owner}/${scan.repo.name}` : STATE_LABEL[current]}

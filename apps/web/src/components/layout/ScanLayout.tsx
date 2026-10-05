@@ -71,11 +71,11 @@ export function ScanLayout() {
   return (
     <ScanContext.Provider value={ctx}>
       <div className="flex flex-1 flex-col">
-        <ScanHeader running={running} />
+        <ScanHeader running={running} hideCancel={onLive} />
         <div className="flex flex-1 flex-col md:flex-row">
           <nav
             aria-label="Scan sections"
-            className="sticky top-13 z-30 flex shrink-0 gap-1 overflow-x-auto border-b bg-background/90 px-3 py-2 backdrop-blur md:h-[calc(100dvh-3.25rem)] md:w-52 md:flex-col md:overflow-visible md:border-r md:border-b-0 md:px-3 md:py-4"
+            className="sticky top-13 z-30 flex shrink-0 gap-1 overflow-x-auto border-b bg-background/90 px-3 py-2 backdrop-blur snap-x [mask-image:linear-gradient(to_right,black_calc(100%-28px),transparent)] [-webkit-mask-image:linear-gradient(to_right,black_calc(100%-28px),transparent)] md:h-[calc(100dvh-3.25rem)] md:w-52 md:flex-col md:overflow-visible md:border-r md:border-b-0 md:px-3 md:py-4 md:[mask-image:none] md:[-webkit-mask-image:none]"
           >
             {NAV.map((item) => (
               <NavLink
@@ -83,7 +83,7 @@ export function ScanLayout() {
                 to={item.to}
                 className={({ isActive }) =>
                   cn(
-                    'group flex items-center gap-2.5 rounded-md px-2.5 py-1.5 text-sm whitespace-nowrap text-muted-foreground transition-colors hover:bg-accent hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none',
+                    'group flex shrink-0 snap-start items-center gap-2.5 rounded-md px-2.5 py-1.5 text-sm whitespace-nowrap text-muted-foreground transition-colors hover:bg-accent hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none',
                     isActive && 'bg-accent font-medium text-foreground',
                   )
                 }
@@ -108,7 +108,7 @@ export function ScanLayout() {
   );
 }
 
-function ScanHeader({ running }: { running: boolean }) {
+function ScanHeader({ running, hideCancel }: { running: boolean; hideCancel: boolean }) {
   const { scan } = useScanContext();
   const cancel = useCancelScan();
   const [confirmOpen, setConfirmOpen] = useState(false);
@@ -165,7 +165,7 @@ function ScanHeader({ running }: { running: boolean }) {
           )}
         </div>
         <div className="flex-1" />
-        {running && (
+        {running && !hideCancel && (
           <Button size="sm" variant="outline" onClick={() => setConfirmOpen(true)} disabled={cancel.isPending}>
             <Square className="fill-current" /> Cancel scan
           </Button>

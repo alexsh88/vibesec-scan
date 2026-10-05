@@ -166,6 +166,12 @@ export function useScanEvents(scanId: string | undefined, opts: { enabled?: bool
       qc.setQueryData<ScanDto>(qk.scan(scanId), (old) => (old ? { ...old, state: next } : old));
     };
 
+    // ScanDto only carries a running total (`costUsd`), no token breakdown, so only that is mirrored
+    // here; the header's cost readout then tracks the live meter instead of waiting for a re-fetch.
+    const applyCost = (e: Extract<ScanEvent, { type: 'cost' }>) => {
+      qc.setQueryData<ScanDto>(qk.scan(scanId), (old) => (old ? { ...old, costUsd: e.usd } : old));
+    };
+
     const onMessage = (ev: MessageEvent<string>) => {
       let data: LiveEvent;
       try {
@@ -178,6 +184,7 @@ export function useScanEvents(scanId: string | undefined, opts: { enabled?: bool
       lastSeqRef.current = seq;
       dispatch({ type: 'event', event: { ...data, seq } });
       if (data.type === 'state') applyState(data.state);
+      if (data.type === 'cost') applyCost(data);
       if (data.type === 'summary') void qc.invalidateQueries({ queryKey: qk.summary(scanId) });
       if (data.type === 'done') {
         applyState(data.state);

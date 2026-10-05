@@ -2,6 +2,12 @@
  * Lazy Shiki: nothing is downloaded until the first <CodeBlock> mounts, and each grammar is its own
  * chunk loaded on demand. Uses the JS regex engine (no WASM) and dual github themes driven by CSS
  * variables, so switching light/dark needs no re-highlight.
+ *
+ * Built from `shiki/core` + explicit `@shikijs/langs/*` / `@shikijs/themes/*` imports rather than the
+ * `shiki` package's convenience `createHighlighter` + generic `loadLanguage(name)`: those resolve
+ * names through Shiki's full bundled-language/theme maps, so the bundler has to assume any of its
+ * ~240 grammars could be requested and ships every one of them (several alone over 500 kB) even
+ * though `EXT_LANG` below only ever asks for a couple dozen.
  */
 import type { Root } from 'hast';
 import type { HighlighterCore, ShikiTransformer } from 'shiki';
@@ -11,14 +17,40 @@ type Lang = string;
 let highlighterPromise: Promise<HighlighterCore> | null = null;
 const loadedLangs = new Set<string>();
 
+/** Only the languages `EXT_LANG` / `langFromPath` can actually produce. */
+const LANG_LOADERS: Record<string, () => Promise<unknown>> = {
+  typescript: () => import('@shikijs/langs/typescript'),
+  tsx: () => import('@shikijs/langs/tsx'),
+  javascript: () => import('@shikijs/langs/javascript'),
+  jsx: () => import('@shikijs/langs/jsx'),
+  python: () => import('@shikijs/langs/python'),
+  json: () => import('@shikijs/langs/json'),
+  yaml: () => import('@shikijs/langs/yaml'),
+  toml: () => import('@shikijs/langs/toml'),
+  shellscript: () => import('@shikijs/langs/shellscript'),
+  sql: () => import('@shikijs/langs/sql'),
+  html: () => import('@shikijs/langs/html'),
+  css: () => import('@shikijs/langs/css'),
+  markdown: () => import('@shikijs/langs/markdown'),
+  xml: () => import('@shikijs/langs/xml'),
+  go: () => import('@shikijs/langs/go'),
+  ruby: () => import('@shikijs/langs/ruby'),
+  java: () => import('@shikijs/langs/java'),
+  php: () => import('@shikijs/langs/php'),
+  dotenv: () => import('@shikijs/langs/dotenv'),
+  hcl: () => import('@shikijs/langs/hcl'),
+  diff: () => import('@shikijs/langs/diff'),
+  docker: () => import('@shikijs/langs/docker'),
+};
+
 async function getHighlighter(): Promise<HighlighterCore> {
   highlighterPromise ??= (async () => {
-    const [{ createHighlighter }, { createJavaScriptRegexEngine }] = await Promise.all([
-      import('shiki'),
+    const [{ createHighlighterCore }, { createJavaScriptRegexEngine }] = await Promise.all([
+      import('shiki/core'),
       import('shiki/engine/javascript'),
     ]);
-    return createHighlighter({
-      themes: ['github-dark-default', 'github-light-default'],
+    return createHighlighterCore({
+      themes: [() => import('@shikijs/themes/github-dark-default'), () => import('@shikijs/themes/github-light-default')],
       langs: [],
       engine: createJavaScriptRegexEngine(),
     });
@@ -53,8 +85,10 @@ export async function highlight(code: string, opts: HighlightOptions): Promise<R
   const hl = await getHighlighter();
   let lang = opts.lang;
   if (lang !== 'text' && !loadedLangs.has(lang)) {
+    const load = LANG_LOADERS[lang];
     try {
-      await hl.loadLanguage(lang as Parameters<HighlighterCore['loadLanguage']>[0]);
+      if (!load) throw new Error(`No grammar registered for ${lang}`);
+      await hl.loadLanguage(load as Parameters<HighlighterCore['loadLanguage']>[0]);
       loadedLangs.add(lang);
     } catch {
       lang = 'text';
