@@ -26,7 +26,7 @@ function graph(eco: Ecosystem, lockfile: string, specs: NodeSpec[], manifestDir 
 
 function adv(id: string, fixedVersions: string[], severity: OsvAdvisory['severity'] = 'high'): OsvAdvisory {
   return {
-    id, aliases: [], summary: id, details: '', severity, cvss: null, cvssVector: null, fixedVersions, affectedSymbols: [], cwes: [], url: null,
+    id, aliases: [], summary: id, details: '', severity, cvss: null, cvssVector: null, fixedVersions, affectedRanges: [], affectedSymbols: [], cwes: [], url: null,
     published: null, malicious: false,
   };
 }
@@ -345,5 +345,95 @@ describe('buildFixPlan — ranking, ids, caps', () => {
     const g = graph('npm', 'package-lock.json', [{ name: 'x', version: '1.0.0', direct: true }]);
     const { plan: p } = await plan([vuln(g, 'x@1.0.0', [adv('A', ['1.0.1']), adv('B', ['1.0.1'])], 70)], new FakeRegistry({ x: ['1.0.0', '1.0.1'] }));
     expect(p.actions[0]).toMatchObject({ riskReduced: 70, resolvedCount: 2 });
+  });
+});
+
+// ---------- affected-range-aware targets (regressions / multi-range advisories) ----------
+
+function advR(id: string, ranges: OsvAdvisory['affectedRanges'], severity: OsvAdvisory['severity'] = 'high'): OsvAdvisory {
+  const fixed = ranges.map((r) => r.fixed).filter((f): f is string => f !== undefined);
+  return { ...adv(id, fixed, severity), affectedRanges: ranges };
+}
+
+describe('buildFixPlan — never recommends a still-affected version', () => {
+  // A: fixed in 1.2.0 but regressed in 1.3.0 (fixed again in 1.3.2). B: fixed in 1.3.0.
+  const A = () => advR('A', [{ introduced: '0', fixed: '1.2.0' }, { introduced: '1.3.0', fixed: '1.3.2' }]);
+  const B = () => advR('B', [{ introduced: '0', fixed: '1.3.0' }]);
+
+  it('skips published versions inside any affected range (registry data)', async () => {
+    const g = graph('npm', 'package-lock.json', [{ name: 'x', version: '1.1.0', direct: true }]);
+    const reg = new FakeRegistry({ x: ['1.1.0', '1.2.0', '1.3.0', '1.3.1', '1.3.2', '1.4.0'] });
+    const { plan: p } = await plan([vuln(g, 'x@1.1.0', [A(), B()])], reg);
+    expect(p.actions).toHaveLength(1);
+    expect(p.actions[0]).toMatchObject({ kind: 'upgrade-direct', to: '1.3.2' });
+    expect(p.actions[0]!.resolves.map((r) => r.advisoryId).sort()).toEqual(['A', 'B']);
+  });
+
+  it('without registry data verifies advisory candidates against the intervals and says so', async () => {
+    const g = graph('npm', 'package-lock.json', [{ name: 'x', version: '1.1.0', direct: true }]);
+    const reg = new FakeRegistry({});
+    reg.failing.add('x');
+    const { plan: p } = await plan([vuln(g, 'x@1.1.0', [A(), B()])], reg);
+    expect(p.actions[0]).toMatchObject({ kind: 'upgrade-direct', to: '1.3.2' });
+    expect(p.actions[0]!.notes.join(' ')).toMatch(/unverified against registry/);
+  });
+
+  it('honours last_affected intervals (first published version after it)', async () => {
+    const g = graph('npm', 'package-lock.json', [{ name: 'x', version: '1.0.0', direct: true }]);
+    const reg = new FakeRegistry({ x: ['1.0.0', '1.0.1', '1.0.2'] });
+    const { plan: p } = await plan([vuln(g, 'x@1.0.0', [advR('A', [{ introduced: '0', lastAffected: '1.0.1' }])])], reg);
+    expect(p.actions[0]).toMatchObject({ kind: 'upgrade-direct', to: '1.0.2' });
+  });
+
+  it('no published version outside every affected range → unfixable (+ remove for a direct dep)', async () => {
+    const g = graph('npm', 'package-lock.json', [{ name: 'x', version: '1.1.0', direct: true }]);
+    // A is fixed in 1.2.0 but everything from 1.3.0 on is affected again; B needs >= 1.3.0.
+    const a = advR('A', [{ introduced: '0', fixed: '1.2.0' }, { introduced: '1.3.0' }]);
+    const reg = new FakeRegistry({ x: ['1.1.0', '1.2.0', '1.3.0', '1.4.0'] });
+    const { plan: p } = await plan([vuln(g, 'x@1.1.0', [a, B()])], reg);
+    expect(p.actions.map((x) => x.kind)).toEqual(['remove']);
+    expect(p.unfixable).toHaveLength(1);
+    expect(p.unfixable[0]!.advisoryIds).toEqual(['A', 'B']);
+  });
+
+  it('upgrade-parent: a parent release whose resolved child is still affected is skipped', async () => {
+    const g = graph('npm', 'package-lock.json', [
+      { name: 'p', version: '1.0.0', direct: true },
+      { name: 'c', version: '1.1.0', parents: ['p@1.0.0'] },
+    ]);
+    const versions = { p: ['1.0.0', '1.1.0', '1.2.0'], c: ['1.1.0', '1.2.0', '1.3.0', '1.3.1', '1.3.2'] };
+    // ~1.3.0 resolves to 1.3.2 (clean).
+    const reg = new FakeRegistry(versions, { 'p@1.0.0': { c: '~1.1.0' }, 'p@1.1.0': { c: '~1.3.0' }, 'p@1.2.0': { c: '^1.3.2' } });
+    // >=1.3.0 <1.3.2 resolves to 1.3.1 (regression-affected by A) although it is >= B's fix.
+    const reg2 = new FakeRegistry(versions, { 'p@1.0.0': { c: '~1.1.0' }, 'p@1.1.0': { c: '>=1.3.0 <1.3.2' }, 'p@1.2.0': { c: '^1.3.2' } });
+    const r1 = await plan([vuln(g, 'c@1.1.0', [A(), B()])], reg);
+    expect(r1.plan.actions[0]).toMatchObject({ kind: 'upgrade-parent', package: 'p', to: '1.1.0' });
+    const r2 = await plan([vuln(g, 'c@1.1.0', [A(), B()])], reg2);
+    expect(r2.plan.actions[0]).toMatchObject({ kind: 'upgrade-parent', package: 'p', to: '1.2.0' });
+  });
+});
+
+describe('safeUpgradeVersion / isAffected', () => {
+  it('isAffected follows intervals, explicit versions, and reports unknown without data', async () => {
+    const { isAffected } = await import('../src/analyzers/dependencies/osv/normalize');
+    const a = { affectedRanges: [{ introduced: '1.0.0', fixed: '1.2.0' }, { introduced: '2.0.0', lastAffected: '2.0.3' }] };
+    expect(isAffected('npm', '0.9.0', a)).toBe(false);
+    expect(isAffected('npm', '1.1.9', a)).toBe(true);
+    expect(isAffected('npm', '1.2.0', a)).toBe(false);
+    expect(isAffected('npm', '2.0.3', a)).toBe(true);
+    expect(isAffected('npm', '2.0.4', a)).toBe(false);
+    expect(isAffected('npm', '3.0.0', { affectedRanges: [], affectedVersions: ['3.0.0'] })).toBe(true);
+    expect(isAffected('npm', '3.0.1', { affectedRanges: [], affectedVersions: ['3.0.0'] })).toBe(false);
+    expect(isAffected('npm', '3.0.1', { affectedRanges: [] })).toBeNull();
+  });
+
+  it('dependency.fixedIn helper (no registry) picks the smallest candidate clean for every advisory', async () => {
+    const { safeUpgradeVersion } = await import('../src/analyzers/dependencies/fixPlan');
+    const A = advR('A', [{ introduced: '0', fixed: '1.2.0' }, { introduced: '1.3.0', fixed: '1.3.2' }]);
+    const B = advR('B', [{ introduced: '0', fixed: '1.3.0' }]);
+    expect(safeUpgradeVersion('npm', '1.1.0', [A, B])).toEqual({ version: '1.3.2', verified: false });
+    expect(safeUpgradeVersion('npm', '1.1.0', [A])).toEqual({ version: '1.2.0', verified: false });
+    expect(safeUpgradeVersion('npm', '1.1.0', [A, B], ['1.1.0', '1.3.1', '1.3.5'])).toEqual({ version: '1.3.5', verified: true });
+    expect(safeUpgradeVersion('npm', '1.1.0', [advR('C', [{ introduced: '0' }])])).toBeNull();
   });
 });

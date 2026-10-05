@@ -19,7 +19,7 @@ function graph(eco: Ecosystem, nodes: DepNode[], edges: [string, string][] = [])
 function adv(over: Partial<OsvAdvisory> = {}): OsvAdvisory {
   return {
     id: 'GHSA-1', aliases: [], summary: 'Prototype pollution', details: '', severity: 'high', cvss: 7.5, cvssVector: null,
-    fixedVersions: ['4.17.21'], affectedSymbols: [], cwes: [], url: null, published: null, malicious: false, ...over,
+    fixedVersions: ['4.17.21'], affectedRanges: [], affectedSymbols: [], cwes: [], url: null, published: null, malicious: false, ...over,
   };
 }
 

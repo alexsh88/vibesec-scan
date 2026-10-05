@@ -11,7 +11,7 @@ function graph(eco: Ecosystem, nodes: DepNode[]): DepGraph {
 }
 
 function adv(id: string, malicious = false): OsvAdvisory {
-  return { id, aliases: [], summary: 's', details: '', severity: 'critical', cvss: null, cvssVector: null, fixedVersions: [], affectedSymbols: [], cwes: [], url: null, published: null, malicious };
+  return { id, aliases: [], summary: 's', details: '', severity: 'critical', cvss: null, cvssVector: null, fixedVersions: [], affectedRanges: [], affectedSymbols: [], cwes: [], url: null, published: null, malicious };
 }
 
 describe('supplyChainSignals', () => {

@@ -5,7 +5,7 @@
  * given version, normalizes to `null` rather than throwing.
  */
 import { z } from 'zod';
-import type { Ecosystem, OsvAdvisory, Severity } from '../types';
+import type { AffectedRange, Ecosystem, OsvAdvisory, Severity } from '../types';
 import { compareVersions, isValidVersion } from '../versions';
 import { cvssV3Score, cvssV4Score, severityFromScore } from './cvss';
 
@@ -141,6 +141,58 @@ function isVersionAffected(eco: Ecosystem, version: string, affected: AffectedEn
   return isVersionInRanges(eco, version, usableRanges);
 }
 
+/** The advisory's affected intervals for this package, in our serializable shape. An entry with no
+ *  usable ranges and no explicit versions list means "every version" (see isVersionAffected). */
+function collectAffected(matched: readonly AffectedEntry[]): { ranges: AffectedRange[]; versions: string[] | undefined } {
+  const ranges: AffectedRange[] = [];
+  let versions: string[] | undefined;
+  for (const a of matched) {
+    if (a.versions !== undefined) versions = [...(versions ?? []), ...a.versions];
+    const usable = (a.ranges ?? []).filter((r) => r.type === 'SEMVER' || r.type === 'ECOSYSTEM');
+    if (usable.length === 0 && a.versions === undefined) {
+      ranges.push({ introduced: '0' });
+      continue;
+    }
+    for (const r of usable) {
+      for (const iv of buildIntervals(r.events)) {
+        ranges.push({
+          introduced: iv.from ?? '0',
+          ...(iv.toExclusive !== undefined ? { fixed: iv.toExclusive } : {}),
+          ...(iv.toInclusive !== undefined ? { lastAffected: iv.toInclusive } : {}),
+        });
+      }
+    }
+  }
+  return { ranges, versions: versions === undefined ? undefined : dedupe(versions) };
+}
+
+function inRange(eco: Ecosystem, version: string, r: AffectedRange): boolean {
+  if (r.introduced !== '0') {
+    const c = safeCompare(eco, version, r.introduced);
+    if (c === null || c < 0) return false;
+  }
+  if (r.fixed !== undefined) {
+    const c = safeCompare(eco, version, r.fixed);
+    if (c === null || c >= 0) return false;
+  }
+  if (r.lastAffected !== undefined) {
+    const c = safeCompare(eco, version, r.lastAffected);
+    if (c === null || c > 0) return false;
+  }
+  return true;
+}
+
+/**
+ * Whether `version` is affected by `advisory` (per its OSV intervals / explicit versions list).
+ * null = unknown (no interval data, e.g. a synthetic advisory): callers fall back to fixedVersions.
+ */
+export function isAffected(eco: Ecosystem, version: string, advisory: Pick<OsvAdvisory, 'affectedRanges' | 'affectedVersions'>): boolean | null {
+  const ranges = advisory.affectedRanges ?? [];
+  if (advisory.affectedVersions?.includes(version)) return true;
+  if (ranges.length === 0) return advisory.affectedVersions !== undefined ? false : null;
+  return ranges.some((r) => inRange(eco, version, r));
+}
+
 function dedupeSortedVersions(eco: Ecosystem, versions: readonly string[]): string[] {
   const unique = [...new Set(versions)].filter((v) => isValidVersion(eco, v));
   unique.sort((a, b) => compareVersions(eco, a, b));
@@ -267,6 +319,7 @@ export function normalizeOsv(record: unknown, pkg: { ecosystem: Ecosystem; name:
   );
 
   const { severity, cvss, cvssVector } = computeSeverity(rec.severity ?? [], rec.database_specific);
+  const affected = collectAffected(matched);
 
   return {
     id: rec.id,
@@ -277,6 +330,8 @@ export function normalizeOsv(record: unknown, pkg: { ecosystem: Ecosystem; name:
     cvss,
     cvssVector,
     fixedVersions,
+    affectedRanges: affected.ranges,
+    ...(affected.versions !== undefined ? { affectedVersions: affected.versions } : {}),
     affectedSymbols: dedupe(matched.flatMap((a) => extractSymbols(a))),
     cwes: extractCwes(rec.database_specific),
     url: pickUrl(rec.references ?? []),

@@ -70,7 +70,7 @@ const BASE_EDGES: ImportEdge[] = [
 
 function adv(id: string, severity: OsvAdvisory['severity'], fixedVersions: string[], extra: Partial<OsvAdvisory> = {}): OsvAdvisory {
   return {
-    id, aliases: [], summary: `${id} summary`, details: '', severity, cvss: null, cvssVector: null, fixedVersions,
+    id, aliases: [], summary: `${id} summary`, details: '', severity, cvss: null, cvssVector: null, fixedVersions, affectedRanges: [],
     affectedSymbols: [], cwes: [], url: `https://osv.dev/${id}`, published: null, malicious: id.startsWith('MAL-'), ...extra,
   };
 }

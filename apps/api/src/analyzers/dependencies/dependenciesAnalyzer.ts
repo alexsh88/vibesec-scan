@@ -30,7 +30,7 @@ import type { FixPlanRepo } from '../../db/fixPlanRepo';
 import type { LlmClient } from '../../llm/LlmClient';
 import type { DockerSandbox } from '../../sandbox/dockerSandbox';
 import type { Analyzer, AnalyzerContext } from '../types';
-import { buildFixPlan, type VulnerablePackage } from './fixPlan';
+import { buildFixPlan, safeUpgradeVersion, type VulnerablePackage } from './fixPlan';
 import { importNamesFor, packageForImport } from './importNames';
 import { normalizePypiName, parseDependencyGraphs, pathsTo } from './lockfiles';
 import type { OsvClient } from './osv/osvClient';
@@ -293,29 +293,19 @@ export function computeSeverity(
 
 // --- advisories ------------------------------------------------------------------------------
 
-function minFixAbove(eco: Ecosystem, current: string, fixed: readonly string[]): string | null {
-  const cur = isValidVersion(eco, current);
-  const fixes = fixed.filter((f) => isValidVersion(eco, f) && (!cur || compareVersions(eco, f, current) > 0));
-  fixes.sort((a, b) => compareVersions(eco, a, b));
-  return fixes[0] ?? null;
-}
-
 function toSharedAdvisory(eco: Ecosystem, version: string, a: OsvAdvisory): Advisory {
   return {
     id: a.id, aliases: a.aliases, summary: truncate(a.summary || a.details.split('\n')[0] || a.id, MAX_SUMMARY),
-    severity: a.severity, cvss: a.cvss, fixedIn: minFixAbove(eco, version, a.fixedVersions), url: a.url,
+    severity: a.severity, cvss: a.cvss, fixedIn: safeUpgradeVersion(eco, version, [a])?.version ?? null, url: a.url,
   };
 }
 
-/** Version fixing every advisory (max of the per-advisory minimal fixes); undefined if any has no fix. */
+/**
+ * Smallest advisory fix version above `version` that is outside EVERY advisory's affected ranges
+ * (not just the max of per-advisory fixes, which can land in a regression range); undefined if none.
+ */
 function coveringFix(eco: Ecosystem, version: string, advisories: readonly OsvAdvisory[]): string | undefined {
-  let target: string | undefined;
-  for (const a of advisories) {
-    const min = minFixAbove(eco, version, a.fixedVersions);
-    if (min === null) return undefined;
-    if (target === undefined || compareVersions(eco, min, target) > 0) target = min;
-  }
-  return target;
+  return safeUpgradeVersion(eco, version, advisories)?.version;
 }
 
 const bySeverityDesc = (a: OsvAdvisory, b: OsvAdvisory): number =>

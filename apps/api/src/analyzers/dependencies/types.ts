@@ -49,6 +49,8 @@ export type DepGraph = {
 
 export type Severity = 'critical' | 'high' | 'medium' | 'low' | 'info';
 
+export type AffectedRange = { introduced: string; fixed?: string; lastAffected?: string };
+
 /** A normalized OSV advisory as it applies to one package. */
 export type OsvAdvisory = {
   id: string;                 // GHSA-…, PYSEC-…, MAL-…, CVE-…
@@ -60,6 +62,14 @@ export type OsvAdvisory = {
   cvssVector: string | null;
   /** Fixed versions for this package (ascending, ecosystem-ordered); empty when no fix exists. */
   fixedVersions: string[];
+  /**
+   * Affected intervals for this package (OSV SEMVER/ECOSYSTEM ranges, one entry per introduced→fixed /
+   * last_affected pair; introduced '0' = from the beginning, no fixed/lastAffected = still affected).
+   * Empty (with no `affectedVersions`) = unknown: callers fall back to `fixedVersions`.
+   */
+  affectedRanges: AffectedRange[];
+  /** Explicit OSV `versions` list (affected iff listed, in addition to the ranges). */
+  affectedVersions?: string[];
   /** Function/module/symbol names the advisory points at, when OSV provides them (ecosystem_specific / database_specific). */
   affectedSymbols: string[];
   cwes: string[];

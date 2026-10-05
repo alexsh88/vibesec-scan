@@ -237,3 +237,19 @@ describe('OsvClient', () => {
     expect(errors[0]).toContain(pkg.key);
   });
 });
+
+describe('normalizeOsv — affected intervals', () => {
+  it('keeps every introduced/fixed/last_affected interval and explicit versions', () => {
+    const rec = {
+      id: 'GHSA-multi',
+      affected: [{
+        package: { ecosystem: 'npm', name: 'x' },
+        ranges: [{ type: 'SEMVER', events: [{ introduced: '0' }, { fixed: '1.2.0' }, { introduced: '1.3.0' }, { last_affected: '1.3.1' }] }],
+        versions: ['1.1.0'],
+      }],
+    };
+    const a = normalizeOsv(rec, { ecosystem: 'npm', name: 'x', version: '1.1.0' })!;
+    expect(a.affectedRanges).toEqual([{ introduced: '0', fixed: '1.2.0' }, { introduced: '1.3.0', lastAffected: '1.3.1' }]);
+    expect(a.affectedVersions).toEqual(['1.1.0']);
+  });
+});

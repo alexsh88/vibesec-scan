@@ -3,8 +3,10 @@
  * concrete changes. Advisories are aggregated per action, so one upgrade lists everything it fixes
  * ("fixing X also fixes Y and Z") with the total risk it removes.
  *
- * Per vulnerable node: target = max over advisories of the smallest fixed version above the
- * installed one, snapped to the smallest published stable release >= target. Direct deps get an
+ * Per vulnerable node: target = the smallest published stable release above the installed one that
+ * is affected by NONE of the package's advisories (checked against every OSV affected interval, so
+ * multi-range advisories and regressions are honoured); without registry data, the smallest advisory
+ * fixed version passing the same interval check (noted as unverified). Direct deps get an
  * 'upgrade-direct'; transitive deps with a single direct parent get an 'upgrade-parent' when some
  * newer parent release pulls in a fixed child; otherwise an 'override' (a lockfile refresh when the
  * intermediate parents' current ranges already admit the fix, else a pin/override snippet).
@@ -15,8 +17,9 @@ import type { FixAction, FixPlan, FixResolves, Unfixable } from '@vibesec/shared
 import { AppError } from '../../errors/AppError';
 import { pathsTo } from './lockfiles';
 import type { RegistryClient } from './registry';
+import { isAffected } from './osv/normalize';
 import type { DepGraph, DepNode, Ecosystem, FixActionKind, OsvAdvisory } from './types';
-import { compareVersions, isValidVersion, minVersionAtLeast, satisfies, semverJump } from './versions';
+import { compareVersions, isValidVersion, maxSatisfying, minVersionAtLeast, satisfies, semverJump } from './versions';
 
 export type VulnerablePackage = {
   findingId: string;
@@ -120,6 +123,58 @@ function errText(err: unknown): string {
 function actionId(scanId: string, d: Pick<Draft, 'ecosystem' | 'manifestDir' | 'kind' | 'package'>): string {
   const h = createHash('sha256').update(`${scanId}|${d.ecosystem}|${d.manifestDir}|${d.kind}|${d.package}`).digest('hex');
   return `fx_${h.slice(0, 20)}`;
+}
+
+// ---------- safe target versions ----------
+
+/** Smallest of `fixed` strictly above `current` (any fix when `current` isn't a valid version). */
+export function minFixAbove(eco: Ecosystem, current: string, fixed: readonly string[]): string | null {
+  const cur = isValidVersion(eco, current);
+  const fixes = fixed.filter((f) => isValidVersion(eco, f) && (!cur || compareVersions(eco, f, current) > 0));
+  fixes.sort((a, b) => compareVersions(eco, a, b));
+  return fixes[0] ?? null;
+}
+
+/**
+ * True when `candidate` is affected by none of `advisories`. An advisory without interval data
+ * (isAffected → null) falls back to "candidate >= its smallest fix above the installed version".
+ */
+export function isCleanVersion(eco: Ecosystem, current: string, candidate: string, advisories: readonly OsvAdvisory[]): boolean {
+  if (!isValidVersion(eco, candidate)) return false;
+  for (const a of advisories) {
+    const hit = isAffected(eco, candidate, a);
+    if (hit === true) return false;
+    if (hit === null) {
+      const min = minFixAbove(eco, current, a.fixedVersions);
+      if (min === null || compareVersions(eco, candidate, min) < 0) return false;
+    }
+  }
+  return true;
+}
+
+/**
+ * Smallest version above `current` that is affected by none of `advisories`:
+ *   - with `published` (registry versions): the smallest stable published release → verified;
+ *   - without: the smallest advisory fixed version passing the interval check → unverified (it may
+ *     not be a published release).
+ * null when no such version exists.
+ */
+export function safeUpgradeVersion(
+  eco: Ecosystem, current: string, advisories: readonly OsvAdvisory[], published?: readonly string[],
+): { version: string; verified: boolean } | null {
+  const curValid = isValidVersion(eco, current);
+  const above = (v: string): boolean => isValidVersion(eco, v) && (!curValid || compareVersions(eco, v, current) > 0);
+  const pool = published !== undefined
+    ? published.filter((v) => above(v) && isStable(eco, v))
+    : [...new Set(advisories.flatMap((a) => [...a.fixedVersions, ...(a.affectedRanges ?? []).flatMap((r) => (r.fixed !== undefined ? [r.fixed] : []))]))].filter(above);
+  pool.sort((a, b) => compareVersions(eco, a, b));
+  for (const v of pool) if (isCleanVersion(eco, current, v, advisories)) return { version: v, verified: published !== undefined };
+  return null;
+}
+
+/** Whether a fix can exist at all (some fixed version, or an interval that closes). */
+function mayBeFixable(a: OsvAdvisory): boolean {
+  return a.fixedVersions.length > 0 || (a.affectedRanges ?? []).some((r) => r.fixed !== undefined || r.lastAffected !== undefined);
 }
 
 // ---------- commands ----------
@@ -228,23 +283,26 @@ export async function buildFixPlan(input: BuildFixPlanInput): Promise<{ plan: Fi
     const eco = graph.ecosystem;
     const pm = packageManager(eco, graph.lockfile);
     const current = node.version;
-    const currentValid = isValidVersion(eco, current);
 
-    // 1. per-advisory minimal fix above the installed version
-    let target: string | null = null;
-    const fixable: OsvAdvisory[] = [];
+    // 1. smallest version above the installed one that is outside every advisory's affected ranges
+    const childVersions = v.advisories.some(mayBeFixable) ? await versionsOf(eco, node.name) : undefined;
+    let fixable: OsvAdvisory[] = [];
     const notFixable: { adv: OsvAdvisory; reason: string }[] = [];
     for (const a of v.advisories) {
-      const fixes = a.fixedVersions.filter((f) => isValidVersion(eco, f) && (!currentValid || compareVersions(eco, f, current) > 0));
-      fixes.sort((x, y) => compareVersions(eco, x, y));
-      const min = fixes[0];
-      if (min === undefined) {
-        notFixable.push({ adv: a, reason: a.fixedVersions.length === 0 ? 'no fixed version published' : 'no fixed version above the installed one' });
-        continue;
-      }
-      fixable.push(a);
-      target = target === null ? min : maxVersion(eco, target, min);
+      if (safeUpgradeVersion(eco, current, [a], childVersions) !== null) { fixable.push(a); continue; }
+      const reason = !mayBeFixable(a)
+        ? 'no fixed version published'
+        : childVersions !== undefined ? 'no published release outside the affected ranges' : 'no fixed version above the installed one';
+      notFixable.push({ adv: a, reason });
     }
+    let pick = fixable.length > 0 ? safeUpgradeVersion(eco, current, fixable, childVersions) : null;
+    if (fixable.length > 0 && pick === null) {
+      // Each advisory is fixable on its own, but no single version escapes all of them (e.g. a regression).
+      for (const a of fixable) notFixable.push({ adv: a, reason: 'no single version is outside every affected range' });
+      fixable = [];
+      pick = null;
+    }
+    const target: string | null = pick?.version ?? null;
 
     if (notFixable.length > 0) {
       const key = `${eco}|${node.name}@${current}`;
@@ -270,17 +328,9 @@ export async function buildFixPlan(input: BuildFixPlanInput): Promise<{ plan: Fi
       continue;
     }
 
-    // Snap to the smallest published stable release >= target.
     const notes: string[] = [];
-    const childVersions = await versionsOf(eco, node.name);
-    let to = target;
-    if (childVersions === undefined) {
-      notes.push(`Target ${target} taken from the advisory (registry unavailable)`);
-    } else {
-      const published = minVersionAtLeast(eco, childVersions, target);
-      if (published === null) notes.push(`No published stable release >= ${target} found; using the advisory version`);
-      else to = published;
-    }
+    const to = target;
+    if (pick?.verified !== true) notes.push(`Target ${target} taken from the advisory (registry unavailable; unverified against registry)`);
     const resolves = resolvesOf(fixable);
 
     // 2. direct dependency
@@ -290,10 +340,16 @@ export async function buildFixPlan(input: BuildFixPlanInput): Promise<{ plan: Fi
     }
 
     // 3. transitive
+    // A parent range "admits" the fix when the version a fresh resolution would pick (the highest
+    // stable release satisfying it) is outside every affected range — not merely >= some fix.
     const childAdmits = (range: string): boolean => {
-      if (range.trim() === '' || range.trim() === '*') return true;
-      if (childVersions === undefined) return satisfies(eco, to, range);
-      return childVersions.some((cv) => isStable(eco, cv) && isValidVersion(eco, cv) && compareVersions(eco, cv, to) >= 0 && satisfies(eco, cv, range));
+      const trivial = range.trim() === '' || range.trim() === '*';
+      if (childVersions === undefined) return trivial || satisfies(eco, to, range);
+      const stable = childVersions.filter((cv) => isValidVersion(eco, cv) && isStable(eco, cv));
+      const resolved = trivial
+        ? stable.reduce<string | null>((m, cv) => (m === null || compareVersions(eco, cv, m) > 0 ? cv : m), null)
+        : maxSatisfying(eco, stable, range);
+      return resolved !== null && isCleanVersion(eco, current, resolved, fixable);
     };
     const labelMap = new Map<string, DepNode>();
     for (const n of graph.nodes.values()) labelMap.set(`${n.name}@${n.version}`, n);
