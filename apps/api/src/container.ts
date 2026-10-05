@@ -11,6 +11,8 @@ import { SecretVerifier } from './analyzers/credentials/verifiers';
 import { createDependenciesAnalyzer } from './analyzers/dependencies/dependenciesAnalyzer';
 import { OsvClient } from './analyzers/dependencies/osv/osvClient';
 import { dependencyReachabilityMockResponder } from './analyzers/dependencies/reachabilityJudge';
+import { skepticMockResponder } from './findings/skeptic';
+import { synthesisMockResponder } from './synthesis/synthesisPrompt';
 import { RegistryClient } from './analyzers/dependencies/registry';
 import { AdvisoryCacheRepo } from './db/advisoryCacheRepo';
 import { CoverageRepo } from './db/coverageRepo';
@@ -75,7 +77,9 @@ export type ContainerOverrides = {
 export const MOCK_RESPONDERS: MockResponder[] = [
   credentialsFpMockResponder, dependencyReachabilityMockResponder, codeTriageMockResponder, sastMockResponder,
   taintMockResponder, qualityMockResponder, configMockResponder, credentialHunterMockResponder,
+  skepticMockResponder, synthesisMockResponder,
 ];
+
 
 /** Composition root: the only place that wires concrete implementations together. */
 export function createContainer(config: Config, overrides: ContainerOverrides = {}): Container {
@@ -143,7 +147,7 @@ export function createContainer(config: Config, overrides: ContainerOverrides = 
 
   const pipeline = overrides.pipeline ?? createScanPipeline({
     git, github, scans, indexRepo, indexer, maxRepoBytes: config.maxRepoBytes, maxFiles: config.maxFiles,
-    analyzers, findings, coverage: new CoverageRepo(db),
+    analyzers, findings, coverage: new CoverageRepo(db), fixPlans, summaries, llm, suppressions,
     onFinished: (scanId) => {
       budget.forget(scanId);
       triage.forget(scanId);

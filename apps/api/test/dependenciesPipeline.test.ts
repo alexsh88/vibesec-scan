@@ -37,7 +37,9 @@ import { BudgetTracker } from '../src/llm/budget';
 import { createTransport } from '../src/llm/createTransport';
 import { LlmClient } from '../src/llm/LlmClient';
 import { RateLimiter, Semaphore } from '../src/llm/rateLimiter';
+import { skepticMockResponder } from '../src/findings/skeptic';
 import { createScanPipeline } from '../src/pipeline/scanPipeline';
+import { synthesisMockResponder } from '../src/synthesis/synthesisPrompt';
 import { ScanLifecycle } from '../src/scans/ScanLifecycle';
 import { ScanService } from '../src/scans/ScanService';
 import { SuppressionRepo } from '../src/suppressions/suppressionRepo';
@@ -45,6 +47,7 @@ import { SuppressionService } from '../src/suppressions/suppressionService';
 import { createFixtureRepo, type FixtureRepo } from './fixtures/gitRepo';
 import { npmProject } from './fixtures/npmProject';
 import { memoryDb } from './helpers';
+import { pipelineDeps } from './pipelineDeps';
 
 // ---------- fixture repo ----------
 
@@ -189,7 +192,7 @@ beforeAll(async () => {
   const llmCalls = new LlmCallRepo(db);
   const budget = new BudgetTracker(config.scanBudgetUsd, (id) => scans.getDto(id)?.costUsd ?? 0);
   const llm = new LlmClient({
-    transport: createTransport(config, [credentialsFpMockResponder, dependencyReachabilityMockResponder]),
+    transport: createTransport(config, [credentialsFpMockResponder, dependencyReachabilityMockResponder, skepticMockResponder, synthesisMockResponder]),
     models: config.models,
     limiter: new RateLimiter({ requestsPerMinute: config.llmRequestsPerMinute, inputTokensPerMinute: config.llmInputTokensPerMinute }),
     semaphore: new Semaphore(config.llmConcurrency),
@@ -207,6 +210,7 @@ beforeAll(async () => {
   ];
   const pipeline = createScanPipeline({
     git, github, scans, indexRepo, indexer, maxRepoBytes: 1024 * 1024 * 1024, maxFiles: 10_000, analyzers, findings,
+    ...pipelineDeps({ db, scans, findings, audit, llm, llmCalls, fixPlans }),
     onFinished: (id) => { budget.forget(id); verifier.forget(id); },
   });
   runner = new JobRunner({
@@ -266,7 +270,12 @@ describe('dependencies analyzer, end to end through the real pipeline', () => {
     const qs = vuln('qs')[0]!;
     expect(qs.dependency).toMatchObject({ direct: false, reachability: 'unknown', paths: [['express@4.17.1', 'qs@6.7.0']] });
     expect(qs.severity).toBe('medium');
-    expect(vuln('send')[0]!.severity).toBe('low');
+    // The analyzer rated it low (transitive, reachability unknown); the SCORING stage now re-scores every
+    // finding from its base severity with the risk factors, which keeps it at or below its base severity.
+    const send = vuln('send')[0]!;
+    expect(send.dependency).toMatchObject({ direct: false, reachability: 'unknown' });
+    expect(['low', 'medium']).toContain(send.severity);
+    expect(send.baseSeverity).toBe('medium');
 
     const minimist = vuln('minimist')[0]!;
     expect(minimist.dependency).toMatchObject({ scope: 'dev', reachability: 'unreachable' });

@@ -1,3 +1,6 @@
+import { readdirSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 import { ScanRepo } from '../src/db/scanRepo';
 import { EventRepo } from '../src/db/eventRepo';
@@ -16,7 +19,9 @@ function seed() {
 describe('migrations', () => {
   it('sets user_version to latest', () => {
     const db = memoryDb();
-    expect(db.pragma('user_version', { simple: true })).toBe(9);
+    const latest = Math.max(...readdirSync(join(dirname(fileURLToPath(import.meta.url)), '..', 'src', 'db', 'migrations'))
+      .filter((f) => /^\d{3}_.+\.sql$/.test(f)).map((f) => Number(f.slice(0, 3))));
+    expect(db.pragma('user_version', { simple: true })).toBe(latest);
   });
 });
 

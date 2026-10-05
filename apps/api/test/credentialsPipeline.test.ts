@@ -33,7 +33,9 @@ import { createTransport } from '../src/llm/createTransport';
 import { LlmClient } from '../src/llm/LlmClient';
 import { RateLimiter, Semaphore } from '../src/llm/rateLimiter';
 import { BudgetTracker } from '../src/llm/budget';
+import { skepticMockResponder } from '../src/findings/skeptic';
 import { createScanPipeline } from '../src/pipeline/scanPipeline';
+import { synthesisMockResponder } from '../src/synthesis/synthesisPrompt';
 import { ScanLifecycle } from '../src/scans/ScanLifecycle';
 import { ScanService } from '../src/scans/ScanService';
 import { SuppressionRepo } from '../src/suppressions/suppressionRepo';
@@ -41,6 +43,7 @@ import { SuppressionService } from '../src/suppressions/suppressionService';
 import { fake } from './fakeCredentials';
 import { createFixtureRepo, type FixtureRepo } from './fixtures/gitRepo';
 import { memoryDb } from './helpers';
+import { pipelineDeps } from './pipelineDeps';
 
 const GITHUB_TOKEN = fake.github();
 const STRIPE_KEY = fake.stripeLive();
@@ -93,7 +96,7 @@ beforeAll(async () => {
   const llmCalls = new LlmCallRepo(db);
   const budget = new BudgetTracker(config.scanBudgetUsd, (id) => scans.getDto(id)?.costUsd ?? 0);
   const llm = new LlmClient({
-    transport: createTransport(config, [credentialsFpMockResponder]),
+    transport: createTransport(config, [credentialsFpMockResponder, skepticMockResponder, synthesisMockResponder]),
     models: config.models,
     limiter: new RateLimiter({ requestsPerMinute: config.llmRequestsPerMinute, inputTokensPerMinute: config.llmInputTokensPerMinute }),
     semaphore: new Semaphore(config.llmConcurrency),
@@ -115,7 +118,7 @@ beforeAll(async () => {
   const analyzers = [createCredentialsAnalyzer({ llm, git, verifier })];
   const pipeline = createScanPipeline({
     git, github, scans, indexRepo, indexer, maxRepoBytes: 1024 * 1024 * 1024, maxFiles: 10_000,
-    analyzers, findings,
+    analyzers, findings, ...pipelineDeps({ db, scans, findings, audit, llm, llmCalls }),
     onFinished: (id) => { budget.forget(id); verifier.forget(id); },
   });
 

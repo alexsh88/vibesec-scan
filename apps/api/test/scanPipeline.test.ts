@@ -4,7 +4,7 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
-import { ScanOptionsSchema } from '@vibesec/shared';
+import { ScanOptionsSchema, type Finding } from '@vibesec/shared';
 import { AuditLogger } from '../src/audit/AuditLogger';
 import { EventRepo } from '../src/db/eventRepo';
 import { FindingRepo } from '../src/db/findingRepo';
@@ -17,10 +17,21 @@ import type { RepoMeta } from '../src/github/GitHubClient';
 import { RepoIndexer } from '../src/index/RepoIndexer';
 import { JobRunner } from '../src/jobs/JobRunner';
 import { createScanPipeline } from '../src/pipeline/scanPipeline';
-import { createStubPipeline } from '../src/pipeline/stubPipeline';
+import type { LlmClient } from '../src/llm/LlmClient';
+import type { PipelineContext } from '../src/pipeline/types';
 import { ScanLifecycle } from '../src/scans/ScanLifecycle';
 import { createFixtureRepo, type FixtureRepo } from './fixtures/gitRepo';
 import { memoryDb } from './helpers';
+import { pipelineDeps } from './pipelineDeps';
+
+/** A structured-output LLM that answers every call with a minimal valid scan summary (no analyzers → nothing else asks). */
+const summaryLlm = {
+  structured: async () => ({
+    output: { riskGrade: 'A', headline: 'No significant security findings', overview: 'Nothing to report.', topRisks: [], nextActions: [], positiveObservations: [] },
+    model: 'claude-test', usage: { inputTokens: 1, outputTokens: 1, cacheReadTokens: 0, cacheWriteTokens: 0 }, costUsd: 0, callIds: ['c'],
+    degraded: false, fellBackOnRefusal: false,
+  }),
+} as never as Pick<LlmClient, 'structured'>;
 
 let repo: FixtureRepo;
 let workDir: string;
@@ -49,17 +60,20 @@ function setup(opts: { meta?: Partial<RepoMeta> | AppError; maxRepoBytes?: numbe
   const audit = new AuditLogger(db);
   const lifecycle = new ScanLifecycle(scans, bus, db, audit);
   const indexRepo = new IndexRepo(db);
+  const findings = new FindingRepo(db);
   const github = {
     getRepo: vi.fn(async (): Promise<RepoMeta> => {
       if (opts.meta instanceof AppError) throw opts.meta;
       return { isPrivate: false, defaultBranch: 'main', sizeBytes: 1_000, htmlUrl: '', archived: false, ...opts.meta };
     }),
   };
+  const p7 = pipelineDeps({ db, scans, findings, audit, llm: summaryLlm });
   const pipeline = createScanPipeline({
     git, github, scans, indexRepo,
     indexer: new RepoIndexer(git, { maxFiles: 1_000, maxFileBytes: 1024 * 1024 }),
     maxRepoBytes: opts.maxRepoBytes ?? 1024 * 1024 * 1024, maxFiles: 1_000,
-    stub: createStubPipeline(1), retryDeps: { sleep: async () => {} },
+    analyzers: [], findings, ...p7,
+    retryDeps: { sleep: async () => {} },
   });
   const runner = new JobRunner({
     scans, lifecycle, bus, audit, pipeline,
@@ -70,7 +84,7 @@ function setup(opts: { meta?: Partial<RepoMeta> | AppError; maxRepoBytes?: numbe
     repoId: repoRecord.id, ref, options: ScanOptionsSchema.parse({}), optionsHash: randomUUID(), idempotencyKey: null, hasAuth: false,
   }).id;
   const run = async (id: string) => { runner.enqueue(id, {}); await runner.whenIdle(); return scans.getDto(id)!; };
-  return { scans, events, indexRepo, github, repoRecord, newScan, run };
+  return { scans, events, indexRepo, github, repoRecord, newScan, run, findings, pipeline, summaries: p7.summaries };
 }
 
 describe('scan pipeline (real git)', () => {
@@ -127,6 +141,37 @@ describe('scan pipeline (real git)', () => {
     expect(await run(newScan('nope'))).toMatchObject({ state: 'FAILED', errorCode: 'REF_NOT_FOUND' });
   });
 
+  it('resumes after ANALYZING: runs only VERIFYING → SCORING → SYNTHESIZING, and every one of them is idempotent', async () => {
+    const { newScan, run, scans, events, findings, pipeline, summaries } = setup();
+    const id = newScan();
+    const f: Finding = {
+      id: 'f-1', scanId: id, fingerprint: 'fp-1', category: 'secret', ruleId: 'secret/x', title: 'Hardcoded key',
+      baseSeverity: 'high', riskScore: 70, severity: 'high', riskFactors: [], confidence: 'high',
+      location: { file: 'src/db.ts', startLine: 1, endLine: 1, snippet: 'x', permalink: '' },
+      explanation: 'e', impact: 'i', remediation: { summary: 'r' }, scanStatus: 'new',
+    };
+    findings.replaceForAnalyzer(id, 'credentials', [f]);
+    scans.setCheckpoint(id, { completedStages: ['RESOLVING', 'CLONING', 'INDEXING', 'ANALYZING'], data: { commitSha: repo.shas[1] } });
+
+    const dto = await run(id);
+    expect(dto.state).toBe('COMPLETED');
+    const states = events.listAfter(id, 0).flatMap((e) => (e.event.type === 'state' ? [e.event.state] : []));
+    expect(states).toEqual(['VERIFYING', 'SCORING', 'SYNTHESIZING', 'COMPLETED']);
+    const after = findings.all(id);
+    expect(after).toHaveLength(1);
+    expect(after[0]!.finding.riskFactors.length + after[0]!.finding.riskScore).toBeGreaterThan(0);
+    expect(summaries.get(id)?.riskGrade).toBe('A');
+
+    // Re-running the post-analysis stages (as a crash + resume would) changes nothing.
+    const ctx: PipelineContext = {
+      scanId: id, scan: dto, secrets: {}, signal: new AbortController().signal, checkpointData: { commitSha: repo.shas[1] },
+      emit: () => {}, warn: () => {}, touch: () => {},
+    };
+    for (const name of ['VERIFYING', 'SCORING', 'SYNTHESIZING'] as const) await pipeline.stages.find((s) => s.name === name)!.run(ctx);
+    expect(findings.all(id)).toEqual(after);
+    expect(summaries.get(id)?.riskGrade).toBe('A');
+  }, 60_000);
+
   it('re-clones when resuming after CLONING with the workspace gone', async () => {
     const { newScan, run, scans, indexRepo } = setup();
     const id = newScan();
@@ -137,36 +182,17 @@ describe('scan pipeline (real git)', () => {
   }, 60_000);
 });
 
-describe('createScanPipeline ANALYZING stage selection', () => {
-  function minimalDeps() {
+describe('createScanPipeline stages', () => {
+  it('runs every real stage in order: RESOLVING → CLONING → INDEXING → ANALYZING → VERIFYING → SCORING → SYNTHESIZING', () => {
     const db = memoryDb();
     const scans = new ScanRepo(db);
-    const indexRepo = new IndexRepo(db);
-    const fakeGit = {
-      remoteUrl: () => '', resolveRef: async () => '0'.repeat(40), ensureCheckout: async () => '0'.repeat(40),
-      removeScanDir: async () => {}, repoDir: (id: string) => `/x/${id}`,
-    };
-    const fakeGithub = { getRepo: async () => ({ isPrivate: false, defaultBranch: 'main', sizeBytes: 0, htmlUrl: '', archived: false }) };
-    const fakeIndexer = {
-      index: async () => ({
-        files: [], imports: [], entrypoints: [],
-        stats: { totalFiles: 0, indexedFiles: 0, skipped: {}, byLanguage: {}, imports: 0, entrypoints: 0, truncated: false },
-      }),
-    };
-    return { git: fakeGit, github: fakeGithub, scans, indexRepo, indexer: fakeIndexer, maxRepoBytes: 1, maxFiles: 1 };
-  }
-
-  it('uses the real analyzer stage when both analyzers and findings are given', () => {
-    const deps = minimalDeps();
-    const pipeline = createScanPipeline({ ...deps, analyzers: [], findings: new FindingRepo(memoryDb()) });
-    const analyzing = pipeline.stages.find((s) => s.name === 'ANALYZING');
-    expect(analyzing?.fatal).toBe(true);
-  });
-
-  it('keeps the stub ANALYZING stage when analyzers/findings are not given', () => {
-    const deps = minimalDeps();
-    const pipeline = createScanPipeline(deps);
-    const analyzing = pipeline.stages.find((s) => s.name === 'ANALYZING');
-    expect(analyzing?.fatal).toBe(false);
+    const findings = new FindingRepo(db);
+    const pipeline = createScanPipeline({
+      git, github: { getRepo: vi.fn() }, scans, indexRepo: new IndexRepo(db),
+      indexer: new RepoIndexer(git, { maxFiles: 1, maxFileBytes: 1 }), maxRepoBytes: 1, maxFiles: 1,
+      analyzers: [], findings, ...pipelineDeps({ db, scans, findings, audit: new AuditLogger(db), llm: summaryLlm }),
+    });
+    expect(pipeline.stages.map((s) => s.name)).toEqual(['RESOLVING', 'CLONING', 'INDEXING', 'ANALYZING', 'VERIFYING', 'SCORING', 'SYNTHESIZING']);
+    expect(pipeline.stages.map((s) => s.fatal)).toEqual([true, true, true, true, false, false, false]);
   });
 });
