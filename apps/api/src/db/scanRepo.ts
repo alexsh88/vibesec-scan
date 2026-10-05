@@ -173,6 +173,10 @@ export class ScanRepo {
   listRepos(): RepoRecord[] {
     return (this.db.prepare(`SELECT * FROM repos ORDER BY created_at DESC`).all() as RepoRow[]).map(toRepo);
   }
+
+  addCost(scanId: string, usd: number): void {
+    this.db.prepare(`UPDATE scans SET cost_usd = cost_usd + ? WHERE id = ?`).run(usd, scanId);
+  }
 }
 
 function toRepo(row: RepoRow): RepoRecord {
