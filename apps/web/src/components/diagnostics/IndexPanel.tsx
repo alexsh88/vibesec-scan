@@ -1,7 +1,7 @@
 import { FolderTree } from 'lucide-react';
+import { Panel } from '@/components/common/Panel';
 import type { IndexStats, ScanIndex } from '@/lib/api';
 import { formatInt } from '@/lib/format';
-import { Panel } from './primitives';
 
 const SKIP_LABEL: Record<string, string> = {
   vendor: 'Vendored (node_modules, vendor/)',
@@ -32,14 +32,14 @@ export function IndexPanel({ stats, index }: { stats: IndexStats | null; index: 
     .filter(([, v]) => v > 0)
     .sort((a, b) => b[1] - a[1]);
   const skippedTotal = skipped.reduce((s, [, v]) => s + v, 0);
-  const truncated = (stats as IndexStats & { truncated?: boolean }).truncated === true;
+  const truncated = stats.truncated === true;
 
   return (
     <Panel
       id="index-h"
       icon={FolderTree}
       title="Repository index"
-      readout={`${formatInt(stats.indexedFiles)} / ${formatInt(stats.totalFiles)} files indexed`}
+      meta={`${formatInt(stats.indexedFiles)} / ${formatInt(stats.totalFiles)} files indexed`}
     >
       <div className="space-y-5">
         <dl className="grid grid-cols-3 gap-3">

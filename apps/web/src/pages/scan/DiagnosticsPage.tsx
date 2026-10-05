@@ -1,9 +1,11 @@
 import { CircleAlert, Clock3, Gauge, Info, Recycle, Timer, TriangleAlert, Wallet } from 'lucide-react';
 import { Link } from 'react-router';
+import { Meter } from '@/components/common/Meter';
+import { Panel } from '@/components/common/Panel';
 import { CoveragePanel } from '@/components/diagnostics/CoveragePanel';
 import { IndexPanel } from '@/components/diagnostics/IndexPanel';
 import { LlmUsagePanel } from '@/components/diagnostics/LlmUsagePanel';
-import { Meter, Panel, Readout } from '@/components/diagnostics/primitives';
+import { Readout } from '@/components/diagnostics/primitives';
 import { ErrorState } from '@/components/feedback/ErrorState';
 import { Page, PageHeader } from '@/components/layout/Page';
 import { Skeleton } from '@/components/ui/skeleton';
@@ -97,7 +99,7 @@ function BudgetPanel({ d, spent }: { d: Diagnostics; spent: number }) {
   const pct = (v: number) => (budget > 0 ? Math.min(100, (v / budget) * 100) : 0);
   const left = Math.max(0, budget - spent - reserved);
   return (
-    <Panel id="budget-h" icon={Wallet} title="Budget" readout={`${formatUsd(left)} left`}>
+    <Panel id="budget-h" icon={Wallet} title="Budget" meta={`${formatUsd(left)} left`}>
       <div className="space-y-4">
         <div className="flex items-baseline justify-between gap-2">
           <span className="font-mono text-3xl font-semibold tabular">{formatUsd(spent)}</span>
@@ -134,7 +136,7 @@ function BudgetPanel({ d, spent }: { d: Diagnostics; spent: number }) {
 function ReusePanel({ d }: { d: Diagnostics }) {
   const r = d.reuse;
   return (
-    <Panel id="reuse-h" icon={Recycle} title="Reuse from earlier scans" readout={`cache hit: ${d.cacheHit}`}>
+    <Panel id="reuse-h" icon={Recycle} title="Reuse from earlier scans" meta={`cache hit: ${d.cacheHit}`}>
       {!r ? (
         <p className="text-sm text-muted-foreground">
           Fresh scan — every file was analyzed. A rescan of the same repository reuses unchanged files’ results (incremental) or the
@@ -187,7 +189,7 @@ function WarningsPanel({ warnings, realCount }: { warnings: ScanWarning[]; realC
       id="warnings-h"
       icon={TriangleAlert}
       title="Warnings & notes"
-      readout={warnings.length === 0 ? 'none' : `${realCount} warning${realCount === 1 ? '' : 's'} · ${warnings.length - realCount} note${warnings.length - realCount === 1 ? '' : 's'}`}
+      meta={warnings.length === 0 ? 'none' : `${realCount} warning${realCount === 1 ? '' : 's'} · ${warnings.length - realCount} note${warnings.length - realCount === 1 ? '' : 's'}`}
     >
       {warnings.length === 0 ? (
         <p className="text-sm text-muted-foreground">The scan ran without degradation.</p>
@@ -227,7 +229,7 @@ function TimingsPanel({ scan, durationMs }: { scan: ReturnType<typeof useScanCon
   const span = Math.max(1, end - created);
   const queued = started !== null ? started - created : end - created;
   return (
-    <Panel id="timing-h" icon={Clock3} title="Timings" readout={formatDuration(finished !== null ? finished - created : null) + ' end-to-end'}>
+    <Panel id="timing-h" icon={Clock3} title="Timings" meta={formatDuration(finished !== null ? finished - created : null) + ' end-to-end'}>
       <div className="space-y-4">
         <div className="space-y-1">
           <div className="flex h-3 overflow-hidden rounded-full bg-muted" role="img" aria-label={`queued ${formatDuration(queued)}, ran ${formatDuration(durationMs)}`}>

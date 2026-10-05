@@ -1,8 +1,9 @@
 import { Cpu } from 'lucide-react';
+import { Meter } from '@/components/common/Meter';
+import { Panel } from '@/components/common/Panel';
 import type { Diagnostics, LlmTotals } from '@/lib/api';
 import { formatCompact, formatInt, formatUsd } from '@/lib/format';
 import { cn } from '@/lib/utils';
-import { Meter, Panel } from './primitives';
 
 /** LLM calls, tokens and $ per analyzer, with a cost-share bar and a token split bar per row. */
 export function LlmUsagePanel({ llm }: { llm: Diagnostics['llm'] }) {
@@ -15,7 +16,7 @@ export function LlmUsagePanel({ llm }: { llm: Diagnostics['llm'] }) {
       id="llm-h"
       icon={Cpu}
       title="LLM usage by analyzer"
-      readout={
+      meta={
         <span className="flex flex-wrap items-center gap-x-3 gap-y-1">
           <span className={cn('rounded border px-1.5 uppercase', llm.mode === 'live' ? 'border-signal/50 text-signal' : 'border-sev-medium/40 text-sev-medium')}>
             {llm.mode}

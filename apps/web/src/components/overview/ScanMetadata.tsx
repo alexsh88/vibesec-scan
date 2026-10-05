@@ -6,7 +6,7 @@ import { Skeleton } from '@/components/ui/skeleton';
 import type { Diagnostics } from '@/lib/api';
 import { formatCompact, formatDateTime, formatDuration, formatInt, formatUsd, githubUrl, shortSha } from '@/lib/format';
 import { cn } from '@/lib/utils';
-import { Panel } from './Panel';
+import { Panel } from '@/components/common/Panel';
 
 function Row({ k, children, className }: { k: string; children: ReactNode; className?: string }) {
   return (

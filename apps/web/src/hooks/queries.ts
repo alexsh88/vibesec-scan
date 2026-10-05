@@ -8,10 +8,15 @@ import {
   useMutation,
   useQuery,
   useQueryClient,
+  type Query,
   type QueryClient,
+  type QueryKey,
 } from '@tanstack/react-query';
-import { isTerminalState, type CreateScanRequest, type Finding, type ScanDto } from '@vibesec/shared';
-import { api, isApiError, type AuditFilters, type FindingFilters, type FindingsPage, type TriageInput } from '@/lib/api';
+import { isTerminalState, type CreateScanRequest, type Finding, type ScanDto, type ScanSummary } from '@vibesec/shared';
+import { api, isApiError, type AuditFilters, type Diagnostics, type FindingFilters, type FindingsPage, type TriageInput } from '@/lib/api';
+
+/** A static interval, or one derived from the query's own state (e.g. "poll while still running"). */
+type RefetchInterval<TData> = number | false | ((query: Query<TData, Error, TData, QueryKey>) => number | false | undefined);
 
 // ---------------------------------------------------------------------------------------------
 // Keys — everything scan-scoped lives under ['scans', id] so one invalidation refreshes a scan.
@@ -99,19 +104,21 @@ export function useFixPlan(id: string | undefined) {
 }
 
 /** 404 NOT_READY until the scan's synthesis step ran — check `error.code === 'NOT_READY'`. */
-export function useSummary(id: string | undefined, opts: { enabled?: boolean } = {}) {
+export function useSummary(id: string | undefined, opts: { enabled?: boolean; refetchInterval?: RefetchInterval<ScanSummary> } = {}) {
   return useQuery({
     queryKey: qk.summary(id ?? ''),
     queryFn: ({ signal }) => api.getSummary(id!, signal),
     enabled: !!id && (opts.enabled ?? true),
+    refetchInterval: opts.refetchInterval ?? false,
   });
 }
 
-export function useDiagnostics(id: string | undefined) {
+export function useDiagnostics(id: string | undefined, opts: { refetchInterval?: RefetchInterval<Diagnostics> } = {}) {
   return useQuery({
     queryKey: qk.diagnostics(id ?? ''),
     queryFn: ({ signal }) => api.getDiagnostics(id!, signal),
     enabled: !!id,
+    refetchInterval: opts.refetchInterval ?? false,
   });
 }
 

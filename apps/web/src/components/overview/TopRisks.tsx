@@ -5,7 +5,7 @@ import { SeverityBadge } from '@/components/security/SeverityBadge';
 import { SEVERITY_CLASSES } from '@/lib/taxonomy';
 import { cn } from '@/lib/utils';
 import { FindingRefList } from './FindingRef';
-import { Panel } from './Panel';
+import { Panel } from '@/components/common/Panel';
 
 /** 3–5 most important risks, most important first, each linking to its findings. */
 export function TopRisks({ summary, scanId, byId }: { summary: ScanSummary; scanId: string; byId: Map<string, Finding> }) {

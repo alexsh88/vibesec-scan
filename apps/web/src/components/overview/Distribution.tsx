@@ -5,7 +5,7 @@ import { formatInt } from '@/lib/format';
 import { CATEGORY_META, SEVERITY_CLASSES, SEVERITY_LABEL, SEVERITY_ORDER } from '@/lib/taxonomy';
 import { cn } from '@/lib/utils';
 import { findingsHref } from './links';
-import { Panel } from './Panel';
+import { Panel } from '@/components/common/Panel';
 
 /**
  * Severity distribution: a proportional stacked bar (overview at a glance) plus one row per severity

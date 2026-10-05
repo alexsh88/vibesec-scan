@@ -13,11 +13,11 @@ import {
 } from 'lucide-react';
 import { useState } from 'react';
 import { Link } from 'react-router';
+import { CommandLine } from '@/components/common/CopyButton';
 import { Button } from '@/components/ui/button';
 import { formatInt } from '@/lib/format';
 import { SEVERITY_CLASSES, SEVERITY_ORDER } from '@/lib/taxonomy';
 import { cn } from '@/lib/utils';
-import { CommandLine } from './CopyButton';
 import { actionAnchor, actionPackages, actionTally, libraryAnchor, osvUrl, splitCommand, type SeverityTally } from './depModel';
 
 const KIND_META: Record<FixAction['kind'], { label: string; icon: typeof Layers; hint: string }> = {

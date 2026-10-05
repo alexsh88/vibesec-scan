@@ -1,5 +1,5 @@
 import type { Finding, FixAction } from '@vibesec/shared';
-import { useEffect, useMemo } from 'react';
+import { useMemo } from 'react';
 import { ErrorState } from '@/components/feedback/ErrorState';
 import { Page } from '@/components/layout/Page';
 import { CategoryBreakdown, SeverityDistribution } from '@/components/overview/Distribution';
@@ -37,17 +37,13 @@ export default function OverviewPage() {
 
 function OverviewResults() {
   const { scanId, scan } = useScanContext();
-  const summary = useSummary(scanId);
-  const notReady = isApiError(summary.error) && summary.error.code === 'NOT_READY';
   const cancelled = !hasResults(scan.state);
-
   // Synthesis lands a moment after the scan is marked done; poll a few times while NOT_READY.
+  const summary = useSummary(scanId, {
+    refetchInterval: (query) => (!cancelled && isApiError(query.state.error) && query.state.error.code === 'NOT_READY' ? 4_000 : false),
+  });
+  const notReady = isApiError(summary.error) && summary.error.code === 'NOT_READY';
   const { refetch } = summary;
-  useEffect(() => {
-    if (!notReady || cancelled) return;
-    const t = window.setTimeout(() => void refetch(), 4_000);
-    return () => window.clearTimeout(t);
-  }, [notReady, cancelled, refetch, summary.errorUpdatedAt]);
 
   // One page of findings serves both the counts and title lookups for linked finding ids.
   const findings = useFindings(scanId, { limit: 200 });

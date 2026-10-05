@@ -1,5 +1,5 @@
 import { CircleCheck } from 'lucide-react';
-import { Panel } from './Panel';
+import { Panel } from '@/components/common/Panel';
 
 /** Evidenced strengths only (the summary never invents them); hidden when there are none. */
 export function PositiveObservations({ items }: { items: string[] }) {

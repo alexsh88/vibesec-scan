@@ -1,9 +1,10 @@
 import { ChevronDown, FileSearch } from 'lucide-react';
 import { useState } from 'react';
+import { Panel } from '@/components/common/Panel';
+import { StackedBar, type Segment } from '@/components/common/StackedBar';
 import type { CoverageStatus, Diagnostics } from '@/lib/api';
 import { formatInt } from '@/lib/format';
 import { cn } from '@/lib/utils';
-import { Panel, StackedBar, type Segment } from './primitives';
 
 export const COVERAGE_META: Record<CoverageStatus, { label: string; cls: string; hint: string }> = {
   reviewed: { label: 'Reviewed', cls: 'bg-signal', hint: 'Deep AI review of the file' },
@@ -29,7 +30,7 @@ export function CoveragePanel({ coverage }: { coverage: Diagnostics['coverage'] 
   const analyzers = Object.entries(coverage.byAnalyzer).sort((a, b) => sum(b[1]) - sum(a[1]));
 
   return (
-    <Panel id="coverage-h" icon={FileSearch} title="AI review coverage" readout={`${pct}% of relevant file-reviews done · ${formatInt(total)} total`}>
+    <Panel id="coverage-h" icon={FileSearch} title="AI review coverage" meta={`${pct}% of relevant file-reviews done · ${formatInt(total)} total`}>
       <div className="space-y-4">
         <StackedBar segments={segs(coverage.totals)} height="h-3" />
         <ul className="grid grid-cols-2 gap-x-4 gap-y-2 sm:grid-cols-3 lg:grid-cols-6">

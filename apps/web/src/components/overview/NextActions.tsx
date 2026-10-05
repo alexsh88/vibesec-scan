@@ -5,7 +5,7 @@ import { EmptyState } from '@/components/feedback/EmptyState';
 import { Checkbox } from '@/components/ui/checkbox';
 import { cn } from '@/lib/utils';
 import { FindingRefList } from './FindingRef';
-import { Panel } from './Panel';
+import { Panel } from '@/components/common/Panel';
 
 const EFFORT: Record<NextAction['effort'], { label: string; cls: string }> = {
   minutes: { label: 'minutes', cls: 'border-signal/40 bg-signal-soft text-foreground' },

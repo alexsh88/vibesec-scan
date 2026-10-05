@@ -3,12 +3,10 @@
  * stream and human warning titles — all computed from the SSE event log (useScanContext().events)
  * plus the scan DTO and diagnostics. No React here except the tiny hooks at the bottom.
  */
-import { useQuery } from '@tanstack/react-query';
 import { isTerminalState, type Category, type FindingSummary, type ScanDto, type ScanEvent, type ScanState, type Severity } from '@vibesec/shared';
 import { useEffect, useState, useSyncExternalStore } from 'react';
-import { qk } from '@/hooks/queries';
 import type { LiveEvent } from '@/hooks/useScanEvents';
-import { api, type CoverageStatus, type Diagnostics } from '@/lib/api';
+import type { CoverageStatus, Diagnostics } from '@/lib/api';
 import { PIPELINE_STAGES } from '@/lib/scanState';
 
 // ---------------------------------------------------------------------------------------------
@@ -277,15 +275,6 @@ export function warningTitle(code: string): string {
 // ---------------------------------------------------------------------------------------------
 // Hooks
 // ---------------------------------------------------------------------------------------------
-
-/** Diagnostics polled every 3 s while the scan runs (coverage, per-analyzer LLM spend, budget). */
-export function useLiveDiagnostics(scanId: string, running: boolean) {
-  return useQuery({
-    queryKey: qk.diagnostics(scanId),
-    queryFn: ({ signal }) => api.getDiagnostics(scanId, signal),
-    refetchInterval: running ? 3_000 : false,
-  });
-}
 
 /** A ticking clock (ms) while `active`; frozen otherwise. */
 export function useNow(active: boolean, intervalMs = 1_000): number {
