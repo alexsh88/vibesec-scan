@@ -161,7 +161,7 @@ describe('scan pipeline (real git)', () => {
     const after = findings.all(id, { includeFixed: true });
     expect(after).toHaveLength(1);
     expect(after[0]!.finding.riskFactors.length + after[0]!.finding.riskScore).toBeGreaterThan(0);
-    expect(summaries.get(id)?.riskGrade).toBe('A');
+    expect(summaries.get(id)?.riskGrade).toBe('C'); // the stub model says A; a high finding floors it at C (rubric)
 
     // Re-running the post-analysis stages (as a crash + resume would) changes nothing.
     const ctx: PipelineContext = {
@@ -170,7 +170,7 @@ describe('scan pipeline (real git)', () => {
     };
     for (const name of ['VERIFYING', 'SCORING', 'SYNTHESIZING'] as const) await pipeline.stages.find((s) => s.name === name)!.run(ctx);
     expect(findings.all(id, { includeFixed: true })).toEqual(after);
-    expect(summaries.get(id)?.riskGrade).toBe('A');
+    expect(summaries.get(id)?.riskGrade).toBe('C'); // the stub model says A; a high finding floors it at C (rubric)
   }, 60_000);
 
   it('re-clones when resuming after CLONING with the workspace gone', async () => {
