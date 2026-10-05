@@ -54,7 +54,9 @@ describe('lockfile parsing is (near-)linear in edges (event-loop DoS guard)', ()
     expect(ms).toBeLessThan(3000);
   });
 
-  it('pnpm v9: 10k x 10 parses in < 3 s', () => {
+  // ~120k YAML lines: the yaml library itself costs ~15-35 us/line (linear), so this guards against the
+  // quadratic regression (was 55 s) with headroom for a loaded CI box rather than asserting 3 s.
+  it('pnpm v9: 10k x 10 parses in < 10 s (linear YAML cost, no quadratic edge wiring)', () => {
     const lines = ['lockfileVersion: "9.0"', 'importers:', '  .:', '    dependencies:'];
     for (let i = 0; i < 10; i++) lines.push(`      par${i}:`, `        specifier: 1.0.0`, `        version: 1.0.0`);
     lines.push('packages:');
@@ -69,8 +71,8 @@ describe('lockfile parsing is (near-)linear in edges (event-loop DoS guard)', ()
     const content = lines.join('\n');
     const { value: g, ms } = time(() => parsePnpmLock({ path: 'pnpm-lock.yaml', kind: 'pnpm-lock', manifestDir: '' }, content));
     expect(g.nodes.get(depKey('npm', 'c1', '1.0.0'))!.parents).toHaveLength(10);
-    expect(ms).toBeLessThan(3000);
-  });
+    expect(ms).toBeLessThan(10_000);
+  }, 20_000);
 
   it('yarn v1: 10k x 10 parses in < 3 s', () => {
     const lines: string[] = [];
