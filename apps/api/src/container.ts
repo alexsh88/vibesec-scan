@@ -2,10 +2,14 @@ import { AuditLogger } from './audit/AuditLogger';
 import type { Config } from './config';
 import { openDatabase, type Db } from './db/database';
 import { EventRepo } from './db/eventRepo';
+import { IndexRepo } from './db/indexRepo';
 import { ScanRepo } from './db/scanRepo';
 import { EventBus } from './events/EventBus';
+import { GitService } from './git/GitService';
+import { GitHubClient } from './github/GitHubClient';
+import { RepoIndexer } from './index/RepoIndexer';
 import { JobRunner } from './jobs/JobRunner';
-import { createStubPipeline } from './pipeline/stubPipeline';
+import { createScanPipeline } from './pipeline/scanPipeline';
 import type { Pipeline } from './pipeline/types';
 import { ScanLifecycle } from './scans/ScanLifecycle';
 import { ScanService } from './scans/ScanService';
@@ -13,6 +17,7 @@ import { ScanService } from './scans/ScanService';
 export type Container = {
   config: Config; db: Db; scans: ScanRepo; bus: EventBus; audit: AuditLogger;
   lifecycle: ScanLifecycle; runner: JobRunner; service: ScanService;
+  git: GitService; github: GitHubClient; indexRepo: IndexRepo; gitVersion: string | null;
 };
 
 /** Composition root: the only place that wires concrete implementations together. */
@@ -22,11 +27,22 @@ export function createContainer(config: Config, overrides: { pipeline?: Pipeline
   const bus = new EventBus(new EventRepo(db));
   const audit = new AuditLogger(db);
   const lifecycle = new ScanLifecycle(scans, bus, db, audit);
+
+  const git = new GitService({
+    workDir: config.workDir, cloneTimeoutMs: config.cloneTimeoutMs, stallMs: config.gitStallMs, allowFileProtocol: config.allowLocalRepos,
+  });
+  const github = new GitHubClient({ apiUrl: config.githubApiUrl, serverToken: config.githubToken });
+  const indexRepo = new IndexRepo(db);
+  const indexer = new RepoIndexer(git, { maxFiles: config.maxFiles, maxFileBytes: config.maxFileBytes });
+  const pipeline = overrides.pipeline ?? createScanPipeline({
+    git, github, scans, indexRepo, indexer, maxRepoBytes: config.maxRepoBytes, maxFiles: config.maxFiles,
+  });
+
   const runner = new JobRunner({
     scans, lifecycle, bus, audit,
-    pipeline: overrides.pipeline ?? createStubPipeline(),
+    pipeline,
     config,
   });
   const service = new ScanService({ db, scans, lifecycle, audit, queue: runner, queueCapacity: config.queueCapacity });
-  return { config, db, scans, bus, audit, lifecycle, runner, service };
+  return { config, db, scans, bus, audit, lifecycle, runner, service, git, github, indexRepo, gitVersion: null };
 }

@@ -120,4 +120,28 @@ describe('HTTP API', () => {
     const res = await app.inject({ method: 'GET', url: '/api/health' });
     expect(res.json()).toMatchObject({ status: 'ok', scanMode: 'mock' });
   });
+
+  it('exposes the repository index of a scan', async () => {
+    await start();
+    const { scanId } = (await createScan()).json();
+    await c.runner.whenIdle();
+    c.indexRepo.replace(scanId, {
+      files: [{ path: 'src/a.ts', blobSha: 'a'.repeat(40), size: 1, language: 'typescript', category: 'source', tags: [], skipReason: null }],
+      imports: [{ from: 'src/a.ts', specifier: 'express', kind: 'package', to: null, pkg: 'express', line: 1 }],
+      entrypoints: [{ path: 'src/a.ts', kind: 'http-route', line: 2, detail: 'GET /' }],
+      stats: { totalFiles: 1, indexedFiles: 1, skipped: {}, byLanguage: { typescript: 1 }, imports: 1, entrypoints: 1, truncated: false },
+    });
+    const res = await app.inject({ method: 'GET', url: `/api/scans/${scanId}/index` });
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toEqual({
+      stats: expect.objectContaining({ indexedFiles: 1 }),
+      entrypoints: [{ path: 'src/a.ts', kind: 'http-route', line: 2, detail: 'GET /' }],
+      packages: [{ name: 'express', importers: 1 }],
+    });
+  });
+
+  it('returns 404 for the index of an unknown scan', async () => {
+    await start();
+    expect((await app.inject({ method: 'GET', url: '/api/scans/nope/index' })).statusCode).toBe(404);
+  });
 });

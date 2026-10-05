@@ -7,5 +7,6 @@ export function healthRoutes(app: FastifyInstance, c: Container): void {
     scanMode: c.config.scanMode,
     docker: 'unknown', // probed by the sandbox module in P5
     queue: { pending: c.runner.pendingCount(), capacity: c.config.queueCapacity },
+    git: c.gitVersion,
   }));
 }

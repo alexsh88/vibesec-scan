@@ -8,6 +8,7 @@ import { serializeError } from './logSerializers';
 import { auditRoutes } from './routes/audit';
 import { eventRoutes } from './routes/events';
 import { healthRoutes } from './routes/health';
+import { indexRoutes } from './routes/index';
 import { scanRoutes } from './routes/scans';
 
 export async function buildApp(c: Container, opts: { logger?: FastifyServerOptions['logger'] } = {}): Promise<FastifyInstance> {
@@ -26,6 +27,7 @@ export async function buildApp(c: Container, opts: { logger?: FastifyServerOptio
   app.setErrorHandler(errorHandler);
 
   scanRoutes(app, c.service);
+  indexRoutes(app, c.service, c.indexRepo);
   eventRoutes(app, c.service, c.bus);
   auditRoutes(app, c.audit);
   healthRoutes(app, c);

@@ -9,9 +9,20 @@ async function main(): Promise<void> {
   const c = createContainer(config);
   const app = await buildApp(c);
 
+  try {
+    c.gitVersion = await c.git.init();
+  } catch (err) {
+    app.log.fatal({ err }, 'git is required but could not be run');
+    process.exit(1);
+  }
+
   // Listen first: if the port is taken (e.g. a second instance), we exit here before touching any scan,
   // instead of adopting / failing the other instance's work.
   await app.listen({ port: config.port, host: config.host });
+
+  const live = new Set(c.scans.listNonTerminal().map((s) => s.id));
+  const removed = await c.git.sweep((scanId) => live.has(scanId));
+  if (removed.length) app.log.info({ removed: removed.length }, 'removed stale scan workspaces');
 
   const { resumed, failed } = c.runner.recover();
   if (resumed.length || failed.length) app.log.info({ resumed, failed }, 'recovered scans from previous run');
