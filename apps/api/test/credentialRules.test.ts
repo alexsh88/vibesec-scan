@@ -106,6 +106,11 @@ describe('detectSecrets — one match per type with correct position', () => {
     const other = fake.jwt({ role: 'editor' });
     const matches = detectSecrets(`${anon}\n${serviceRole}\n${other}\n`);
     expect(matches.some((m) => m.value === anon)).toBe(false);
+    // ...but it is still surfaced as a redact-only match when asked for (so snippets can hide it).
+    const withRedactOnly = detectSecrets(`${anon}\n`, { includeRedactOnly: true });
+    expect(withRedactOnly).toHaveLength(1);
+    expect(withRedactOnly[0]!.redactOnly).toBe(true);
+    expect(withRedactOnly[0]!.value).toBe(anon);
     const svc = matches.find((m) => m.value === serviceRole);
     expect(svc?.type).toBe('supabase-service-role');
     expect(svc?.jwtRole).toBe('service_role');
@@ -201,9 +206,44 @@ describe('redact', () => {
     expect(r.endsWith(value.slice(-4))).toBe(true);
   });
 
-  it('uses first 2 + ellipsis for short values', () => {
-    const r = redact('abcdefgh');
-    expect(r).toBe('ab…');
+  it('reveals at most 25% of an untyped value (per side min(4, floor(len/8)))', () => {
+    for (let len = 8; len <= 16; len++) {
+      const value = fake.genericSecretValue(len);
+      const r = redact(value);
+      const revealed = r.replace('…', '').length;
+      expect(revealed).toBeLessThanOrEqual(Math.floor(len * 0.25));
+      const n = Math.min(4, Math.floor(len / 8));
+      expect(r).toBe(`${value.slice(0, n)}…${value.slice(-n)}`);
+    }
+    expect(redact('abcdefgh')).toBe('a…h');
+  });
+
+  it('reveals nothing for values shorter than 8 chars', () => {
+    expect(redact('a')).toBe('…');
+    expect(redact('abcdefg')).toBe('…');
+  });
+
+  it('generic-secret reveals only a 2-char prefix', () => {
+    const value = fake.genericSecretValue(12);
+    expect(redact(value, 'generic-secret')).toBe(`${value.slice(0, 2)}…`);
+    expect(redact('short', 'generic-secret')).toBe('…');
+  });
+
+  it('database-url hides all but 2 chars of the password', () => {
+    const url = fake.databaseUrl('postgres');
+    const password = /:\/\/[^:]*:([^@]+)@/.exec(url)![1]!;
+    const r = redact(url, 'database-url');
+    expect(r).not.toContain(password.slice(2));
+    expect(r).toContain(`${password.slice(0, 2)}…@`);
+  });
+
+  it('typed tokens keep their (non-secret) prefix and at most 4 trailing chars', () => {
+    const gh = fake.github();
+    expect(redact(gh, 'github-token')).toBe(`ghp_…${gh.slice(-4)}`);
+    const aws = fake.awsAccessKey();
+    expect(redact(aws, 'aws-access-key')).toBe(`AKIA…${aws.slice(-2)}`);
+    const stripe = fake.stripeLive();
+    expect(redact(stripe, 'stripe-secret-key')).toBe(`sk_live_…${stripe.slice(-3)}`);
   });
 
   it('redacts PEM blocks without leaking body lines', () => {
@@ -238,7 +278,154 @@ describe('isClientExposed', () => {
     ['static/app.js', 'const key = "x";', true],
     ['site/index.html', 'const key = "x";', true],
     ['src/server.ts', 'const key = "x";', false],
+    ['src/server.ts', 'const key = NON_PUBLIC_KEY;', false],
+    ['src/server.ts', 'const key = import.meta.env.PUBLIC_KEY;', true],
   ] as const)('%s / %s -> %s', (file, line, expected) => {
     expect(isClientExposed(file, line)).toBe(expected);
+  });
+});
+
+describe('AWS secret pairing', () => {
+  it('pairs each access key with its own profile secret in a two-profile credentials file', () => {
+    const k1 = fake.awsAccessKey();
+    const k2 = fake.awsAccessKey();
+    const s1 = fake.awsSecretKey();
+    const s2 = fake.awsSecretKey();
+    const text = `[default]\naws_access_key_id = ${k1}\naws_secret_access_key = ${s1}\n[prod]\naws_access_key_id = ${k2}\naws_secret_access_key = ${s2}\n`;
+    const matches = detectSecrets(text);
+    expect(matches.find((m) => m.value === k1)?.pairedSecret).toBe(s1);
+    expect(matches.find((m) => m.value === k2)?.pairedSecret).toBe(s2);
+    // The paired secrets are reported as part of the AWS findings, not as separate generic secrets.
+    expect(matches.filter((m) => m.type === 'generic-secret')).toHaveLength(0);
+  });
+
+  it('pairs within the INI section even when the secret precedes the key id', () => {
+    const k1 = fake.awsAccessKey();
+    const k2 = fake.awsAccessKey();
+    const s1 = fake.awsSecretKey();
+    const s2 = fake.awsSecretKey();
+    const text = `[a]\naws_secret_access_key = ${s1}\naws_access_key_id = ${k1}\n[b]\naws_secret_access_key = ${s2}\naws_access_key_id = ${k2}\n`;
+    const matches = detectSecrets(text);
+    expect(matches.find((m) => m.value === k1)?.pairedSecret).toBe(s1);
+    expect(matches.find((m) => m.value === k2)?.pairedSecret).toBe(s2);
+  });
+});
+
+describe('placeholder filtering does not drop real high-entropy credentials', () => {
+  const pemWith = (needle: string) => {
+    const pem = fake.privateKeyPem();
+    const lines = pem.split('\n');
+    lines[2] = lines[2]!.slice(0, 20) + needle + lines[2]!.slice(20 + needle.length);
+    return lines.join('\n');
+  };
+
+  it.each(['xXx', 'ToDo', 'sample', 'your', 'Insert'])('PEM body containing %s is still detected', (needle) => {
+    const pem = pemWith(needle);
+    const keys = detectSecrets(pem).filter((m) => m.type === 'private-key');
+    expect(keys).toHaveLength(1);
+    expect(keys[0]!.value).toBe(pem);
+  });
+
+  it('ghp_ token whose random part contains "todo" is still detected', () => {
+    const token = 'ghp_' + fake.genericSecretValue(10) + 'todo' + fake.genericSecretValue(22);
+    expect(detectSecrets(`t = "${token}"`).map((m) => m.value)).toEqual([token]);
+  });
+
+  it('JWT whose signature contains "xxx" is still detected', () => {
+    const jwt = fake.jwt({ role: 'editor' });
+    const tampered = jwt.slice(0, -10) + 'xxx' + jwt.slice(-7);
+    expect(detectSecrets(tampered).map((m) => m.value)).toEqual([tampered]);
+  });
+
+  it.each([
+    ['ghp_' + 'x'.repeat(36)],
+    ['ghp_YourGithubTokenGoesHereYourToken0123'],
+    ['ghp_abcdXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX'],
+    ['AKIAI44QH8DHBEXAMPLE'],
+    ['-----BEGIN RSA PRIVATE KEY-----\n...\n-----END RSA PRIVATE KEY-----'],
+    ['-----BEGIN PRIVATE KEY-----\n<your private key goes here, paste the whole thing>\n-----END PRIVATE KEY-----'],
+    ['-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC...\n...\n-----END PRIVATE KEY-----'],
+  ])('real placeholder %s is still filtered', (text) => {
+    expect(detectSecrets(text)).toHaveLength(0);
+  });
+});
+
+describe('detection gaps (M1)', () => {
+  it('database-url with an empty username (redis://:pass@host)', () => {
+    const password = fake.genericSecretValue(20);
+    const url = `redis://:${password}@cache.internal:6379/0`;
+    expect(detectSecrets(url).find((m) => m.type === 'database-url')?.value).toBe(url);
+  });
+
+  it('lowercase .env keys are detected by the generic rule', () => {
+    const value = fake.genericSecretValue(24);
+    expect(detectSecrets(`db_password=${value}\n`).find((m) => m.type === 'generic-secret')?.value).toBe(value);
+  });
+
+  it('unquoted YAML values are detected by the generic rule', () => {
+    const value = fake.genericSecretValue(16) + '9';
+    const m = detectSecrets(`database:\n  password: ${value}\n`).find((x) => x.type === 'generic-secret');
+    expect(m?.value).toBe(value);
+    expect(m?.line).toBe(2);
+    expect(m?.startCol).toBe('  password: '.length + 1);
+  });
+
+  it('generic rule still filters placeholders and low entropy, and ignores code', () => {
+    expect(detectSecrets('db_password=changeme123\n')).toHaveLength(0);
+    expect(detectSecrets('password: aaaabbbbcccc\n')).toHaveLength(0);
+    expect(detectSecrets('const token = getTokenFromRequest(req);\n')).toHaveLength(0);
+    expect(detectSecrets('  token: tokenFromRequest,\n')).toHaveLength(0);
+  });
+});
+
+describe('ReDoS resistance (2 MiB adversarial inputs)', () => {
+  const MIB2 = 2 * 1024 * 1024;
+  const fill = (unit: string) => unit.repeat(Math.ceil(MIB2 / unit.length)).slice(0, MIB2);
+  const minifiedJsLike = () => {
+    const alphabet = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-.=:"\'(){};,/+ ';
+    const out: string[] = [];
+    let x = 12345;
+    for (let i = 0; i < MIB2; i++) {
+      x = (Math.imul(x, 1103515245) + 12345) & 0x7fffffff;
+      out.push(alphabet.charAt(x % alphabet.length));
+    }
+    return out.join('');
+  };
+
+  it.each([
+    ['jwt prefix run', () => fill('-eyJ')],
+    ['jwt header-like segments', () => fill('eyJaaaaaaaaaaaaa.')],
+    ['openai legacy prefix run', () => fill('sk-')],
+    ['openai proj prefix run', () => fill('-sk-proj-')],
+    ['anthropic prefix run', () => fill('-sk-ant-api03-')],
+    ['env keyword run (one line)', () => fill('TOKEN')],
+    ['env keyword run (many lines)', () => fill('API_TOKEN=\n')],
+    ['quoted generic', () => fill('password=')],
+    ['db url', () => fill('redis://a:')],
+    ['slack', () => fill('xoxb-')],
+    ['aws candidates', () => fill(`aws = ${'A'.repeat(40)} \n`)],
+    ['aws keys + candidates on one line', () => fill(`${fake.awsAccessKey()} aws = ${fake.awsSecretKey()} `)],
+    ['minified js-like single line', minifiedJsLike],
+  ])('%s finishes detectSecrets in < 1.5 s', (_name, gen) => {
+    const text = gen();
+    const t0 = performance.now();
+    detectSecrets(text);
+    expect(performance.now() - t0).toBeLessThan(1500);
+  }, 30_000);
+
+  it('still finds tokens straddling the 16 KiB window boundaries of a long single line', () => {
+    const filler = minifiedJsLike().replace(/[A-Za-z0-9_-]/g, ' ').slice(0, 64 * 1024);
+    const tokens = [16_380, 12_280, 24_570, 40_950].map((offset) => ({ offset, token: fake.github() }));
+    let line = filler;
+    for (const { offset, token } of tokens) {
+      line = line.slice(0, offset) + ` ${token} ` + line.slice(offset + token.length + 2);
+    }
+    const matches = detectSecrets(`first\n${line}\nlast\n`);
+    expect(matches.map((m) => m.value).sort()).toEqual(tokens.map((t) => t.token).sort());
+    for (const { offset, token } of tokens) {
+      const m = matches.find((x) => x.value === token)!;
+      expect(m.line).toBe(2);
+      expect(m.startCol).toBe(offset + 2);
+    }
   });
 });

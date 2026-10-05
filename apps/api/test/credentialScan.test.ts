@@ -43,6 +43,77 @@ describe('scanText', () => {
     expect(candidate!.line).toBe(100);
   });
 
+  it('two-profile ~/.aws/credentials: each key pairs with its own secret and no snippet leaks either secret', () => {
+    const k1 = fake.awsAccessKey();
+    const k2 = fake.awsAccessKey();
+    const s1 = fake.awsSecretKey();
+    const s2 = fake.awsSecretKey();
+    const text = `[default]\naws_access_key_id = ${k1}\naws_secret_access_key = ${s1}\n[prod]\naws_access_key_id = ${k2}\naws_secret_access_key = ${s2}\n`;
+    const candidates = scanText('.aws/credentials', text);
+    const c1 = candidates.find((c) => c.value === k1)!;
+    const c2 = candidates.find((c) => c.value === k2)!;
+    expect(c1.pairedSecret).toBe(s1);
+    expect(c2.pairedSecret).toBe(s2);
+    expect(candidates.length).toBeGreaterThan(0);
+    for (const c of candidates) {
+      expect(c.snippet.includes(s1)).toBe(false);
+      expect(c.snippet.includes(s2)).toBe(false);
+      expect(c.snippet.includes(c.value)).toBe(false);
+    }
+  });
+
+  it('redacts unpaired AWS-secret-shaped tokens on aws/secret context lines', () => {
+    const token = fake.github();
+    const orphan = fake.awsSecretKey();
+    const text = `# old aws key: ${orphan}\nconst t = "${token}";\n`;
+    const [candidate] = scanText('src/config.ts', text);
+    expect(candidate!.value).toBe(token);
+    expect(candidate!.snippet.includes(orphan)).toBe(false);
+  });
+
+  it('redact-only matches (anon JWT) are not candidates but are redacted in neighbours\' snippets', () => {
+    const anon = fake.supabaseAnonJwt();
+    const token = fake.github();
+    expect(scanText('src/supabase.ts', `const anon = "${anon}";\n`)).toHaveLength(0);
+    const candidates = scanText('src/config.ts', `const anon = "${anon}";\nconst t = "${token}";\n`);
+    expect(candidates.map((c) => c.value)).toEqual([token]);
+    expect(candidates[0]!.snippet.includes(anon)).toBe(false);
+  });
+
+  it('uses the type-aware redaction for candidate.redacted', () => {
+    const value = fake.genericSecretValue(24);
+    const [candidate] = scanText('.env', `API_SECRET_TOKEN=${value}\n`);
+    expect(candidate!.type).toBe('generic-secret');
+    expect(candidate!.redacted).toBe(`${value.slice(0, 2)}…`);
+  });
+
+  it('builds snippets for 20k tokens in < 1 s and never leaks a raw value', () => {
+    const tokens = Array.from({ length: 20_000 }, () => fake.github());
+    const text = tokens.join('\n');
+    const t0 = performance.now();
+    const candidates = scanText('big.txt', text);
+    const elapsed = performance.now() - t0;
+    expect(candidates).toHaveLength(20_000);
+    expect(elapsed).toBeLessThan(1000);
+    for (const c of candidates) {
+      const at = c.line - 1;
+      for (const neighbour of [tokens[at - 1], tokens[at], tokens[at + 1]]) {
+        if (neighbour) expect(c.snippet.includes(neighbour)).toBe(false);
+      }
+    }
+  }, 30_000);
+
+  it('handles 5k tokens on one long line without leaking or stalling', () => {
+    const tokens = Array.from({ length: 5_000 }, () => fake.github());
+    const text = tokens.map((t) => `"${t}"`).join(',');
+    const t0 = performance.now();
+    const candidates = scanText('bundle.min.js', text);
+    expect(performance.now() - t0).toBeLessThan(1000);
+    expect(candidates).toHaveLength(5_000);
+    expect(candidates[0]!.snippet.includes(tokens[0]!)).toBe(false);
+    expect(candidates[0]!.snippet.includes(tokens[1]!)).toBe(false);
+  }, 30_000);
+
   it('ids are deterministic for the same file/line/hash', () => {
     const token = fake.github();
     const text = `const t = "${token}";\n`;
@@ -133,6 +204,27 @@ describe('scanTree', () => {
     });
     expect(withSmallLimit.candidates).toHaveLength(0);
     expect(withSmallLimit.filesScanned).toBe(1);
+  });
+
+  it('sizes the read buffer to the file, not maxFileBytes (huge maxFileBytes still works)', async () => {
+    const result = await scanTree({
+      repoDir: dir, files: [file('app/config.ts', null)], signal: new AbortController().signal, maxFileBytes: 16 * 1024 ** 3,
+    });
+    expect(result.filesScanned).toBe(1);
+    expect(result.candidates.length).toBeGreaterThan(0);
+  });
+
+  it('stops all workers promptly once the signal aborts mid-scan', async () => {
+    let polls = 0;
+    const reason = new Error('aborted-mid-scan');
+    const signal = {
+      get aborted() { polls++; return polls > 5; },
+      reason,
+    } as unknown as AbortSignal;
+    const many = Array.from({ length: 500 }, () => file('app/config.ts', null));
+    await expect(scanTree({ repoDir: dir, files: many, signal })).rejects.toThrow('aborted-mid-scan');
+    // 5 healthy polls + at most a couple per worker (16) once aborted — not one per remaining file.
+    expect(polls).toBeLessThan(5 + 16 * 3);
   });
 
   it('rejects when the signal is already aborted', async () => {

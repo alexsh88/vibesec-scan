@@ -43,48 +43,102 @@ function candidateId(type: SecretType, file: string, line: number, hash: string)
 
 const SNIPPET_LINE_LIMIT = 300;
 
+/** A standalone 40-char run of the AWS secret-access-key alphabet. */
+const AWS_SECRET_SHAPE_RE = /(?<![A-Za-z0-9/+])[A-Za-z0-9/+]{40}(?![A-Za-z0-9/+])/g;
+const AWS_CONTEXT_RE = /aws|secret/i;
+
 /**
- * Builds the ±1-line snippet for `match`, with every detected credential value in that range
- * (from `allMatches`, not just `match` itself) swapped for its redacted form, truncated to
- * `SNIPPET_LINE_LIMIT` chars/line. A multi-line `private-key` match that overlaps the window is
- * blanked line-by-line (its raw body never appears verbatim on a single physical line).
+ * Builds ±1-line snippets in which every detected credential (including redact-only matches) is
+ * swapped for its redacted form. Matches are pre-indexed by line (multi-line PEMs registered across
+ * their whole range) and each redacted line is computed once and cached, so building all snippets for
+ * a file is O(text + matches) instead of O(matches²).
+ *
+ * Rules per line:
+ * - a line strictly inside / at the end of a multi-line match (PEM body) is blanked entirely;
+ * - single-line matches are replaced by position (startCol + value length), overlapping ones merged;
+ * - on any line mentioning aws/secret, every standalone 40-char AWS-secret-shaped token is redacted
+ *   too, paired or not — so an AWS secret never survives into a snippet;
+ * - lines are truncated to SNIPPET_LINE_LIMIT chars *after* redaction.
  */
-function buildSnippet(lines: readonly string[], match: SecretMatch, allMatches: readonly SecretMatch[]): string {
-  const windowStart = Math.max(1, match.line - 1);
-  const windowEnd = Math.min(lines.length, match.endLine + 1);
-  const out: string[] = [];
-  for (let ln = windowStart; ln <= windowEnd; ln++) {
-    let lineText = lines[ln - 1] ?? '';
-    for (const other of allMatches) {
-      if (ln >= other.line && ln <= other.endLine) {
-        if (lineText.includes(other.value)) {
-          lineText = lineText.split(other.value).join(redact(other.value));
-        } else if (other.endLine > other.line) {
-          // Multi-line credential (e.g. PEM) whose raw value can't appear as a substring of a single
-          // physical line — blank this line defensively so no body fragment leaks.
-          lineText = ln === other.line ? redact(other.value) : '';
-        }
-      }
-      // A paired AWS secret key (found within +/-5 lines, not tied to `other`'s own line range) must
-      // also never survive into the snippet, even when it lands on a context line that has no match
-      // of its own to trigger redaction.
-      if (other.pairedSecret && lineText.includes(other.pairedSecret)) {
-        lineText = lineText.split(other.pairedSecret).join(redact(other.pairedSecret));
+class SnippetBuilder {
+  private readonly byLine = new Map<number, SecretMatch[]>();
+  private readonly cache = new Map<number, string>();
+
+  constructor(private readonly lines: readonly string[], matches: readonly SecretMatch[]) {
+    for (const m of matches) {
+      for (let ln = m.line; ln <= m.endLine; ln++) {
+        const list = this.byLine.get(ln);
+        if (list) list.push(m); else this.byLine.set(ln, [m]);
       }
     }
-    out.push(lineText.length > SNIPPET_LINE_LIMIT ? lineText.slice(0, SNIPPET_LINE_LIMIT) : lineText);
   }
-  return out.join('\n');
+
+  snippet(match: SecretMatch): string {
+    const windowStart = Math.max(1, match.line - 1);
+    const windowEnd = Math.min(this.lines.length, match.endLine + 1);
+    const out: string[] = [];
+    for (let ln = windowStart; ln <= windowEnd; ln++) out.push(this.redactedLine(ln));
+    return out.join('\n');
+  }
+
+  private redactedLine(ln: number): string {
+    const cached = this.cache.get(ln);
+    if (cached !== undefined) return cached;
+    const raw = this.lines[ln - 1] ?? '';
+    const onLine = this.byLine.get(ln) ?? [];
+    let text: string;
+    if (onLine.some((m) => m.endLine > m.line && ln > m.line)) {
+      text = ''; // body/end line of a multi-line credential: never show any fragment
+    } else {
+      const spans = onLine
+        .map((m) => ({
+          start: m.startCol - 1,
+          end: m.endLine > m.line ? raw.length : m.startCol - 1 + m.value.length,
+          replacement: redact(m.value, m.type),
+        }))
+        .sort((a, b) => a.start - b.start);
+      const parts: string[] = [];
+      let cursor = 0;
+      for (const span of spans) {
+        if (span.start < cursor) {
+          // Overlaps the previous span: extend the hidden region, nothing new to show.
+          cursor = Math.max(cursor, span.end);
+          continue;
+        }
+        parts.push(raw.slice(cursor, span.start), span.replacement);
+        cursor = span.end;
+      }
+      parts.push(raw.slice(cursor));
+      text = parts.join('');
+      if (AWS_CONTEXT_RE.test(raw)) text = text.replace(AWS_SECRET_SHAPE_RE, (token) => redact(token));
+    }
+    if (text.length > SNIPPET_LINE_LIMIT) text = text.slice(0, SNIPPET_LINE_LIMIT);
+    this.cache.set(ln, text);
+    return text;
+  }
 }
 
 export function scanText(file: string, text: string, opts: ScanTextOptions = {}): SecretCandidate[] {
   const source = opts.source ?? 'tree';
-  const matches = detectSecrets(text);
+  // Redact-only matches (public-by-design tokens) are never candidates but must still be hidden in
+  // every snippet, so the snippet builder sees them all.
+  const matches = detectSecrets(text, { includeRedactOnly: true });
   const lines = text.split('\n');
+  const snippets = new SnippetBuilder(lines, matches);
   const seen = new Set<string>();
   const out: SecretCandidate[] = [];
+  const exposedByLine = new Map<number, boolean>();
+  const clientExposedAt = (line: number): boolean => {
+    let v = exposedByLine.get(line);
+    if (v === undefined) {
+      v = isClientExposed(file, lines[line - 1] ?? '');
+      exposedByLine.set(line, v);
+    }
+    return v;
+  };
 
   for (const m of matches) {
+    if (m.redactOnly) continue;
     const hash = secretHash(m.value);
     const line = opts.lineOffset ? opts.lineOffset(m.line) : m.line;
     const endLine = opts.lineOffset ? opts.lineOffset(m.endLine) : m.endLine;
@@ -92,8 +146,7 @@ export function scanText(file: string, text: string, opts: ScanTextOptions = {})
     if (seen.has(dedupeKey)) continue;
     seen.add(dedupeKey);
 
-    const redacted = redact(m.value);
-    const lineText = lines[m.line - 1] ?? '';
+    const redacted = redact(m.value, m.type);
     const candidate: SecretCandidate = {
       id: candidateId(m.type, file, line, hash),
       type: m.type,
@@ -104,8 +157,8 @@ export function scanText(file: string, text: string, opts: ScanTextOptions = {})
       value: m.value,
       redacted,
       hash,
-      snippet: buildSnippet(lines, m, matches),
-      clientExposed: isClientExposed(file, lineText),
+      snippet: snippets.snippet(m),
+      clientExposed: clientExposedAt(m.line),
       source,
     };
     if (m.jwtRole !== undefined) candidate.jwtRole = m.jwtRole;
@@ -141,26 +194,41 @@ function shouldScan(file: IndexedFile): boolean {
   return SCAN_EVEN_IF_SKIPPED.has(file.skipReason);
 }
 
-/** Runs `fn` over `items` with at most `limit` in flight, preserving nothing but call order per item. */
+/** Runs `fn` over `items` with at most `limit` in flight. As soon as any call throws (e.g. on abort),
+ *  a shared flag stops every other worker from picking up further items. */
 async function forEachLimit<T>(items: readonly T[], limit: number, fn: (item: T) => Promise<void>): Promise<void> {
   let next = 0;
+  let stopped = false;
   const worker = async () => {
-    while (next < items.length) {
+    while (!stopped && next < items.length) {
       const item = items[next++]!;
-      await fn(item);
+      try {
+        await fn(item);
+      } catch (err) {
+        stopped = true;
+        throw err;
+      }
     }
   };
   await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
 }
 
 /** Reads at most `maxBytes` from the start of the file; returns null for binary (NUL in the
- *  first probe window) or unreadable files. */
+ *  first probe window) or unreadable files. The buffer is sized min(file size, maxBytes). */
 async function readTextHead(absPath: string, maxBytes: number): Promise<string | null> {
   const handle = await open(absPath, 'r').catch(() => null);
   if (!handle) return null;
   try {
-    const buffer = Buffer.alloc(maxBytes);
-    const { bytesRead } = await handle.read(buffer, 0, maxBytes, 0);
+    const { size } = await handle.stat();
+    const length = Math.max(0, Math.min(size, maxBytes));
+    if (length === 0) return '';
+    const buffer = Buffer.allocUnsafe(length);
+    let bytesRead = 0;
+    while (bytesRead < length) {
+      const { bytesRead: n } = await handle.read(buffer, bytesRead, length - bytesRead, bytesRead);
+      if (n === 0) break;
+      bytesRead += n;
+    }
     const probeLen = Math.min(NUL_PROBE_BYTES, bytesRead);
     if (buffer.subarray(0, probeLen).includes(0)) return null;
     return buffer.subarray(0, bytesRead).toString('utf8');
@@ -201,6 +269,7 @@ export async function scanTree(opts: ScanTreeOptions): Promise<ScanTreeResult> {
       skipped++;
     } else {
       const text = await readTextHead(absPath, maxFileBytes);
+      if (opts.signal.aborted) throw opts.signal.reason; // don't burn CPU scanning after an abort
       if (text === null) {
         skipped++;
       } else {
