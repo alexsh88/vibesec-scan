@@ -25,6 +25,14 @@ const EnvSchema = z.object({
   MAX_FILE_KB: z.coerce.number().int().positive().default(1024),
   CLONE_TIMEOUT_MS: z.coerce.number().int().positive().default(120_000),
   GIT_STALL_MS: z.coerce.number().int().positive().default(30_000),
+  LLM_MODEL_FAST: z.string().min(1).default('claude-haiku-4-5'),
+  LLM_MODEL_DEEP: z.string().min(1).default('claude-sonnet-5'),
+  LLM_MODEL_SYNTHESIS: z.string().min(1).default('claude-opus-5'),
+  LLM_CONCURRENCY: z.coerce.number().int().positive().default(8),
+  LLM_REQUESTS_PER_MINUTE: z.coerce.number().int().positive().default(50),
+  LLM_INPUT_TOKENS_PER_MINUTE: z.coerce.number().int().positive().default(200_000),
+  LLM_TIMEOUT_MS: z.coerce.number().int().positive().default(120_000),
+  LLM_RECORDINGS_DIR: z.string().default(join('fixtures', 'llm-recordings')),
 });
 
 export type Config = {
@@ -34,6 +42,8 @@ export type Config = {
   heartbeatMs: number; staleHeartbeatMs: number; stuckAfterMs: number; corsOrigin: string; allowLocalRepos: boolean;
   githubToken: string | undefined; githubApiUrl: string; workDir: string;
   maxRepoBytes: number; maxFiles: number; maxFileBytes: number; cloneTimeoutMs: number; gitStallMs: number;
+  models: { fast: string; deep: string; synthesis: string };
+  llmConcurrency: number; llmRequestsPerMinute: number; llmInputTokensPerMinute: number; llmTimeoutMs: number; llmRecordingsDir: string;
 };
 
 export function loadConfig(env: Record<string, string | undefined> = process.env): Config {
@@ -52,10 +62,14 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
   if (e.GIT_STALL_MS >= e.CLONE_TIMEOUT_MS) {
     throw new Error(`Invalid config: GIT_STALL_MS (${e.GIT_STALL_MS}) must be less than CLONE_TIMEOUT_MS (${e.CLONE_TIMEOUT_MS})`);
   }
+  const scanMode = e.SCAN_MODE ?? (e.ANTHROPIC_API_KEY ? 'live' : 'mock');
+  if (scanMode !== 'mock' && !e.ANTHROPIC_API_KEY) {
+    throw new Error(`Invalid config: SCAN_MODE=${scanMode} requires ANTHROPIC_API_KEY (use SCAN_MODE=mock to run without a key)`);
+  }
   return {
     port: e.PORT, host: e.HOST, dbPath: e.DB_PATH,
     anthropicApiKey: e.ANTHROPIC_API_KEY,
-    scanMode: e.SCAN_MODE ?? (e.ANTHROPIC_API_KEY ? 'live' : 'mock'),
+    scanMode,
     maxConcurrentScans: e.MAX_CONCURRENT_SCANS, queueCapacity: e.QUEUE_CAPACITY,
     scanDeadlineMs: e.SCAN_DEADLINE_MS, scanBudgetUsd: e.SCAN_BUDGET_USD,
     heartbeatMs: e.HEARTBEAT_MS, staleHeartbeatMs: e.STALE_HEARTBEAT_MS, stuckAfterMs: e.STUCK_AFTER_MS,
@@ -64,5 +78,8 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     workDir: e.WORK_DIR ?? join(tmpdir(), 'vibesec'),
     maxRepoBytes: e.MAX_REPO_MB * 1024 * 1024, maxFiles: e.MAX_FILES, maxFileBytes: e.MAX_FILE_KB * 1024,
     cloneTimeoutMs: e.CLONE_TIMEOUT_MS, gitStallMs: e.GIT_STALL_MS,
+    models: { fast: e.LLM_MODEL_FAST, deep: e.LLM_MODEL_DEEP, synthesis: e.LLM_MODEL_SYNTHESIS },
+    llmConcurrency: e.LLM_CONCURRENCY, llmRequestsPerMinute: e.LLM_REQUESTS_PER_MINUTE,
+    llmInputTokensPerMinute: e.LLM_INPUT_TOKENS_PER_MINUTE, llmTimeoutMs: e.LLM_TIMEOUT_MS, llmRecordingsDir: e.LLM_RECORDINGS_DIR,
   };
 }

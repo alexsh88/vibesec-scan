@@ -60,3 +60,22 @@ describe('git & workspace config', () => {
     expect(() => loadConfig({ CLONE_TIMEOUT_MS: '1000', GIT_STALL_MS: '1000' })).toThrow(/GIT_STALL_MS/);
   });
 });
+
+describe('LLM config', () => {
+  it('has tiered model defaults and limits', () => {
+    const c = loadConfig({});
+    expect(c.models).toEqual({ fast: 'claude-haiku-4-5', deep: 'claude-sonnet-5', synthesis: 'claude-opus-5' });
+    expect(c).toMatchObject({ llmConcurrency: 8, llmRequestsPerMinute: 50, llmInputTokensPerMinute: 200_000, llmTimeoutMs: 120_000 });
+    expect(c.llmRecordingsDir).toMatch(/llm-recordings$/);
+  });
+
+  it('allows overriding models', () => {
+    expect(loadConfig({ LLM_MODEL_DEEP: 'claude-opus-5' }).models.deep).toBe('claude-opus-5');
+  });
+
+  it('requires an API key for live and record modes', () => {
+    expect(() => loadConfig({ SCAN_MODE: 'live' })).toThrow(/ANTHROPIC_API_KEY/);
+    expect(() => loadConfig({ SCAN_MODE: 'record' })).toThrow(/ANTHROPIC_API_KEY/);
+    expect(loadConfig({ SCAN_MODE: 'mock' }).scanMode).toBe('mock');
+  });
+});
