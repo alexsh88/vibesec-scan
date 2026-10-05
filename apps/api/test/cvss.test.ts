@@ -12,7 +12,15 @@ describe('cvssV3Score', () => {
 
   it('computes the official base score for a scope-changed (S:C) vector', () => {
     expect(cvssV3Score('CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:C/C:H/I:H/A:H')).toBe(10);
-    expect(cvssV3Score('CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:C/C:L/I:L/A:N')).toBe(5.6);
+    expect(cvssV3Score('CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:C/C:L/I:L/A:N')).toBe(6.1);
+  });
+
+  it('applies the 1.08 scope-changed multiplier (official FIRST calculator values)', () => {
+    expect(cvssV3Score('CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:C/C:H/I:H/A:H')).toBe(9.6);
+    expect(cvssV3Score('CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:C/C:H/I:H/A:H')).toBe(9.9);
+    expect(cvssV3Score('CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:C/C:L/I:L/A:N')).toBe(7.2);
+    expect(cvssV3Score('CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:C/C:L/I:L/A:N')).toBe(6.4);
+    expect(cvssV3Score('CVSS:3.1/AV:L/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H')).toBe(8.4);
   });
 
   it('accepts CVSS:3.0 vectors using the same metric weights', () => {

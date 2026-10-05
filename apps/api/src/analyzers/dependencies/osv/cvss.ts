@@ -63,7 +63,8 @@ export function cvssV3Score(vector: string): number | null {
   const impact = scopeChanged ? 7.52 * (iss - 0.029) - 3.25 * Math.pow(iss - 0.02, 15) : 6.42 * iss;
   if (impact <= 0) return 0;
   const exploitability = 8.22 * av! * ac! * pr! * ui!;
-  return roundUp(Math.min(impact + exploitability, 10));
+  // FIRST v3.x spec: Scope Changed → Roundup(Minimum(1.08 × (Impact + Exploitability), 10)).
+  return roundUp(Math.min((scopeChanged ? 1.08 : 1) * (impact + exploitability), 10));
 }
 
 const AT_W: Record<string, number> = { N: 0.85, P: 0.62 };
