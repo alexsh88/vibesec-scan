@@ -1,4 +1,5 @@
 import type { AuditInput } from '../../audit/AuditLogger';
+import { scrubSecrets } from '../../security/scrub';
 import { signV4 } from './sigv4';
 
 export type Liveness = 'live' | 'revoked' | 'unknown' | 'not_checked';
@@ -9,6 +10,10 @@ export type VerifiableSecret = {
   redacted: string;
   hash: string;
   pairedSecret?: string;
+  /** AWS temporary-credential session token (STS `x-amz-security-token`). Not yet populated by the
+   *  scanner today (ASIA keys are only ever reported without a paired session token), but the field
+   *  exists so that STS is called correctly if/when one is ever captured. */
+  sessionToken?: string;
 };
 
 export type VerifyResult = {
@@ -37,19 +42,37 @@ type ProviderRequest = {
 
 const DEFAULT_TIMEOUT_MS = 5_000;
 
+/** Releases a response body we are never going to read, so the underlying connection can be freed. */
+async function discardBody(res: Response | null): Promise<void> {
+  if (!res || res.bodyUsed || !res.body) return;
+  try {
+    await res.body.cancel();
+  } catch {
+    // best-effort; never fail verification because a body couldn't be released
+  }
+}
+
+/**
+ * 401 (bad/revoked credentials) -> revoked. Everything else -> unknown, in particular 403: a 403 can
+ * mean a rate limit, an IP allow-list, or a permissions-scoped token, none of which prove the
+ * credential itself is dead (I3c). A 3xx is never followed (fetch uses `redirect: 'manual'`), so it
+ * also lands here as an opaque, statusless response -> unknown (M3).
+ */
 function defaultStatusMap(status: number): Liveness {
   if (status === 200) return 'live';
-  if (status === 401 || status === 403) return 'revoked';
+  if (status === 401) return 'revoked';
   return 'unknown';
 }
 
 async function interpretDefault(res: Response | null): Promise<Liveness> {
   if (!res) return 'unknown';
+  await discardBody(res);
   return defaultStatusMap(res.status);
 }
 
 async function interpretStripe(res: Response | null): Promise<Liveness> {
   if (!res) return 'unknown';
+  await discardBody(res);
   // A 403 for a restricted key lacking the balance permission still proves the key exists.
   if (res.status === 200 || res.status === 403) return 'live';
   if (res.status === 401) return 'revoked';
@@ -59,7 +82,10 @@ async function interpretStripe(res: Response | null): Promise<Liveness> {
 const SLACK_REVOKED_ERRORS = new Set(['invalid_auth', 'account_inactive', 'token_revoked', 'token_expired']);
 
 async function interpretSlack(res: Response | null): Promise<Liveness> {
-  if (!res || res.status !== 200) return 'unknown';
+  if (!res || res.status !== 200) {
+    await discardBody(res);
+    return 'unknown';
+  }
   let body: unknown;
   try {
     body = await res.json();
@@ -74,19 +100,40 @@ async function interpretSlack(res: Response | null): Promise<Liveness> {
   return 'unknown';
 }
 
-async function interpretAws(res: Response | null): Promise<Liveness> {
-  if (!res) return 'unknown';
-  if (res.status === 200) return 'live';
-  if (res.status === 403) {
-    let text = '';
-    try {
-      text = await res.text();
-    } catch {
-      text = '';
+/** AWS access key ids starting `ASIA` are temporary (STS-issued) credentials that always require a
+ *  session token; `AKIA` ids are permanent/long-lived IAM user keys. */
+function isTemporaryAwsAccessKey(accessKeyId: string): boolean {
+  return accessKeyId.startsWith('ASIA');
+}
+
+/**
+ * I3a/b: `isPermanentKey` is true only for an `AKIA` id. `SignatureDoesNotMatch` means the *secret*
+ * half of the pair is wrong (a mis-paired access key id + secret access key) — it says nothing about
+ * whether the access key id itself is still valid, so it must never be treated as revoked. Only
+ * `InvalidClientTokenId` on a permanent key proves the key id itself was rejected -> revoked. A
+ * temporary (`ASIA`) key is never dispatched here without a session token (see `dispatch`), but if it
+ * ever is and STS still reports `InvalidClientTokenId`, that is unknown too, not revoked.
+ */
+function interpretAws(isPermanentKey: boolean): Interpreter {
+  return async (res: Response | null): Promise<Liveness> => {
+    if (!res) return 'unknown';
+    if (res.status === 200) {
+      await discardBody(res);
+      return 'live';
     }
-    if (text.includes('InvalidClientTokenId') || text.includes('SignatureDoesNotMatch')) return 'revoked';
-  }
-  return 'unknown';
+    if (res.status === 403) {
+      let text = '';
+      try {
+        text = await res.text();
+      } catch {
+        text = '';
+      }
+      if (isPermanentKey && text.includes('InvalidClientTokenId')) return 'revoked';
+      return 'unknown';
+    }
+    await discardBody(res);
+    return 'unknown';
+  };
 }
 
 function abortReason(signal: AbortSignal, fallback: unknown): unknown {
@@ -204,6 +251,9 @@ export class SecretVerifier {
 
       case 'aws-access-key':
         if (!secret.pairedSecret) return Promise.resolve({ liveness: 'unknown' });
+        // I3a: a temporary (ASIA) key with no session token will always get InvalidClientTokenId from
+        // STS regardless of whether it's actually live — that tells us nothing, so don't even call it.
+        if (isTemporaryAwsAccessKey(secret.value) && !secret.sessionToken) return Promise.resolve({ liveness: 'unknown' });
         return this.callAws(scanId, secret, signal);
 
       default:
@@ -224,9 +274,11 @@ export class SecretVerifier {
       accessKeyId: secret.value,
       // Non-null: callers only reach this branch when pairedSecret is present (checked in dispatch).
       secretAccessKey: secret.pairedSecret as string,
+      ...(secret.sessionToken !== undefined ? { sessionToken: secret.sessionToken } : {}),
       now: this.now(),
     });
-    return this.callProvider(scanId, secret, signal, { provider: 'aws', url, method: 'POST', headers, body, interpret: interpretAws });
+    const isPermanentKey = !isTemporaryAwsAccessKey(secret.value);
+    return this.callProvider(scanId, secret, signal, { provider: 'aws', url, method: 'POST', headers, body, interpret: interpretAws(isPermanentKey) });
   }
 
   private async callProvider(
@@ -236,7 +288,15 @@ export class SecretVerifier {
     req: ProviderRequest,
   ): Promise<VerifyResult> {
     return this.runOnProvider(req.provider, async () => {
-      const res = await this.safeFetch(signal, req.url, req.method, req.headers, req.body);
+      let res: Response | null;
+      try {
+        res = await this.safeFetch(signal, req.url, req.method, req.headers, req.body);
+      } catch (err) {
+        // M3: an attempt aborted mid-flight (scan cancellation, not our own per-request timeout — see
+        // safeFetch) still gets exactly one audit entry, recorded before the error propagates.
+        this.appendAudit(scanId, secret, { liveness: 'unknown', provider: req.provider }, undefined, true);
+        throw err;
+      }
       const checkedAt = this.now().toISOString();
       const liveness = await req.interpret(res);
       const result: VerifyResult = { liveness, checkedAt, provider: req.provider };
@@ -269,7 +329,9 @@ export class SecretVerifier {
     if (signal.aborted) throw abortReason(signal, new DOMException('Aborted', 'AbortError'));
     const combined = AbortSignal.any([signal, AbortSignal.timeout(this.timeoutMs)]);
     try {
-      return await this.fetchFn(url, { method, headers, body, signal: combined });
+      // M3: never follow a redirect — a 3xx response resolves to `unknown` rather than letting a
+      // provider redirect this request to a host outside the fixed set we intend to call.
+      return await this.fetchFn(url, { method, headers, body, signal: combined, redirect: 'manual' });
     } catch (err) {
       // Cancellation of the whole scan must propagate; our own per-request timeout must not.
       if (signal.aborted) throw abortReason(signal, err);
@@ -277,7 +339,13 @@ export class SecretVerifier {
     }
   }
 
-  private appendAudit(scanId: string, secret: VerifiableSecret, result: VerifyResult, httpStatus?: number): void {
+  private appendAudit(
+    scanId: string,
+    secret: VerifiableSecret,
+    result: VerifyResult,
+    httpStatus?: number,
+    aborted = false,
+  ): void {
     const details: Record<string, unknown> = {
       provider: result.provider,
       secretType: secret.type,
@@ -286,12 +354,21 @@ export class SecretVerifier {
       result: result.liveness,
     };
     if (httpStatus !== undefined) details.httpStatus = httpStatus;
-    this.audit.append({
-      action: 'secret.verification_attempted',
-      targetType: 'secret',
-      targetId: secret.hash,
-      scanId,
-      details,
-    });
+    if (aborted) details.aborted = true;
+    try {
+      this.audit.append({
+        action: 'secret.verification_attempted',
+        targetType: 'secret',
+        targetId: secret.hash,
+        scanId,
+        details,
+      });
+    } catch (err) {
+      // M3: an audit-log failure must never fail (or mask the result of) verification itself. Best-
+      // effort console logging, matching the fallback already used for channel-less failures
+      // elsewhere (see JobRunner's logInternal) — scrubbed since err may echo request details.
+      const detail = err instanceof Error ? `${err.name}: ${err.message}` : String(err);
+      console.error(scrubSecrets(`[SecretVerifier] audit.append failed (scanId=${scanId}, provider=${String(result.provider)}): ${detail}`));
+    }
   }
 }

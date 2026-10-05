@@ -97,6 +97,98 @@ describe('SecretVerifier', () => {
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
+  it('I3a: ASIA (temporary) access key without a session token resolves unknown with no network call, even with a pairedSecret', async () => {
+    const fetchMock = vi.fn(async () => json(200, {}));
+    const v = new SecretVerifier({ fetch: fetchMock as unknown as typeof fetch, audit: fakeAudit() });
+    const s = secret({
+      type: 'aws-access-key', value: 'ASIAIOSFODNN7EXAMPLE',
+      pairedSecret: 'wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY', hash: 'q1'.padEnd(64, '0'),
+    });
+    const result = await v.verify('s', s, new AbortController().signal);
+    expect(result.liveness).toBe('unknown');
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('I3b: aws-access-key 403 SignatureDoesNotMatch (mis-paired secret) -> unknown, never revoked', async () => {
+    const fetchMock = vi.fn(async () => text(403, '<ErrorResponse><Error><Code>SignatureDoesNotMatch</Code></Error></ErrorResponse>'));
+    const v = new SecretVerifier({ fetch: fetchMock as unknown as typeof fetch, audit: fakeAudit() });
+    const s = secret({
+      type: 'aws-access-key', value: 'AKIAIOSFODNN7EXAMPLE',
+      pairedSecret: 'wrongSecretWrongSecretWrongSecretWrongS', hash: 'r1'.padEnd(64, '0'),
+    });
+    const result = await v.verify('s', s, new AbortController().signal);
+    expect(result.liveness).toBe('unknown');
+  });
+
+  it('I3b: a temporary (ASIA) key with a session token that still gets InvalidClientTokenId from STS -> unknown, not revoked', async () => {
+    const fetchMock = vi.fn(async () => text(403, '<ErrorResponse><Error><Code>InvalidClientTokenId</Code></Error></ErrorResponse>'));
+    const v = new SecretVerifier({ fetch: fetchMock as unknown as typeof fetch, audit: fakeAudit() });
+    const s = secret({
+      type: 'aws-access-key', value: 'ASIAIOSFODNN7EXAMPLE', pairedSecret: 'wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY',
+      sessionToken: 'FQoGZXIvYXdzEBYaDHRlc3Rfc2Vzc2lvbg==', hash: 't1'.padEnd(64, '0'),
+    });
+    const result = await v.verify('s', s, new AbortController().signal);
+    expect(result.liveness).toBe('unknown');
+  });
+
+  it.each(['github-token', 'openai-api-key', 'anthropic-api-key', 'sendgrid-api-key'])(
+    'I3c: %s 403 -> unknown (rate limit/IP allow-list/permissions), 401 stays revoked',
+    async (type) => {
+      const revoked = new SecretVerifier({ fetch: (async () => json(401, {})) as unknown as typeof fetch, audit: fakeAudit() });
+      const r1 = await revoked.verify('s', secret({ type, value: 'x', hash: 'u'.repeat(64) }), new AbortController().signal);
+      expect(r1.liveness).toBe('revoked');
+
+      const unknown = new SecretVerifier({ fetch: (async () => json(403, {})) as unknown as typeof fetch, audit: fakeAudit() });
+      const r2 = await unknown.verify('s', secret({ type, value: 'x', hash: 'v'.repeat(64) }), new AbortController().signal);
+      expect(r2.liveness).toBe('unknown');
+    },
+  );
+
+  it('M3: every fetch uses redirect: manual, so a 3xx (opaque-redirect) response resolves unknown', async () => {
+    const fetchMock = vi.fn(async () => text(200, ''));
+    const v = new SecretVerifier({ fetch: fetchMock as unknown as typeof fetch, audit: fakeAudit() });
+    await v.verify('s', secret({ type: 'github-token', value: 'x', hash: 'w'.repeat(64) }), new AbortController().signal);
+    const [, init] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
+    expect(init.redirect).toBe('manual');
+  });
+
+  it('M3: cancels an unread response body (default interpreter never reads it)', async () => {
+    const cancel = vi.fn(async () => {});
+    const fakeRes = {
+      status: 200, bodyUsed: false, body: { cancel }, json: async () => ({}), text: async () => '',
+    } as unknown as Response;
+    const fetchMock = vi.fn(async () => fakeRes);
+    const v = new SecretVerifier({ fetch: fetchMock as unknown as typeof fetch, audit: fakeAudit() });
+    await v.verify('s', secret({ type: 'github-token', value: 'x', hash: 'n1'.padEnd(64, '0') }), new AbortController().signal);
+    expect(cancel).toHaveBeenCalledTimes(1);
+  });
+
+  it('M3: swallows an audit.append failure without failing verification', async () => {
+    const fetchMock = vi.fn(async () => json(200, { login: 'x' }));
+    const audit = { append: vi.fn(() => { throw new Error('db locked'); }) };
+    const v = new SecretVerifier({ fetch: fetchMock as unknown as typeof fetch, audit });
+    const result = await v.verify('s', secret({ type: 'github-token', value: 'x', hash: 'o1'.padEnd(64, '0') }), new AbortController().signal);
+    expect(result.liveness).toBe('live');
+  });
+
+  it('M3: records an aborted audit entry (unknown, aborted) before rethrowing when cancelled mid-flight', async () => {
+    let started: (() => void) | undefined;
+    const hangingFetch = vi.fn((_url: string, init: RequestInit) => new Promise<Response>((_resolve, reject) => {
+      started?.();
+      init.signal?.addEventListener('abort', () => reject(new DOMException('Aborted', 'AbortError')));
+    }));
+    const startedPromise = new Promise<void>((resolve) => { started = resolve; });
+    const ac = new AbortController();
+    const audit = fakeAudit();
+    const v = new SecretVerifier({ fetch: hangingFetch as unknown as typeof fetch, audit });
+    const p = v.verify('s', secret({ type: 'anthropic-api-key', value: 'sk-ant-x', hash: 'p1'.padEnd(64, '0') }), ac.signal);
+    await startedPromise;
+    ac.abort(new Error('scan cancelled'));
+    await expect(p).rejects.toThrow('scan cancelled');
+    expect(audit.entries).toHaveLength(1);
+    expect(audit.entries[0]?.details).toMatchObject({ result: 'unknown', aborted: true });
+  });
+
   it.each(['database-url', 'slack-webhook', 'google', 'generic'])(
     'non-verifiable type %s resolves unknown with zero fetch calls and zero audit entries',
     async (type) => {
