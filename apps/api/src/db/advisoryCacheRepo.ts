@@ -37,4 +37,10 @@ export class AdvisoryCacheRepo {
       )
       .run(kind, key, JSON.stringify(value), fetchedAt.toISOString());
   }
+
+  /** Deletes rows older than `ttlMs` as of `now` (they can never be served again); returns the count. */
+  purgeExpired(now: Date, ttlMs: number = ADVISORY_CACHE_TTL_MS): number {
+    const cutoff = new Date(now.getTime() - ttlMs).toISOString(); // ISO-8601 UTC strings sort chronologically
+    return this.db.prepare(`DELETE FROM advisory_cache WHERE fetched_at < ?`).run(cutoff).changes;
+  }
 }

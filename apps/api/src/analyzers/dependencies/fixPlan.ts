@@ -120,8 +120,18 @@ function errText(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
 
-function actionId(scanId: string, d: Pick<Draft, 'ecosystem' | 'manifestDir' | 'kind' | 'package'>): string {
-  const h = createHash('sha256').update(`${scanId}|${d.ecosystem}|${d.manifestDir}|${d.kind}|${d.package}`).digest('hex');
+/**
+ * Actions merge per (ecosystem, manifest dir, kind, package) — one `npm install` fixes the dir — except for
+ * per-file Python manifests (requirements*.txt / pyproject.toml), where each file needs its own edit.
+ */
+function mergeKey(d: Pick<Draft, 'ecosystem' | 'manifestDir' | 'kind' | 'package' | 'lockfile'>): string {
+  const pm = packageManager(d.ecosystem, d.lockfile);
+  const perFile = pm === 'requirements' || pm === 'pyproject';
+  return `${d.ecosystem}|${d.manifestDir}|${d.kind}|${d.package}${perFile ? `|${d.lockfile}` : ''}`;
+}
+
+function actionId(scanId: string, d: Pick<Draft, 'ecosystem' | 'manifestDir' | 'kind' | 'package' | 'lockfile'>): string {
+  const h = createHash('sha256').update(`${scanId}|${mergeKey(d)}`).digest('hex');
   return `fx_${h.slice(0, 20)}`;
 }
 
@@ -424,7 +434,7 @@ export async function buildFixPlan(input: BuildFixPlanInput): Promise<{ plan: Fi
   // 5. merge per (ecosystem, manifestDir, kind, package)
   const merged = new Map<string, Draft>();
   for (const d of drafts) {
-    const key = `${d.ecosystem}|${d.manifestDir}|${d.kind}|${d.package}`;
+    const key = mergeKey(d);
     const prev = merged.get(key);
     if (!prev) {
       merged.set(key, { ...d, resolves: [...d.resolves], notes: [...d.notes] });

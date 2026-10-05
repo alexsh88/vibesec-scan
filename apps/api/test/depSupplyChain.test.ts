@@ -103,3 +103,19 @@ describe('supplyChainSignals', () => {
     expect(performance.now() - t0).toBeLessThan(500);
   });
 });
+
+describe('supplyChainSignals — non-registry-source grouping', () => {
+  it('collapses every package from one host into ONE signal per lockfile (direct representative, low if any direct)', () => {
+    const a = node('npm', 'zeta-fork', { nonRegistrySource: 'git+https://github.com/x/zeta.git' });
+    const b = node('npm', 'alpha-fork', { direct: true, nonRegistrySource: 'github:x/alpha' });
+    const c = node('npm', 'mid-fork', { nonRegistrySource: 'git+ssh://git@github.com/x/mid.git' });
+    const d = node('npm', 'other-host', { nonRegistrySource: 'https://cdn.example.org/o.tgz' });
+    const sigs = supplyChainSignals(graph('npm', [a, b, c, d]), new Map()).filter((s) => s.ruleId === 'supply-chain/non-registry-source');
+    expect(sigs).toHaveLength(2);
+    const gh = sigs.find((s) => s.host === 'github.com')!;
+    expect(gh).toMatchObject({ key: b.key, severity: 'low' });
+    expect(gh.title).toMatch(/3 packages/);
+    for (const n of ['alpha-fork@1.0.0', 'mid-fork@1.0.0', 'zeta-fork@1.0.0']) expect(gh.reason).toContain(n);
+    expect(sigs.find((s) => s.host === 'cdn.example.org')).toMatchObject({ key: d.key, severity: 'info' });
+  });
+});

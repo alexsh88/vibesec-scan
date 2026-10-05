@@ -99,9 +99,11 @@ describe('parseDependencyGraphs', () => {
 
     const reqDev = graphs.find((g) => g.lockfile === 'services/worker/requirements-dev.txt')!;
     expect(reqDev).toBeDefined();
-    // follows "-r requirements.txt" into the sibling file, plus its own pin, all scope 'dev'.
+    // follows "-r requirements.txt" into the sibling file (those stay 'prod'), plus its own pin ('dev').
     expect([...reqDev.nodes.keys()].sort()).toEqual(['PyPI:click@8.1.7', 'PyPI:flask@2.3.3', 'PyPI:pytest@7.4.0']);
-    expect([...reqDev.nodes.values()].every((n) => n.scope === 'dev' && n.direct)).toBe(true);
+    expect([...reqDev.nodes.values()].every((n) => n.direct)).toBe(true);
+    expect(reqDev.nodes.get('PyPI:flask@2.3.3')!.scope).toBe('prod');
+    expect(reqDev.nodes.get('PyPI:pytest@7.4.0')!.scope).toBe('dev');
 
     expect(graphs.some((g) => g.lockfile.includes('node_modules'))).toBe(false);
     expect(warnings).toEqual([]);

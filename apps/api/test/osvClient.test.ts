@@ -287,3 +287,32 @@ describe('OsvClient — structured failures (never silently "no vulnerabilities"
     expect(res.byKey.has('npm:a@1.0.0')).toBe(false);
   });
 });
+
+describe('advisory cache purge', () => {
+  it('purgeExpired deletes only rows older than the TTL', () => {
+    const cache = new AdvisoryCacheRepo(memoryDb());
+    const now = new Date('2026-06-01T00:00:00Z');
+    cache.set('pkg', 'old', ['A'], new Date(now.getTime() - 25 * 3600_000));
+    cache.set('vuln', 'fresh', { id: 'x' }, new Date(now.getTime() - 3600_000));
+    expect(cache.purgeExpired(now)).toBe(1);
+    expect(cache.get('pkg', 'old')).toBeUndefined();
+    expect(cache.get('vuln', 'fresh')).toBeDefined();
+  });
+
+  it('OsvClient purges expired rows on startup and at most hourly afterwards', async () => {
+    const cache = new AdvisoryCacheRepo(memoryDb());
+    let now = new Date('2026-06-01T00:00:00Z');
+    cache.set('pkg', 'stale-1', [], new Date(now.getTime() - 48 * 3600_000));
+    const fetchMock = vi.fn(async () => jsonResponse(200, { results: [{ vulns: [] }] }));
+    const client = new OsvClient({ fetch: fetchMock as unknown as typeof fetch, cache, now: () => now });
+    expect(cache.get('pkg', 'stale-1')).toBeUndefined();
+
+    cache.set('pkg', 'stale-2', [], new Date(now.getTime() - 48 * 3600_000));
+    const pkg = { key: 'npm:a@1.0.0', ecosystem: 'npm' as const, name: 'a', version: '1.0.0' };
+    await client.advisoriesFor([pkg], new AbortController().signal);
+    expect(cache.get('pkg', 'stale-2')).toBeDefined(); // < 1 h since the startup purge
+    now = new Date(now.getTime() + 61 * 60_000);
+    await client.advisoriesFor([pkg], new AbortController().signal);
+    expect(cache.get('pkg', 'stale-2')).toBeUndefined();
+  });
+});

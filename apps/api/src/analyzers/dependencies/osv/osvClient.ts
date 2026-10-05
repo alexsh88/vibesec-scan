@@ -47,6 +47,7 @@ const QUERYBATCH_CHUNK = 1000;
 const DETAIL_CONCURRENCY = 8;
 const QUERYBATCH_TIMEOUT_MS = 15_000;
 const DETAIL_TIMEOUT_MS = 10_000;
+const PURGE_INTERVAL_MS = 60 * 60 * 1000;
 
 type BatchQuery = { package: { name: string; ecosystem: string }; version: string; page_token?: string };
 type BatchResult = { vulns?: Array<{ id: string }>; next_page_token?: string };
@@ -73,9 +74,25 @@ export class OsvClient {
     this.baseUrl = deps.baseUrl ?? 'https://api.osv.dev';
     this.breaker = deps.breaker ?? new CircuitBreaker('OSV API', { failureThreshold: 5, resetMs: 30_000, unavailableCode: 'OSV_UNAVAILABLE' });
     this.retryDeps = deps.retryDeps;
+    this.purgeCache(); // startup: drop rows that can never be served again
+  }
+
+  private lastPurgeAt = 0;
+
+  /** Deletes expired advisory_cache rows; best-effort, at most once per hour (opportunistic after startup). */
+  private purgeCache(): void {
+    const now = this.now();
+    if (this.lastPurgeAt !== 0 && now.getTime() - this.lastPurgeAt < PURGE_INTERVAL_MS) return;
+    this.lastPurgeAt = now.getTime();
+    try {
+      this.cache.purgeExpired(now);
+    } catch {
+      // never let cache housekeeping fail a scan
+    }
   }
 
   async advisoriesFor(pkgs: readonly OsvPackageInput[], signal: AbortSignal): Promise<OsvAdvisoriesResult> {
+    this.purgeCache();
     const errors: string[] = [];
     const byKey = new Map<string, OsvAdvisory[]>();
     const failedKeys: string[] = [];

@@ -4,7 +4,7 @@ import { dirname, join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { FindingSchema, ScanOptionsSchema, type Finding, type FixPlan, type ScanDto } from '@vibesec/shared';
 import {
-  computeSeverity, createDependenciesAnalyzer, parseSandboxUsages, type DependenciesAnalyzerDeps,
+  computeSeverity, createDependenciesAnalyzer, lockfileEntryLine, parseSandboxUsages, type DependenciesAnalyzerDeps,
 } from '../src/analyzers/dependencies/dependenciesAnalyzer';
 import { dependencyReachabilityMockResponder } from '../src/analyzers/dependencies/reachabilityJudge';
 import type { Ecosystem, OsvAdvisory } from '../src/analyzers/dependencies/types';
@@ -543,5 +543,54 @@ describe('createDependenciesAnalyzer', () => {
     const { analyzer } = setup({ sandbox, sandboxEnabled: true });
     await expect(analyzer.run(makeCtx(files, ac.signal).ctx)).rejects.toMatchObject({ kind: 'cancelled' });
     expect(sandbox.sweep).toHaveBeenCalledWith('scan-1');
+  });
+});
+
+describe('lockfileEntryLine (finding location inside pnpm / yarn lockfiles)', () => {
+  it('pnpm: matches the package\'s own key line, not a substring elsewhere', () => {
+    const lines = [
+      "lockfileVersion: '9.0'",
+      'importers:',
+      '  .:',
+      '    dependencies:',
+      '      lodash-es:',
+      '        specifier: ^4.17.0',
+      '        version: 4.17.21',
+      'packages:',
+      '  lodash-es@4.17.21:',
+      '    resolution: {integrity: sha512-x}',
+      "  '@scope/lodash@4.17.20':",
+      '  lodash@4.17.20:',
+      '  /lodash/4.17.19:',
+      'snapshots:',
+      '  lodash@4.17.20(react@18.2.0):',
+    ];
+    expect(lockfileEntryLine(lines, 'pnpm-lock.yaml', 'lodash', '4.17.20')).toBe(12);
+    expect(lockfileEntryLine(lines, 'pnpm-lock.yaml', '@scope/lodash', '4.17.20')).toBe(11);
+    expect(lockfileEntryLine(lines, 'pnpm-lock.yaml', 'lodash', '4.17.19')).toBe(13);
+    expect(lockfileEntryLine(lines, 'pnpm-lock.yaml', 'lodash', '9.9.9')).toBeNull();
+  });
+
+  it('yarn: matches the entry header whose block has the version (v1 and berry)', () => {
+    const v1 = [
+      '# yarn lockfile v1',
+      '',
+      'lodash-es@^4.17.0:',
+      '  version "4.17.21"',
+      '',
+      'lodash@^4.17.0, lodash@~4.17.10:',
+      '  version "4.17.21"',
+      '',
+      'lodash@^3.0.0:',
+      '  version "3.10.1"',
+      '',
+      '"@babel/core@^7.0.0":',
+      '  version "7.24.0"',
+    ];
+    expect(lockfileEntryLine(v1, 'yarn.lock', 'lodash', '3.10.1')).toBe(9);
+    expect(lockfileEntryLine(v1, 'yarn.lock', 'lodash', '4.17.21')).toBe(6);
+    expect(lockfileEntryLine(v1, 'yarn.lock', '@babel/core', '7.24.0')).toBe(12);
+    const berry = ['__metadata:', '  version: 8', '', '"lodash@npm:^4.17.0":', '  version: 4.17.21', '  resolution: "lodash@npm:4.17.21"'];
+    expect(lockfileEntryLine(berry, 'yarn.lock', 'lodash', '4.17.21')).toBe(4);
   });
 });

@@ -4,7 +4,7 @@
 //   - typosquat: name within Damerau-Levenshtein distance 1 (or a separator-only variant) of a popular
 //     package that is not itself popular
 //   - non-registry-source: git / tarball URL / file dependencies (host only — credentials, paths and
-//     query strings are never echoed)
+//     query strings are never echoed); ONE signal per host per graph (lockfile), listing its packages
 // Pure and deterministic (sorted by node key, then rule id).
 
 import { normalizePypiName } from './lockfiles/graph';
@@ -24,7 +24,11 @@ export type SupplyChainSignal = {
   title: string;
   reason: string;
   similarTo?: string;
+  /** non-registry-source: the (credential-free) host; one signal per host per lockfile. */
+  host?: string;
 };
+
+const MAX_LISTED = 8;
 
 const MIN_TYPOSQUAT_LENGTH = 4;
 
@@ -122,6 +126,7 @@ const label = (n: DepNode): string => `${n.name}@${n.version}`;
 
 export function supplyChainSignals(graph: DepGraph, advisoriesByKey: Map<string, OsvAdvisory[]>): SupplyChainSignal[] {
   const out: SupplyChainSignal[] = [];
+  const byHost = new Map<string, DepNode[]>();
   for (const node of graph.nodes.values()) {
     const mal = (advisoriesByKey.get(node.key) ?? []).filter((a) => a.malicious || a.id.startsWith('MAL-'));
     if (mal.length > 0) {
@@ -152,13 +157,34 @@ export function supplyChainSignals(graph: DepGraph, advisoriesByKey: Map<string,
 
     if (node.nonRegistrySource) {
       const host = sourceHost(node.nonRegistrySource);
-      const where = host === 'git' ? 'a git repository' : host === 'file' ? 'a local file path' : host;
-      out.push({
-        key: node.key, ruleId: 'supply-chain/non-registry-source', severity: node.direct ? 'low' : 'info',
-        title: `${label(node)} is installed from outside the public registry`,
-        reason: `${node.name} is resolved from ${where} instead of the public ${node.ecosystem} registry, bypassing registry integrity and malware checks`,
-      });
+      const list = byHost.get(host);
+      if (list) list.push(node);
+      else byHost.set(host, [node]);
     }
+  }
+
+  // non-registry-source: one signal per host (a monorepo of git deps would otherwise flood the report).
+  for (const [host, nodes] of byHost) {
+    nodes.sort((a, b) => Number(b.direct) - Number(a.direct) || (a.key < b.key ? -1 : a.key > b.key ? 1 : 0));
+    const rep = nodes[0]!;
+    const where = host === 'git' ? 'a git repository' : host === 'file' ? 'a local file path' : host;
+    const eco = rep.ecosystem;
+    const anyDirect = nodes.some((n) => n.direct);
+    if (nodes.length === 1) {
+      out.push({
+        key: rep.key, ruleId: 'supply-chain/non-registry-source', severity: rep.direct ? 'low' : 'info', host,
+        title: `${label(rep)} is installed from outside the public registry`,
+        reason: `${rep.name} is resolved from ${where} instead of the public ${eco} registry, bypassing registry integrity and malware checks`,
+      });
+      continue;
+    }
+    const labels = nodes.map(label).sort();
+    const shown = labels.slice(0, MAX_LISTED).join(', ') + (labels.length > MAX_LISTED ? ` and ${labels.length - MAX_LISTED} more` : '');
+    out.push({
+      key: rep.key, ruleId: 'supply-chain/non-registry-source', severity: anyDirect ? 'low' : 'info', host,
+      title: `${nodes.length} packages are installed from ${where} (outside the public registry)`,
+      reason: `${shown} are resolved from ${where} instead of the public ${eco} registry, bypassing registry integrity and malware checks`,
+    });
   }
   return out.sort((a, b) => (a.key < b.key ? -1 : a.key > b.key ? 1 : a.ruleId < b.ruleId ? -1 : a.ruleId > b.ruleId ? 1 : 0));
 }

@@ -437,3 +437,21 @@ describe('safeUpgradeVersion / isAffected', () => {
     expect(safeUpgradeVersion('npm', '1.1.0', [advR('C', [{ introduced: '0' }])])).toBeNull();
   });
 });
+
+describe('buildFixPlan — per-file Python manifests', () => {
+  it('requirements files in the same dir get one action each (the command names the file to edit)', async () => {
+    const prod = graph('PyPI', 'svc/requirements.txt', [{ name: 'x', version: '1.0.0', direct: true }], 'svc');
+    const dev = graph('PyPI', 'svc/requirements-dev.txt', [{ name: 'x', version: '1.0.0', direct: true, dev: true }], 'svc');
+    const reg = new FakeRegistry({ x: ['1.0.0', '1.0.1'] });
+    const { plan: p } = await plan([vuln(prod, 'x@1.0.0', [adv('A', ['1.0.1'])]), vuln(dev, 'x@1.0.0', [adv('A', ['1.0.1'])])], reg);
+    expect(p.actions.map((a) => a.command).sort()).toEqual(['set `x==1.0.1` in requirements-dev.txt', 'set `x==1.0.1` in requirements.txt']);
+    expect(new Set(p.actions.map((a) => a.id)).size).toBe(2);
+  });
+
+  it('npm lockfiles in one dir still merge into one action', async () => {
+    const a = graph('npm', 'web/package-lock.json', [{ name: 'x', version: '1.0.0', direct: true }], 'web');
+    const b = graph('npm', 'web/package-lock.json', [{ name: 'x', version: '1.0.0', direct: true }], 'web');
+    const { plan: p } = await plan([vuln(a, 'x@1.0.0', [adv('A', ['1.0.1'])]), vuln(b, 'x@1.0.0', [adv('B', ['1.0.1'])])], new FakeRegistry({ x: ['1.0.0', '1.0.1'] }));
+    expect(p.actions).toHaveLength(1);
+  });
+});

@@ -67,7 +67,8 @@ export function extractPyprojectDirect(content: string): Map<string, { scope: De
       if (optional) {
         for (const specs of Object.values(optional)) {
           if (!Array.isArray(specs)) continue;
-          for (const spec of specs) if (typeof spec === 'string') addDirect(out, pep508Name(spec), 'dev');
+          // Extras are installable by consumers (pip install pkg[extra]): prod, not dev.
+          for (const spec of specs) if (typeof spec === 'string') addDirect(out, pep508Name(spec), 'prod');
         }
       }
     }
@@ -308,7 +309,9 @@ function parseRequirementsLines(content: string): ReqEntry[] {
  *  includes (cycle-safe) against the full set of sibling requirements files read by the caller. */
 export function buildRequirementsGraph(ref: LockfileRef, filesInDir: ReadonlyMap<string, string>): DepGraph {
   const builder = new GraphBuilder('PyPI');
-  const scope: DepScope = /dev|test/i.test(posix.basename(ref.path)) ? 'dev' : 'prod';
+  // Scope comes from the file that declares the requirement, not the entry point: requirements-dev.txt
+  // including '-r requirements.txt' must not turn the prod pins into dev ones.
+  const scopeOf = (basename: string): DepScope => (/dev|test/i.test(basename) ? 'dev' : 'prod');
   const visitedFiles = new Set<string>();
 
   const visit = (basename: string): void => {
@@ -333,12 +336,12 @@ export function buildRequirementsGraph(ref: LockfileRef, filesInDir: ReadonlyMap
       } else if (entry.kind === 'pin') {
         const name = normalizePypiName(entry.name);
         const node = builder.node(name, entry.version);
-        builder.markDirect(node.key, scope, entry.version);
+        builder.markDirect(node.key, scopeOf(basename), entry.version);
       } else {
         const name = normalizePypiName(entry.name);
         const version = entry.specifier.length > 0 ? entry.specifier : 'unknown';
         const node = builder.node(name, version);
-        builder.markDirect(node.key, scope, entry.specifier);
+        builder.markDirect(node.key, scopeOf(basename), entry.specifier);
         builder.warn(`${basename}: unpinned requirement "${entry.name}${entry.specifier}" recorded with specifier as version`);
       }
     }
@@ -398,7 +401,7 @@ export function parsePyprojectManifestOnly(ref: LockfileRef, content: string): D
           if (!Array.isArray(specs)) continue;
           for (const spec of specs) {
             if (typeof spec !== 'string') continue;
-            addManifestOnly(builder, pep508Name(spec), pep508Range(spec), 'dev');
+            addManifestOnly(builder, pep508Name(spec), pep508Range(spec), 'prod'); // extras: prod
             any = true;
           }
         }

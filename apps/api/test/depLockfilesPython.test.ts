@@ -108,7 +108,7 @@ lint = ["ruff"]
     expect(direct.get('requests')).toEqual({ scope: 'prod' });
     expect(direct.get('click[extras]')).toBeUndefined(); // pep508Name strips the bracket extras already
     expect(direct.get('click')).toEqual({ scope: 'prod' });
-    expect(direct.get('pytest')).toEqual({ scope: 'dev' });
+    expect(direct.get('pytest')).toEqual({ scope: 'prod' }); // extras are installable by consumers: prod
     expect(direct.get('ruff')).toEqual({ scope: 'dev' });
   });
 });
@@ -238,7 +238,12 @@ describe('requirements*.txt', () => {
     expect([...dev.nodes.keys()].sort()).toEqual(['PyPI:click@8.1.7', 'PyPI:flask@2.3.3', 'PyPI:pytest@7.4.0', 'PyPI:requests@>=2.0']);
     expect(dev.nodes.get('PyPI:requests@>=2.0')!.declaredRange).toBe('>=2.0');
     expect(dev.warnings.some((w) => w.includes('unpinned'))).toBe(true);
-    expect([...dev.nodes.values()].every((n) => n.scope === 'dev' && n.direct)).toBe(true);
+    expect([...dev.nodes.values()].every((n) => n.direct)).toBe(true);
+    // packages that come from the included prod file keep scope 'prod' (they are not dev-only)
+    expect(dev.nodes.get('PyPI:flask@2.3.3')!.scope).toBe('prod');
+    expect(dev.nodes.get('PyPI:click@8.1.7')!.scope).toBe('prod');
+    expect(dev.nodes.get('PyPI:pytest@7.4.0')!.scope).toBe('dev');
+    expect(dev.nodes.get('PyPI:requests@>=2.0')!.scope).toBe('dev');
   });
 
   it('warns instead of throwing when an -r target is missing', () => {
@@ -262,7 +267,7 @@ test = ["pytest>=7"]
     expect(g.source).toBe('manifest-only');
     expect(g.nodes.get('PyPI:requests@>=2.0')!.direct).toBe(true);
     expect(g.nodes.get('PyPI:requests@>=2.0')!.scope).toBe('prod');
-    expect(g.nodes.get('PyPI:pytest@>=7')!.scope).toBe('dev');
+    expect(g.nodes.get('PyPI:pytest@>=7')!.scope).toBe('prod'); // optional-dependencies (extras) are prod
     expect(g.warnings.some((w) => w.includes('no lockfile'))).toBe(true);
   });
 

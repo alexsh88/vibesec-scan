@@ -151,8 +151,51 @@ function findLine(lines: readonly string[], pred: (line: string) => boolean): nu
 
 const PY_REQ_NAME_RE = /^\s*([A-Za-z0-9][A-Za-z0-9._-]*)/;
 
+const unquoteSpec = (s: string): string => s.trim().replace(/^["']|["']$/g, '');
+
+/**
+ * 1-based line of `name@version`'s OWN entry key in a pnpm-lock.yaml / yarn.lock (null if absent): pnpm
+ * `name@version:` / `/name/version:` (optionally quoted, with peer suffixes); yarn the header line whose
+ * specs name the package and whose block carries that version. Never a substring hit inside another
+ * package's name or block.
+ */
+export function lockfileEntryLine(lines: readonly string[], lockBase: string, name: string, version: string): number | null {
+  if (lockBase === 'pnpm-lock.yaml') {
+    for (let i = 0; i < lines.length; i++) {
+      let t = unquoteSpec(lines[i]!.trim().replace(/:$/, ''));
+      if (t.startsWith('/')) t = t.slice(1);
+      for (const prefix of [`${name}@${version}`, `${name}/${version}`]) {
+        if (!t.startsWith(prefix)) continue;
+        const rest = t.slice(prefix.length);
+        if (rest === '' || rest.startsWith('(') || rest.startsWith('_')) return i + 1;
+      }
+    }
+    return null;
+  }
+  if (lockBase === 'yarn.lock') {
+    const versionRe = new RegExp(`^\\s+version:?\\s+"?${escapeRe(version)}"?\\s*$`);
+    let fallback: number | null = null;
+    for (let i = 0; i < lines.length; i++) {
+      const raw = lines[i]!;
+      if (/^\s/.test(raw) || !raw.trimEnd().endsWith(':')) continue;
+      const specs = raw.trimEnd().slice(0, -1).replace(/^"|"$/g, '').split(',').map(unquoteSpec);
+      if (!specs.some((s) => s.startsWith(`${name}@`))) continue;
+      fallback ??= i + 1;
+      for (let j = i + 1; j < lines.length; j++) {
+        const l = lines[j]!;
+        if (l.trim() !== '' && !/^\s/.test(l)) break; // next entry header
+        if (versionRe.test(l)) return i + 1;
+      }
+    }
+    return fallback;
+  }
+  return null;
+}
+
+type DeclCandidate = { file: string; match: (line: string) => boolean; find?: (lines: readonly string[]) => number | null };
+
 /** Files + literal matchers that declare `node` (direct deps: the manifest first; then the lockfile). */
-function declarationCandidates(graph: DepGraph, node: DepNode): Array<{ file: string; match: (line: string) => boolean }> {
+function declarationCandidates(graph: DepGraph, node: DepNode): DeclCandidate[] {
   const lockfile = graph.lockfile;
   const base = basenameOf(lockfile).toLowerCase();
   const name = node.name;
@@ -164,11 +207,12 @@ function declarationCandidates(graph: DepGraph, node: DepNode): Array<{ file: st
   const pyMention = (line: string): boolean => normalizePypiName(line.toLowerCase()).includes(pyNorm);
   const npmManifest = (line: string): boolean => line.trimStart().startsWith(`"${name}"`);
   const npmLock = (line: string): boolean => line.includes(`node_modules/${name}"`);
-  const out: Array<{ file: string; match: (line: string) => boolean }> = [];
+  const out: DeclCandidate[] = [];
 
   if (graph.ecosystem === 'npm') {
     if (node.direct) out.push({ file: joinRel(graph.manifestDir, 'package.json'), match: npmManifest });
-    out.push({ file: lockfile, match: base === 'package-lock.json' || base === 'npm-shrinkwrap.json' ? npmLock : (l) => l.includes(name) });
+    if (base === 'package-lock.json' || base === 'npm-shrinkwrap.json') out.push({ file: lockfile, match: npmLock });
+    else out.push({ file: lockfile, match: () => false, find: (lines) => lockfileEntryLine(lines, base, name, node.version) });
     return out;
   }
   if (/^requirements.*\.txt$/.test(base) || base === 'pyproject.toml') {
@@ -191,7 +235,7 @@ async function locate(read: (rel: string) => Promise<string[] | null>, graph: De
     const lines = await read(c.file);
     if (!lines) continue;
     fallback ??= { file: c.file, lines };
-    const line = findLine(lines, c.match);
+    const line = c.find ? c.find(lines) : findLine(lines, c.match);
     if (line !== null) return { file: c.file, line, snippet: truncate(lines[line - 1]!.trim(), MAX_SNIPPET) };
   }
   if (fallback) return { file: fallback.file, line: 1, snippet: truncate((fallback.lines[0] ?? '').trim(), MAX_SNIPPET) };
@@ -564,7 +608,11 @@ export function createDependenciesAnalyzer(deps: DependenciesAnalyzerDeps): Anal
           if (!node) continue;
           const verdict = verdicts.get(`${graph.lockfile}|${node.key}`);
           const loc = await locate(read, graph, node);
-          const fp = fingerprint(['dependency', s.ruleId, graph.ecosystem, node.name, node.version, graph.lockfile]);
+          // non-registry-source is one finding per host per lockfile: keyed by the host, not by whichever
+          // package happens to represent it.
+          const fp = s.ruleId === 'supply-chain/non-registry-source' && s.host !== undefined
+            ? fingerprint(['dependency', s.ruleId, graph.ecosystem, `host:${s.host}`, graph.lockfile])
+            : fingerprint(['dependency', s.ruleId, graph.ecosystem, node.name, node.version, graph.lockfile]);
           const id = fingerprint([ctx.scanId, fp]).slice(0, 32);
           const isMal = s.ruleId === 'supply-chain/malicious-package';
           const mal = isMal ? (advisoriesByKey.get(node.key) ?? []).filter((a) => a.malicious || a.id.startsWith('MAL-')) : [];
