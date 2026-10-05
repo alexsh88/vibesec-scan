@@ -5,3 +5,6 @@ dist/
 .env
 coverage/
 test_output.txt
+
+# Planning docs are kept local only
+docs/superpowers/plans/
