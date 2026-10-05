@@ -114,4 +114,27 @@ describe('resolvePyImport', () => {
     expect(resolvePyImport('main.py', imp('PIL.Image'), ctx)[0]?.pkg).toBe('pillow');
     expect(resolvePyImport('main.py', imp('sklearn.linear_model'), ctx)[0]?.pkg).toBe('scikit-learn');
   });
+
+  it('treats platform-specific and private stdlib modules as builtin, mapping _pytest to the pytest distribution', () => {
+    expect(resolvePyImport('main.py', imp('msvcrt'), ctx)).toEqual([{ specifier: 'msvcrt', kind: 'builtin', to: null, pkg: null }]);
+    expect(resolvePyImport('main.py', imp('_typeshed'), ctx)).toEqual([{ specifier: '_typeshed', kind: 'builtin', to: null, pkg: null }]);
+    expect(resolvePyImport('main.py', imp('_pytest.fixtures'), ctx)[0]).toMatchObject({ kind: 'package', pkg: 'pytest' });
+  });
+
+  it('never produces a package name with a leading or trailing dash', () => {
+    expect(resolvePyImport('main.py', imp('foo_bar'), ctx)[0]).toMatchObject({ kind: 'package', pkg: 'foo-bar' });
+  });
+
+  it("resolves sibling modules via the importing script's own directory, without breaking stdlib classification", () => {
+    const siblingCtx: PyResolveContext = {
+      files: new Set(['tests/test_x.py', 'tests/test_options.py']),
+      roots: [''],
+    };
+    expect(resolvePyImport('tests/test_x.py', imp('test_options'), siblingCtx)).toEqual([
+      { specifier: 'test_options', kind: 'local', to: 'tests/test_options.py', pkg: null },
+    ]);
+    expect(resolvePyImport('tests/test_x.py', imp('os'), siblingCtx)).toEqual([
+      { specifier: 'os', kind: 'builtin', to: null, pkg: null },
+    ]);
+  });
 });

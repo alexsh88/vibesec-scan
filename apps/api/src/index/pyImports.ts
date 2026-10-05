@@ -14,7 +14,10 @@ pathlib pdb pickle pkgutil platform plistlib poplib posixpath pprint profile pst
 readline reprlib resource runpy sched secrets select selectors shelve shlex shutil signal site smtplib socket
 socketserver sqlite3 ssl stat statistics string struct subprocess sys sysconfig syslog tarfile tempfile termios
 textwrap threading time timeit tkinter token tokenize tomllib trace traceback tracemalloc tty types typing unicodedata
-unittest urllib uuid venv warnings wave weakref webbrowser winreg wsgiref xml xmlrpc zipapp zipfile zipimport zlib zoneinfo`
+unittest urllib uuid venv warnings wave weakref webbrowser winreg wsgiref xml xmlrpc zipapp zipfile zipimport zlib zoneinfo
+msvcrt winsound _winapi nt posix ntpath genericpath _thread _io _collections_abc _weakrefset sre_compile sre_parse
+sre_constants opcode marshal imp asynchat asyncore distutils lib2to3 ensurepip pydoc doctest code codeop cProfile
+crypt curses dbm fcntl grp nis ossaudiodev pipes spwd telnetlib uu xdrlib zipimport`
   .split(/\s+/));
 
 /** Import name → PyPI distribution, where they differ (lower-cased distribution names). */
@@ -24,6 +27,7 @@ export const IMPORT_TO_DISTRIBUTION: Record<string, string> = {
   OpenSSL: 'pyopenssl', magic: 'python-magic', multipart: 'python-multipart', psycopg2: 'psycopg2-binary',
   MySQLdb: 'mysqlclient', google: 'google-api-core', attr: 'attrs', serial: 'pyserial', usb: 'pyusb',
   telegram: 'python-telegram-bot', docx: 'python-docx', pptx: 'python-pptx', git: 'gitpython', kafka: 'kafka-python',
+  _pytest: 'pytest',
 };
 
 const IMPORT_RE = /^\s*import\s+(.+)$/;
@@ -107,7 +111,8 @@ export function resolvePyImport(fromPath: string, imp: PyImport, ctx: PyResolveC
     for (let up = 1; up < imp.level; up++) dir = parent(dir);
     bases = [dir];
   } else {
-    bases = [...ctx.roots];
+    const importerDir = parent(fromPath);
+    bases = ctx.roots.includes(importerDir) ? [...ctx.roots] : [...ctx.roots, importerDir];
   }
 
   for (const base of bases) {
@@ -130,7 +135,10 @@ export function resolvePyImport(fromPath: string, imp: PyImport, ctx: PyResolveC
   if (imp.level > 0) return [{ specifier, kind: 'unresolved', to: null, pkg: null }];
   const top = imp.module.split('.')[0]!;
   if (STDLIB.has(top)) return [{ specifier, kind: 'builtin', to: null, pkg: null }];
-  const pkg = (IMPORT_TO_DISTRIBUTION[top] ?? top).toLowerCase().replace(/_/g, '-');
+  if (top.startsWith('_') && !(top in IMPORT_TO_DISTRIBUTION)) {
+    return [{ specifier, kind: 'builtin', to: null, pkg: null }];
+  }
+  const pkg = (IMPORT_TO_DISTRIBUTION[top] ?? top).toLowerCase().replace(/_/g, '-').replace(/^-+|-+$/g, '');
   return [{ specifier, kind: 'package', to: null, pkg }];
 }
 
