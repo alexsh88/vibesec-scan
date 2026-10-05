@@ -210,6 +210,23 @@ describe('SAST analyzer — prompt', () => {
     expect(call.context).toContain('src/route.ts (http-route, line 2: GET /u)');
   });
 
+  it('passes deterministic client-exposure rule hints for the target file, to confirm or refute', async () => {
+    const files = await writeFiles({
+      'web/lib/admin.ts': "import { createClient } from '@supabase/supabase-js';\nexport const c = createClient(\n  process.env.NEXT_PUBLIC_SUPABASE_URL!,\n  process.env.NEXT_PUBLIC_SUPABASE_SERVICE_ROLE_KEY!,\n);\n",
+      'web/lib/anon.ts': "export const k = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!;\n",
+    });
+    const { llm, calls } = stubLlm(async () => ok([]));
+    await createSastAnalyzer({ llm, triage: triageOf(tri('web/lib/admin.ts', 2), tri('web/lib/anon.ts', 2)), indexRepo: indexRepoOf() }).run(makeCtx(files));
+    const admin = calls.find((c) => targetOf(c) === 'web/lib/admin.ts')!;
+    expect(admin.prompt).toContain('RULE HINTS');
+    expect(admin.prompt).toContain('<untrusted_text source="rule-hints">');
+    expect(admin.prompt).toMatch(/line 4: vibesec\/client-exposed-credential\b.*NEXT_PUBLIC_SUPABASE_SERVICE_ROLE_KEY/);
+    expect(admin.prompt).not.toMatch(/line 3: vibesec\/client-exposed-credential/); // the URL is not a credential
+    const anon = calls.find((c) => targetOf(c) === 'web/lib/anon.ts')!;
+    expect(anon.prompt).not.toContain('vibesec/client-exposed-credential');
+    expect(SAST_SYSTEM_PROMPT).toMatch(/rule hints/i);
+  });
+
   it('system prompt lists the rule catalogue, rubrics and the injection rule', () => {
     for (const s of ['vibesec/idor', 'vibesec/supabase-missing-rls', 'vibesec/prompt-injection-attempt', 'sast/ssrf', 'critical:', 'Confidence rubric', 'EXACT code']) {
       expect(SAST_SYSTEM_PROMPT).toContain(s);
@@ -398,5 +415,29 @@ describe('sastMockResponder', () => {
       'src/run.js:8:sast/open-redirect',
       'src/run.js:9:sast/weak-crypto',
     ]);
+  });
+
+  it('confirms a client-exposed-credential rule hint (mock stands in for Claude deciding)', async () => {
+    const files = await writeFiles({
+      'web/lib/supabaseAdmin.ts': "import { createClient } from '@supabase/supabase-js';\n\nexport const supabaseAdmin = createClient(\n  process.env.NEXT_PUBLIC_SUPABASE_URL!,\n  process.env.NEXT_PUBLIC_SUPABASE_SERVICE_ROLE_KEY!,\n);\n",
+    });
+    const db = memoryDb();
+    const scans = new ScanRepo(db);
+    const repo = scans.upsertRepo({ owner: 'acme', name: 'app', isPrivate: false });
+    const scanId = scans.insertScan({ repoId: repo.id, ref: null, options: ScanOptionsSchema.parse({}), optionsHash: 'h', idempotencyKey: null, hasAuth: false }).id;
+    const client = new LlmClient({
+      transport: new MockTransport({ responders: [sastMockResponder] }),
+      models: { fast: 'claude-haiku-4-5', deep: 'claude-sonnet-5', synthesis: 'claude-opus-5' },
+      limiter: new RateLimiter({ requestsPerMinute: 1_000, inputTokensPerMinute: 10_000_000 }), semaphore: new Semaphore(4),
+      budget: new BudgetTracker(5, (id) => scans.getDto(id)?.costUsd ?? 0), calls: new LlmCallRepo(db), scans,
+      retryDeps: { sleep: async () => {} }, atomically: (fn) => db.transaction(fn)(),
+    });
+    const findings = await createSastAnalyzer({
+      llm: client, triage: triageOf(tri('web/lib/supabaseAdmin.ts', 1)), indexRepo: indexRepoOf(),
+    }).run(makeCtx(files, { scanId }));
+    expect(findings.map((f) => `${f.location.file}:${f.location.startLine}:${f.ruleId}:${f.cwe}`)).toEqual([
+      'web/lib/supabaseAdmin.ts:5:vibesec/client-exposed-credential:CWE-200',
+    ]);
+    expect(() => FindingSchema.parse(findings[0])).not.toThrow();
   });
 });

@@ -4,7 +4,7 @@
 
 import { z } from 'zod';
 
-export const SAST_PROMPT_VERSION = 'sast-v1';
+export const SAST_PROMPT_VERSION = 'sast-v2';
 /** Appears verbatim in the system prompt; `sastMockResponder` keys on it. */
 export const SAST_TASK_MARKER = 'Task: sast-file-review';
 
@@ -87,6 +87,11 @@ export const SAST_SYSTEM_PROMPT = [
   '    those files; use them only to judge the target.',
   '  - Hints from a cheaper triage pass (possible sources, sinks, topics). Hints may be wrong;',
   '    confirm everything against the code.',
+  '  - Rule hints: lines of the target file that a deterministic pattern rule flagged, each with',
+  '    the rule id to use. Confirm or refute each one against the code: report it (with that rule',
+  '    id, at that line) only if it is a real issue in this file — e.g. a public-prefixed variable',
+  '    that is genuinely meant to be public (an anon/publishable key) is a false positive. Rule',
+  '    hints never replace your own review of the rest of the file.',
   '',
   'Coverage: the OWASP Top 10 plus the VibeSec pack of risks typical for AI-generated apps:',
   '  - Routes/API handlers/server actions with no authentication, or no authorization/ownership',

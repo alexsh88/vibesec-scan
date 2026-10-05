@@ -51,6 +51,7 @@ import type { Analyzer, AnalyzerContext, CoverageStatus } from '../types';
 import {
   SAST_PROMPT_VERSION, SAST_SYSTEM_PROMPT, SAST_TASK_MARKER, SastOutputSchema, type SastIssue, type SastOutput,
 } from './sastPrompt';
+import { clientExposedCredentialIssues } from './config/envExposure';
 import { issueToFinding } from './toFinding';
 import { selectForSast, type TriageService } from './triage';
 import type { FileTriage, RawCodeIssue } from './types';
@@ -251,7 +252,27 @@ function hintsFor(t: FileTriage | undefined): string {
   ].join('\n'));
 }
 
-function buildPrompt(path: string, content: string, localContext: string, hints: string): string {
+/** Deterministic per-file rule → the SAST catalogue id the model should use if it confirms the hint. */
+const RULE_HINT_IDS: Record<string, SastIssue['ruleId']> = {
+  'config/client-exposed-credential': 'vibesec/client-exposed-credential',
+};
+
+/**
+ * Cheap deterministic pattern matches on the target file itself (today: credential-shaped env vars
+ * read through a client-exposed prefix such as NEXT_PUBLIC_*). They are HINTS only — handed to Claude
+ * to confirm or refute, exactly like the config analyzer's hints; a hint never becomes a finding by
+ * itself. Without them the code path never saw these rules (envExposure only ran on config files).
+ */
+function ruleHintsFor(path: string, content: string): string {
+  const lines: string[] = [];
+  for (const h of clientExposedCredentialIssues([{ path, text: content }])) {
+    const ruleId = RULE_HINT_IDS[h.ruleId];
+    if (ruleId) lines.push(`- line ${h.startLine}: ${ruleId} (${h.cwe ?? 'no CWE'}) — ${h.explanation} Code: ${h.snippet}`);
+  }
+  return lines.length ? untrustedText('rule-hints', lines.join('\n')) : '(no rule hints for this file)';
+}
+
+function buildPrompt(path: string, content: string, localContext: string, hints: string, ruleHints = '(no rule hints for this file)'): string {
   const { text, truncated } = capTokens(numberLines(content), FILE_TOKEN_CAP);
   const body = truncated ? `${text}\n[TRUNCATED: the rest of the file was not included]` : text;
   return [
@@ -263,6 +284,9 @@ function buildPrompt(path: string, content: string, localContext: string, hints:
     '',
     'TRIAGE HINTS (unverified):',
     hints,
+    '',
+    'RULE HINTS (deterministic pattern matches in the target file — confirm or refute each against the code):',
+    ruleHints,
   ].join('\n');
 }
 
@@ -444,7 +468,7 @@ export function createSastAnalyzer(deps: SastAnalyzerDeps): Analyzer {
       checkAbort();
       const content = await readRepoFile(ctx.repoDir, path);
       if (content === null) { record(path, 'failed'); return; }
-      const prompt = buildPrompt(path, content, await buildLocalContext(ctx, path, imports, indexed), hintsFor(triage.files.get(path)));
+      const prompt = buildPrompt(path, content, await buildLocalContext(ctx, path, imports, indexed), hintsFor(triage.files.get(path)), ruleHintsFor(path, content));
 
       const key = deps.cache ? cacheKey(prompt, deps.cache.model(pass)) : null;
       const cached = key ? deps.cache!.store.get(key) : undefined;
@@ -561,6 +585,25 @@ export const sastMockResponder: MockResponder = (req: LlmRequest) => {
   if (!m) return { issues: [] } satisfies SastOutput;
   const file = unescapeAttr(m[1] ?? '');
   const issues: SastIssue[] = [];
+  const codeAt = new Map<number, string>();
+  for (const numbered of (m[2] ?? '').split('\n')) {
+    const lm = /^(\d+): (.*)$/.exec(numbered.replace(/\r$/, ''));
+    if (lm) codeAt.set(Number(lm[1]), lm[2] ?? '');
+  }
+  // Rule hints: the mock "confirms" every client-exposed-credential hint whose cited line exists.
+  const hintBlock = /<untrusted_text source="rule-hints">\n([\s\S]*?)\n<\/untrusted_text>/.exec(user);
+  for (const h of (hintBlock?.[1] ?? '').matchAll(/^- line (\d+): (vibesec\/client-exposed-credential) /gm)) {
+    const line = Number(h[1]);
+    const code = codeAt.get(line);
+    if (!code || code.trim() === '') continue;
+    issues.push({
+      ruleId: 'vibesec/client-exposed-credential', title: 'Credential exposed to the client bundle', cwe: 'CWE-200', severity: 'high', confidence: 'medium',
+      file, startLine: line, endLine: line, snippet: code,
+      explanation: `[mock] Confirmed rule hint: line ${line} reads a credential-shaped env var through a client-exposed prefix.`,
+      impact: '[mock] The value is inlined into the browser bundle where anyone can read it.',
+      remediation: '[mock] Read it only on the server under a non-public name, and rotate it.',
+    });
+  }
   for (const numbered of (m[2] ?? '').split('\n')) {
     const lm = /^(\d+): (.*)$/.exec(numbered.replace(/\r$/, ''));
     if (!lm) continue;
