@@ -120,7 +120,7 @@ function parseV9(builder: GraphBuilder, raw: JsonRecord): void {
 export function parsePnpmLock(ref: LockfileRef, content: string): DepGraph {
   const builder = new GraphBuilder('npm');
   try {
-    const raw = parseYaml(content, { maxAliasCount: 1000 });
+    const raw = parseYaml(content, { maxAliasCount: 1000, uniqueKeys: false });
     if (!isPlainObject(raw)) throw new Error('top-level YAML value is not a mapping');
     if (isPlainObject(raw.importers)) {
       parseV9(builder, raw);

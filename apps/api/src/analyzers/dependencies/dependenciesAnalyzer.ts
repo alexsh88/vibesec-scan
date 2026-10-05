@@ -359,7 +359,7 @@ export function createDependenciesAnalyzer(deps: DependenciesAnalyzerDeps): Anal
 
     async run(ctx: AnalyzerContext): Promise<Finding[]> {
       const { signal } = ctx;
-      const { graphs } = await parseDependencyGraphs({ repoDir: ctx.repoDir, files: ctx.files, signal });
+      const { graphs } = await parseDependencyGraphs({ repoDir: ctx.repoDir, files: ctx.files, signal, touch: ctx.touch });
       if (graphs.length === 0) return [];
       ctx.touch();
       const read = createLineReader(ctx.repoDir);

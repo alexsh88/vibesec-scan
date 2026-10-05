@@ -7,6 +7,9 @@ import type { DepGraph, DepNode, DepScope, Ecosystem } from '../types';
 /** Hard safety cap: attacker-controlled lockfiles must never let a graph grow unbounded. */
 export const NODE_CAP = 50_000;
 
+/** Hard safety cap on edges per graph (a 50k-node lockfile can still declare millions of edges). */
+export const EDGE_CAP = 500_000;
+
 /** Keys that must never be treated as data when walking attacker-controlled JSON/YAML/TOML. */
 const DANGEROUS_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
 
@@ -50,6 +53,11 @@ export class GraphBuilder {
   /** key -> most-generous declared scope seen for it as a direct/root dependency ('prod' wins). */
   private readonly rootDeclared = new Map<string, DepScope>();
   private capWarned = false;
+  /** O(1) edge dedupe (arrays on DepNode stay the public shape; `includes` would be quadratic). */
+  private readonly childSets = new Map<string, Set<string>>();
+  private readonly parentSets = new Map<string, Set<string>>();
+  private edgeCount = 0;
+  private edgeCapWarned = false;
 
   constructor(readonly ecosystem: Ecosystem) {}
 
@@ -94,8 +102,31 @@ export class GraphBuilder {
     const parent = this.nodes.get(parentKey);
     const child = this.nodes.get(childKey);
     if (!parent || !child) return;
-    if (!parent.children.includes(childKey)) parent.children.push(childKey);
-    if (!child.parents.includes(parentKey)) child.parents.push(parentKey);
+    let kids = this.childSets.get(parentKey);
+    if (!kids) {
+      kids = new Set(parent.children);
+      this.childSets.set(parentKey, kids);
+    }
+    if (kids.has(childKey)) return;
+    if (this.edgeCount >= EDGE_CAP) {
+      if (!this.edgeCapWarned) {
+        this.edgeCapWarned = true;
+        this.warnings.push(`graph truncated at ${EDGE_CAP} edges (edge cap reached)`);
+      }
+      return;
+    }
+    this.edgeCount++;
+    kids.add(childKey);
+    parent.children.push(childKey);
+    let ps = this.parentSets.get(childKey);
+    if (!ps) {
+      ps = new Set(child.parents);
+      this.parentSets.set(childKey, ps);
+    }
+    if (!ps.has(parentKey)) {
+      ps.add(parentKey);
+      child.parents.push(parentKey);
+    }
   }
 
   /** Marks a node as a direct/root dependency with the given declared scope ('prod' is sticky). */
@@ -125,8 +156,9 @@ export class GraphBuilder {
 
     const visited = new Set<string>();
     const queue: string[] = [...prodRoots];
-    while (queue.length > 0) {
-      const k = queue.shift()!;
+    // Index cursor instead of shift(): shift() is O(n) per call, i.e. quadratic BFS on big graphs.
+    for (let head = 0; head < queue.length; head++) {
+      const k = queue[head]!;
       if (visited.has(k)) continue;
       visited.add(k);
       const n = this.nodes.get(k);
@@ -137,6 +169,8 @@ export class GraphBuilder {
     for (const [k, n] of this.nodes) {
       if (!visited.has(k)) n.scope = 'dev';
     }
+    this.childSets.clear();
+    this.parentSets.clear();
 
     return { ecosystem: this.ecosystem, lockfile, manifestDir, nodes: this.nodes, roots, warnings: this.warnings, source };
   }

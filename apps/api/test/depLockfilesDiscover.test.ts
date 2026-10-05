@@ -106,4 +106,21 @@ describe('parseDependencyGraphs', () => {
     expect(graphs.some((g) => g.lockfile.includes('node_modules'))).toBe(false);
     expect(warnings).toEqual([]);
   });
+
+  it('yields to the event loop and reports liveness between lockfiles', async () => {
+    const dir = fixtureDir('monorepo');
+    const files = (await listFiles(dir)).map((p) => idxFile(p));
+    let touches = 0;
+    let ticks = 0;
+    const timer = setInterval(() => { ticks++; }, 0);
+    const immediate = new Promise<void>((r) => setImmediate(() => { ticks++; r(); }));
+    try {
+      await parseDependencyGraphs({ repoDir: dir, files, signal: new AbortController().signal, touch: () => { touches++; } });
+    } finally {
+      clearInterval(timer);
+    }
+    await immediate;
+    expect(touches).toBeGreaterThanOrEqual(2);
+    expect(ticks).toBeGreaterThan(0);
+  });
 });

@@ -2,6 +2,7 @@
 // (dispatched by LockfileRef.kind), the full repo-scan orchestrator, and the shared graph utilities.
 
 import { open } from 'node:fs/promises';
+import { setImmediate as yieldToLoop } from 'node:timers/promises';
 import { join, resolve, sep } from 'node:path';
 import type { IndexedFile } from '../../../index/types';
 import type { DepGraph } from '../types';
@@ -64,6 +65,8 @@ export type ParseDependencyGraphsOptions = {
   signal: AbortSignal;
   /** @default 20 MiB */
   maxBytes?: number;
+  /** Liveness callback, invoked between files (parsing a large lockfile is synchronous). */
+  touch?: () => void;
 };
 
 /**
@@ -117,9 +120,18 @@ export async function parseDependencyGraphs(opts: ParseDependencyGraphsOptions):
     else requirementsByDir.set(ref.manifestDir, [ref]);
   }
 
+  // Parsing is synchronous; yield to the event loop between files so one scan's lockfiles can't
+  // starve other requests/heartbeats, and report liveness.
+  const breathe = async (): Promise<void> => {
+    await yieldToLoop();
+    opts.touch?.();
+    if (opts.signal.aborted) throw opts.signal.reason;
+  };
+
   for (const ref of refs) {
     if (opts.signal.aborted) throw opts.signal.reason;
     if (ref.kind === 'requirements') continue; // handled per-directory below
+    await breathe();
 
     const content = await readSafe(ref.path);
     if (content === null) continue;
@@ -146,6 +158,7 @@ export async function parseDependencyGraphs(opts: ParseDependencyGraphsOptions):
   // requirements*.txt: read every sibling once per directory so `-r` includes resolve across them.
   for (const [, dirRefs] of requirementsByDir) {
     if (opts.signal.aborted) throw opts.signal.reason;
+    await breathe();
     const filesInDir = new Map<string, string>();
     for (const ref of dirRefs) {
       const content = await readSafe(ref.path);

@@ -100,7 +100,7 @@ function parseV1Entries(content: string): YarnEntry[] {
 // --- Berry (YAML) ----------------------------------------------------------------------------------
 
 function parseBerryEntries(content: string): YarnEntry[] {
-  const raw = parseYaml(content, { maxAliasCount: 1000 });
+  const raw = parseYaml(content, { maxAliasCount: 1000, uniqueKeys: false });
   if (!isPlainObject(raw)) return [];
   const entries: YarnEntry[] = [];
   for (const [headerKey, val] of safeEntries(raw)) {
