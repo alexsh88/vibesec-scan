@@ -1,10 +1,11 @@
-import { loadConfig } from './config';
+import { loadConfig, loadDotEnv } from './config';
 import { createContainer } from './container';
 import { buildApp } from './http/app';
 
 const SHUTDOWN_GRACE_MS = 20_000;
 
 async function main(): Promise<void> {
+  loadDotEnv();
   const config = loadConfig();
   const c = createContainer(config);
   const app = await buildApp(c);

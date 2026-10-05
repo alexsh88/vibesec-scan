@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import { loadConfig } from '../src/config';
+import { loadConfig, loadDotEnv } from '../src/config';
 import { createContainer } from '../src/container';
 import type { ModelRole } from '../src/llm/models';
 
@@ -10,6 +10,7 @@ import type { ModelRole } from '../src/llm/models';
  * Without a key it exits 0 after printing that it skipped.
  */
 async function main(): Promise<void> {
+  loadDotEnv();
   const config = loadConfig();
   if (config.scanMode === 'mock') {
     console.log('SCAN_MODE=mock (no ANTHROPIC_API_KEY): skipping the live LLM smoke test.');

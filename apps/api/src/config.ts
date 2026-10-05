@@ -1,3 +1,4 @@
+import { existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -7,6 +8,18 @@ import { z } from 'zod';
 // import.meta.url (not process.cwd()) keeps LLM_RECORDINGS_DIR stable no matter where the
 // process is launched from (#M-6).
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
+
+/**
+ * Loads `<repo root>/.env` (gitignored) into process.env for entry points (server, scripts).
+ * Variables already set in the environment win. Not called by loadConfig, so tests stay hermetic.
+ */
+export function loadDotEnv(path = join(REPO_ROOT, '.env')): boolean {
+  if (!existsSync(path)) return false;
+  const before = { ...process.env };
+  process.loadEnvFile(path);
+  for (const [k, v] of Object.entries(before)) process.env[k] = v;
+  return true;
+}
 
 const EnvSchema = z.object({
   PORT: z.coerce.number().int().positive().default(4000),
