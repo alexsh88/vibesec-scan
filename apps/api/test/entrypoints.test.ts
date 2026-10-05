@@ -30,6 +30,19 @@ describe('detectEntrypoints (JS/TS)', () => {
     ]);
   });
 
+  it('detects routes on named Express routers/apps (invoicesRouter, adminApp)', () => {
+    const src = [
+      "export const invoicesRouter = Router();",
+      "invoicesRouter.get('/:id', async (req, res) => {});",
+      "adminApp.post('/backup', run);",
+      "settings.get('/x');",
+    ].join('\n');
+    expect(detectEntrypoints('src/routes/invoices.ts', src)).toEqual([
+      { path: 'src/routes/invoices.ts', kind: 'http-route', line: 2, detail: 'GET /:id' },
+      { path: 'src/routes/invoices.ts', kind: 'http-route', line: 3, detail: 'POST /backup' },
+    ]);
+  });
+
   it('detects serverless handlers and Supabase edge functions', () => {
     expect(detectEntrypoints('lambda/index.ts', 'export const handler = async (event) => {}')[0])
       .toMatchObject({ kind: 'serverless', line: 1 });

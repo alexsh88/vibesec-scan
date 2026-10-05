@@ -367,6 +367,15 @@ describe('credentialHunterMockResponder', () => {
     ]);
   });
 
+  it('flags a credential-named constant holding a base64 literal that decodes to text, but not random base64', () => {
+    const encoded = Buffer.from('partnerKey_mock_value_1234').toString('base64');
+    const prompt = untrustedFile('src/config.ts', `1: const ENCODED_PARTNER_KEY = '${encoded}';\n2: const ICON_KEY = '${Buffer.from([0, 1, 2, 3, 250, 251, 252, 253, 254, 255, 9, 8, 7, 6, 5, 4, 3, 2]).toString('base64')}';`);
+    const out = credentialHunterMockResponder(requestFor(prompt)) as { results: unknown[] } | undefined;
+    expect(out!.results).toEqual([
+      expect.objectContaining({ file: 'src/config.ts', startLine: 1, kind: 'encoded', reconstructed: true }),
+    ]);
+  });
+
   it('flags a Buffer.from(..., "base64") literal, reconstructed=true', () => {
     const prompt = untrustedFile('src/config.js', "1: const key = Buffer.from('c3VwZXJzZWNyZXQ=', 'base64');");
     const out = credentialHunterMockResponder(requestFor(prompt)) as { results: unknown[] } | undefined;

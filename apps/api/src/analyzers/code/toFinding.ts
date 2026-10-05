@@ -1,5 +1,6 @@
 import type { Category, Finding } from '@vibesec/shared';
 import { fingerprint, githubPermalink, provisionalScore } from '../../findings/helpers';
+import { detectSecrets, redact } from '../credentials/rules';
 import type { AnalyzerContext } from '../types';
 import type { RawCodeIssue } from './types';
 
@@ -8,6 +9,15 @@ const MAX_SNIPPET_CHARS = 2_000;
 /** Whitespace-insensitive snippet identity, so reformatting doesn't change a finding's fingerprint. */
 function normalizeSnippet(snippet: string): string {
   return snippet.replace(/\s+/g, ' ').trim();
+}
+
+/** Code findings quote real code: any credential the regex rules recognize in it is masked first. */
+function maskCredentials(text: string): string {
+  let out = text;
+  for (const m of detectSecrets(text, { includeRedactOnly: true })) {
+    if (m.value.length > 0) out = out.split(m.value).join(redact(m.value, m.type));
+  }
+  return out;
 }
 
 /**
@@ -20,7 +30,8 @@ export function issueToFinding(
   issue: RawCodeIssue,
   producedBy: string[],
 ): Finding {
-  const fp = fingerprint([issue.ruleId, issue.file, normalizeSnippet(issue.snippet)]);
+  const snippet = maskCredentials(issue.snippet);
+  const fp = fingerprint([issue.ruleId, issue.file, normalizeSnippet(snippet)]);
   const finding: Finding = {
     id: fingerprint([ctx.scanId, fp]).slice(0, 32),
     scanId: ctx.scanId,
@@ -37,7 +48,7 @@ export function issueToFinding(
       file: issue.file,
       startLine: issue.startLine,
       endLine: Math.max(issue.startLine, issue.endLine),
-      snippet: issue.snippet.slice(0, MAX_SNIPPET_CHARS),
+      snippet: snippet.slice(0, MAX_SNIPPET_CHARS),
       permalink: githubPermalink(ctx.repo, ctx.commitSha, issue.file, issue.startLine, Math.max(issue.startLine, issue.endLine)),
     },
     explanation: issue.explanation,
@@ -47,6 +58,6 @@ export function issueToFinding(
     producedBy,
   };
   if (issue.cwe) finding.cwe = issue.cwe;
-  if (issue.taintTrace?.length) finding.taintTrace = issue.taintTrace;
+  if (issue.taintTrace?.length) finding.taintTrace = issue.taintTrace.map((s) => ({ ...s, code: maskCredentials(s.code) }));
   return finding;
 }

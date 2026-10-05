@@ -596,6 +596,13 @@ const FILE_BLOCK_RE = /<untrusted_file\s+path="([^"]*)">([\s\S]*?)<\/untrusted_f
 const SPLIT_STRING_RE = /(?:password|secret|token|api[_-]?key|apikey)\w*\s*[:=]\s*(?:['"][^'"]*['"]\s*\+\s*){1,}['"][^'"]*['"]/i;
 const ENCODED_RE = /Buffer\.from\(\s*['"][^'"]+['"]\s*,\s*['"]base64['"]\s*\)|\batob\(\s*['"][^'"]+['"]\s*\)|base64\.b64decode\(\s*['"][^'"]+['"]\s*\)/;
 const PASSWORD_LITERAL_RE = /\bpassword\s*:\s*['"][^'"]+['"]/i;
+/** A credential-named constant holding a long base64 literal (decoded at runtime elsewhere). */
+const ENCODED_ASSIGNMENT_RE = /(?:key|token|secret|password|credential)\w*\s*[:=]\s*['"]([A-Za-z0-9+/]{24,}={0,2})['"]/i;
+
+function decodesToPrintable(b64: string): boolean {
+  const decoded = Buffer.from(b64, 'base64').toString('latin1');
+  return decoded.length >= 12 && /^[\x20-\x7e]+$/.test(decoded);
+}
 const NUMBERED_LINE_RE = /^(\d+): (.*)$/;
 
 function unescapeAttr(value: string): string {
@@ -640,7 +647,7 @@ export const credentialHunterMockResponder: MockResponder = (req: LlmRequest) =>
           description: 'String concatenation builds a credential-like value from literal fragments.',
           confidence: 'high', reconstructed: true,
         });
-      } else if (ENCODED_RE.test(code)) {
+      } else if (ENCODED_RE.test(code) || decodesToPrintable(ENCODED_ASSIGNMENT_RE.exec(code)?.[1] ?? '')) {
         results.push({
           file: path, startLine, snippet: code, kind: 'encoded',
           description: 'A base64-decoded literal looks like a credential value.',

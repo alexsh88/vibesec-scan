@@ -466,7 +466,7 @@ function textOfRequest(req: LlmRequest): { system: string; user: string } {
  * Deterministic stand-in for the real model (used by MockTransport). Answers only requests whose
  * system prompt carries TRIAGE_TASK_MARKER. Per file block: relevance 3 if a sink pattern is seen,
  * else 2 if a source pattern is seen, else 1 if the content has any control-flow/function-like code,
- * else 0 (types/constants only). sources/sinks are the matched snippets with line numbers (capped at
+ * else 0 (types/constants only). sources/sinks (both, independently) are the matched snippets with line numbers (capped at
  * 10 each, per the schema); securityTopics are derived from which sink categories matched (plus
  * 'secrets' when credentialRisk); credentialRisk is a simple password/secret/token/apikey assignment
  * regex.
@@ -484,7 +484,7 @@ export const codeTriageMockResponder: MockResponder = (req: LlmRequest) => {
     const content = unescapeAttr(m[2] ?? '');
 
     const sinks = matchesWithLines(content, SINK_PATTERNS);
-    const sources = sinks.length > 0 ? [] : matchesWithLines(content, SOURCE_PATTERNS);
+    const sources = matchesWithLines(content, SOURCE_PATTERNS);
     const hasSink = SINK_PATTERNS.some(([re]) => re.test(content));
     const hasSource = SOURCE_PATTERNS.some(([re]) => re.test(content));
     const relevance: FileTriage['relevance'] = hasSink ? 3 : hasSource ? 2 : LOGIC_RE.test(content) ? 1 : 0;

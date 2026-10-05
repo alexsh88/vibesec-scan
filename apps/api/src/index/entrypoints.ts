@@ -6,7 +6,7 @@ const NEXT_ROUTE = /(^|\/)app\/(.+\/)?route\.[cm]?[jt]sx?$/;
 const NEXT_API = /(^|\/)pages\/api\/.+\.[cm]?[jt]sx?$/;
 const EDGE_FUNCTION = /(^|\/)supabase\/functions\/[^/]+\/index\.[jt]sx?$/;
 const NEXT_METHODS = /export\s+(?:async\s+)?(?:function|const|let)\s+(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)\b/g;
-const JS_ROUTE = /\b(?:app|router|server|fastify|api|routes?|r)\s*\.\s*(get|post|put|patch|delete|all|options|head)\s*\(\s*(['"`])(\/[^'"`]*)\2/gi;
+const JS_ROUTE = /\b(?:app|router|server|fastify|api|routes?|r|[A-Za-z_$][\w$]*(?:Router|App))\s*\.\s*(get|post|put|patch|delete|all|options|head)\s*\(\s*(['"`])(\/[^'"`]*)\2/gi;
 const JS_SERVERLESS = /export\s+(?:const|let|async\s+function|function)\s+handler\b|(?:module\.)?exports\.handler\s*=/;
 const PY_ROUTE = /^\s*@\s*\w+\.(get|post|put|patch|delete|route|api_route|websocket)\s*\(\s*(['"])([^'"]*)\2/;
 const PY_SERVERLESS = /^\s*(?:async\s+)?def\s+(?:lambda_)?handler\s*\(\s*event\b/;
