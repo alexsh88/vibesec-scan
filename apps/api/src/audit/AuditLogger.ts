@@ -7,7 +7,7 @@ export const GENESIS_HASH = '0'.repeat(64);
 
 export const AUDIT_ACTIONS = [
   'scan.created', 'scan.cancelled', 'scan.resumed', 'scan.completed', 'scan.failed',
-  'repo.private_access', 'secret.verification_attempted', 'finding.triaged', 'finding.untriaged',
+  'repo.private_access', 'repo.deleted', 'secret.verification_attempted', 'finding.triaged', 'finding.untriaged',
   'export.downloaded', 'config.changed', 'audit.verified',
 ] as const;
 export type AuditAction = (typeof AUDIT_ACTIONS)[number];

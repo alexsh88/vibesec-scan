@@ -1,9 +1,10 @@
 import { useQueries } from '@tanstack/react-query';
 import type { ScanDto } from '@vibesec/shared';
-import { ArrowUpRight, Clock, FolderGit2, Lock, RotateCw } from 'lucide-react';
+import { ArrowUpRight, Clock, FolderGit2, Lock, RotateCw, Trash2 } from 'lucide-react';
 import { Link } from 'react-router';
 import { EmptyState } from '@/components/feedback/EmptyState';
 import { ErrorState } from '@/components/feedback/ErrorState';
+import { DeleteRepoDialog } from '@/components/history/DeleteRepoDialog';
 import { GradeBadge } from '@/components/security/GradeBadge';
 import { ScanStatePill } from '@/components/security/StatusPill';
 import { Skeleton } from '@/components/ui/skeleton';
@@ -186,6 +187,21 @@ function RepoRow({
           </TooltipTrigger>
           <TooltipContent>History</TooltipContent>
         </Tooltip>
+        <DeleteRepoDialog
+          repo={repo}
+          scanCount={latest.pending ? undefined : latest.count}
+          running={!!scan && !isTerminalState(scan.state)}
+          trigger={
+            <button
+              type="button"
+              title="Delete history"
+              className="inline-flex size-8 items-center justify-center rounded-md text-muted-foreground hover:bg-destructive/10 hover:text-destructive focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none"
+              aria-label={`Delete scan history for ${repo.owner}/${repo.name}`}
+            >
+              <Trash2 className="size-4" />
+            </button>
+          }
+        />
       </div>
     </li>
   );

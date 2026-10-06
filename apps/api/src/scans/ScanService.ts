@@ -99,6 +99,30 @@ export class ScanService {
     return this.d.scans.listRepos();
   }
 
+  /**
+   * Deletes a repository's whole scan history so its next scan starts fresh (no full-scan cache source,
+   * no baseline for new/existing/fixed, no triage decisions). Refused while any of its scans is still
+   * running. `purgeAiCaches` also clears the shared, content-keyed triage/SAST caches so every file gets
+   * a fresh AI review. The deletion itself is audited.
+   */
+  deleteRepo(repoId: string, opts: { purgeAiCaches: boolean }, meta: RequestMeta): { deletedScans: number; purgedCacheEntries: number } {
+    const { scans, audit, lifecycle } = this.d;
+    const repo = scans.getRepo(repoId);
+    if (!repo) throw new AppError('NOT_FOUND', 'permanent', 'Repository not found');
+    if (scans.listByRepo(repoId, 1_000).some((s) => !isTerminalState(s.state))) {
+      throw new AppError('CONFLICT', 'permanent', 'A scan of this repository is still running; cancel it or wait for it to finish');
+    }
+    return lifecycle.atomically(() => {
+      const { scans: deletedScans } = scans.deleteRepoHistory(repoId);
+      const purgedCacheEntries = opts.purgeAiCaches ? scans.purgeAiCaches().entries : 0;
+      audit.append({
+        action: 'repo.deleted', targetType: 'repo', targetId: repoId, actorIp: meta.ip, userAgent: meta.userAgent,
+        details: { repo: `${repo.owner}/${repo.name}`, deletedScans, purgedAiCaches: opts.purgeAiCaches, purgedCacheEntries },
+      });
+      return { deletedScans, purgedCacheEntries };
+    });
+  }
+
   listScans(repoId: string): ScanDto[] {
     if (!this.d.scans.getRepo(repoId)) throw new AppError('NOT_FOUND', 'permanent', 'Repository not found');
     return this.d.scans.listByRepo(repoId);

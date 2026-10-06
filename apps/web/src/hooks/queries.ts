@@ -186,6 +186,18 @@ export function useCancelScan() {
   });
 }
 
+/** Delete a repository's scan history; refreshes the repo list and drops that repo's cached scan list. */
+export function useDeleteRepo() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (v: { repoId: string; purgeAiCache: boolean }) => api.deleteRepo(v.repoId, v.purgeAiCache),
+    onSuccess: (_res, v) => {
+      qc.removeQueries({ queryKey: qk.repoScans(v.repoId) });
+      void qc.invalidateQueries({ queryKey: qk.repos });
+    },
+  });
+}
+
 export type TriageVars = { findingId: string } & ({ clear: true } | ({ clear?: false } & TriageInput));
 
 /** Set (PUT) or clear (DELETE) a finding's triage. Updates the finding cache and refreshes lists. */

@@ -1,11 +1,12 @@
 import { useQueries } from '@tanstack/react-query';
 import { ScanOptionsSchema, type RiskGrade, type ScanDto } from '@vibesec/shared';
-import { GitCompareArrows, History, Lock, RotateCw } from 'lucide-react';
+import { GitCompareArrows, History, Lock, RotateCw, Trash2 } from 'lucide-react';
 import { useMemo } from 'react';
 import { Link, useNavigate, useParams, useSearchParams } from 'react-router';
 import { toast } from 'sonner';
 import { EmptyState } from '@/components/feedback/EmptyState';
 import { ErrorState } from '@/components/feedback/ErrorState';
+import { DeleteRepoDialog } from '@/components/history/DeleteRepoDialog';
 import { ScanCompare } from '@/components/history/ScanCompare';
 import { ScanHistoryTable, type HistoryRow } from '@/components/history/ScanHistoryTable';
 import { Page, PageHeader } from '@/components/layout/Page';
@@ -125,6 +126,17 @@ export default function RepoHistoryPage() {
         actions={
           repo && (
             <>
+              <DeleteRepoDialog
+                repo={repo}
+                scanCount={scansQ.isPending ? undefined : scans.length}
+                running={scans.some((s) => !isTerminalState(s.state))}
+                onDeleted={() => navigate('/')}
+                trigger={
+                  <Button size="sm" variant="ghost" className="text-muted-foreground hover:text-destructive">
+                    <Trash2 /> Delete history
+                  </Button>
+                }
+              />
               <Button asChild size="sm" variant="ghost">
                 <a href={githubUrl(repo.owner, repo.name)} target="_blank" rel="noreferrer">
                   <GithubMark /> GitHub

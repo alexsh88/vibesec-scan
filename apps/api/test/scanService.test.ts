@@ -44,7 +44,7 @@ function setup(queueCapacity = 10) {
     audit: (db.prepare('SELECT COUNT(*) AS n FROM audit_log').get() as { n: number }).n,
     repos: (db.prepare('SELECT COUNT(*) AS n FROM repos').get() as { n: number }).n,
   });
-  return { scans, audit, queue, service, counts };
+  return { db, scans, audit, lifecycle, queue, service, counts };
 }
 
 describe('ScanService.create', () => {
@@ -170,5 +170,57 @@ describe('ScanService.cancel', () => {
   it('rejects unknown scans with NOT_FOUND', () => {
     const { service } = setup();
     expect(() => service.get('missing')).toThrow(expect.objectContaining({ code: 'NOT_FOUND' }));
+  });
+});
+
+describe('ScanService.deleteRepo', () => {
+  it('deletes the repo with all its scans and events, audits it, and leaves other repos alone', () => {
+    const { db, service, lifecycle, audit, counts } = setup();
+    const a = service.create(req({ repoUrl: 'https://github.com/acme/app' }), meta).scan;
+    const b = service.create(req({ repoUrl: 'https://github.com/acme/other' }), meta).scan;
+    lifecycle.transition(a.id, 'CANCELLED');
+    lifecycle.transition(b.id, 'CANCELLED');
+    const before = counts();
+
+    const result = service.deleteRepo(a.repo.id, { purgeAiCaches: false }, meta);
+
+    expect(result).toEqual({ deletedScans: 1, purgedCacheEntries: 0 });
+    const after = counts();
+    expect(after.scans).toBe(before.scans - 1);
+    expect(after.repos).toBe(before.repos - 1);
+    expect((db.prepare('SELECT COUNT(*) AS n FROM scan_events WHERE scan_id = ?').get(a.id) as { n: number }).n).toBe(0);
+    expect((db.prepare('SELECT COUNT(*) AS n FROM scan_events WHERE scan_id = ?').get(b.id) as { n: number }).n).toBeGreaterThan(0);
+    expect(service.listRepos().map((r) => r.name)).toEqual(['other']);
+    const entry = audit.list({ action: 'repo.deleted' }).items[0]!;
+    expect(entry).toMatchObject({ targetId: a.repo.id, details: { repo: 'acme/app', deletedScans: 1, purgedAiCaches: false } });
+    expect(audit.verify().ok).toBe(true);
+  });
+
+  it('refuses while a scan of the repo is still running', () => {
+    const { service } = setup();
+    const a = service.create(req({ repoUrl: 'https://github.com/acme/app' }), meta).scan;
+    expect(() => service.deleteRepo(a.repo.id, { purgeAiCaches: false }, meta)).toThrow(expect.objectContaining({ code: 'CONFLICT' }));
+    expect(service.listRepos()).toHaveLength(1);
+  });
+
+  it('purges the shared AI result caches only when asked', () => {
+    const { db, service, lifecycle } = setup();
+    const insert = (table: string, key: string) =>
+      db.prepare(`INSERT INTO ${table} (cache_key, json, created_at) VALUES (?, '{}', '2026-01-01T00:00:00.000Z')`).run(key);
+    insert('triage_cache', 't1'); insert('sast_cache', 's1');
+    const keep = service.create(req({ repoUrl: 'https://github.com/acme/keep' }), meta).scan;
+    lifecycle.transition(keep.id, 'CANCELLED');
+    service.deleteRepo(keep.repo.id, { purgeAiCaches: false }, meta);
+    expect((db.prepare('SELECT COUNT(*) AS n FROM triage_cache').get() as { n: number }).n).toBe(1);
+
+    const purge = service.create(req({ repoUrl: 'https://github.com/acme/purge' }), meta).scan;
+    lifecycle.transition(purge.id, 'CANCELLED');
+    expect(service.deleteRepo(purge.repo.id, { purgeAiCaches: true }, meta).purgedCacheEntries).toBe(2);
+    expect((db.prepare('SELECT COUNT(*) AS n FROM sast_cache').get() as { n: number }).n).toBe(0);
+  });
+
+  it('rejects unknown repos with NOT_FOUND', () => {
+    const { service } = setup();
+    expect(() => service.deleteRepo('missing', { purgeAiCaches: false }, meta)).toThrow(expect.objectContaining({ code: 'NOT_FOUND' }));
   });
 });

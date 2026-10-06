@@ -250,7 +250,7 @@ export type ScanIndex = {
 
 export const AUDIT_ACTIONS = [
   'scan.created', 'scan.cancelled', 'scan.resumed', 'scan.completed', 'scan.failed',
-  'repo.private_access', 'secret.verification_attempted', 'finding.triaged', 'finding.untriaged',
+  'repo.private_access', 'repo.deleted', 'secret.verification_attempted', 'finding.triaged', 'finding.untriaged',
   'export.downloaded', 'config.changed', 'audit.verified',
 ] as const;
 export type AuditAction = (typeof AUDIT_ACTIONS)[number];
@@ -302,6 +302,11 @@ export const api = {
     request<CreateScanResponse>('/scans', { method: 'POST', body, headers: { 'idempotency-key': idempotencyKey } }),
   getScan: (id: string, signal?: AbortSignal) => request<ScanDto>(`/scans/${enc(id)}`, { signal, schema: ScanDtoSchema }),
   cancelScan: (id: string) => request<ScanDto>(`/scans/${enc(id)}/cancel`, { method: 'POST' }),
+  /** Deletes a repo's whole scan history (409 while a scan is running); purgeAiCache also clears the shared AI caches. */
+  deleteRepo: (repoId: string, purgeAiCache: boolean) =>
+    request<{ deletedScans: number; purgedCacheEntries: number }>(`/repos/${enc(repoId)}`, {
+      method: 'DELETE', query: purgeAiCache ? { purgeAiCache: '1' } : {},
+    }),
 
   listFindings: (id: string, filters: FindingFilters, cursor?: string, signal?: AbortSignal) =>
     request<FindingsPage>(`/scans/${enc(id)}/findings`, { signal, query: { ...filters, cursor } }),

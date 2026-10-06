@@ -31,4 +31,11 @@ export function scanRoutes(app: FastifyInstance, service: ScanService): void {
   app.get('/api/repos', async () => ({ items: service.listRepos() }));
 
   app.get<IdParams>('/api/repos/:id/scans', async (req) => ({ items: service.listScans(req.params.id) }));
+
+  // Deletes the repo's scan history so the next scan starts fresh; ?purgeAiCache=1 also clears the
+  // shared AI result caches. 409 while a scan of the repo is still running.
+  app.delete<IdParams & { Querystring: { purgeAiCache?: string } }>('/api/repos/:id', async (req) => {
+    const purgeAiCaches = req.query.purgeAiCache === '1' || req.query.purgeAiCache === 'true';
+    return service.deleteRepo(req.params.id, { purgeAiCaches }, requestMeta(req));
+  });
 }

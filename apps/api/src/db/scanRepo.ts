@@ -264,6 +264,35 @@ export class ScanRepo {
     return (this.db.prepare(`SELECT * FROM repos ORDER BY created_at DESC`).all() as RepoRow[]).map(toRepo);
   }
 
+  /**
+   * Deletes a repository and everything its scans produced: the scans, their events, findings, coverage,
+   * index, LLM call log, fix plans, summaries and per-analyzer results, plus the repo's triage decisions.
+   * The audit log is append-only by design (triggers) and keeps its entries; their scan_id is plain text.
+   * The caller runs this inside a transaction and checks that no scan is still running.
+   */
+  deleteRepoHistory(repoId: string): { scans: number } {
+    const inRepo = `scan_id IN (SELECT id FROM scans WHERE repo_id = ?)`;
+    for (const table of [
+      'scan_events', 'findings', 'scan_coverage', 'analyzer_results', 'scan_files', 'scan_imports',
+      'scan_entrypoints', 'llm_calls', 'fix_plans', 'scan_summaries',
+    ]) {
+      this.db.prepare(`DELETE FROM ${table} WHERE ${inRepo}`).run(repoId);
+    }
+    // base_scan_id points at another scan of the same repo; clear it so the delete never trips the FK.
+    this.db.prepare(`UPDATE scans SET base_scan_id = NULL WHERE repo_id = ?`).run(repoId);
+    const scans = this.db.prepare(`DELETE FROM scans WHERE repo_id = ?`).run(repoId).changes;
+    this.db.prepare(`DELETE FROM suppressions WHERE repo_id = ?`).run(repoId);
+    this.db.prepare(`DELETE FROM repos WHERE id = ?`).run(repoId);
+    return { scans };
+  }
+
+  /** Clears the content-keyed AI result caches (triage, SAST). They are shared across repos. */
+  purgeAiCaches(): { entries: number } {
+    const triage = this.db.prepare(`DELETE FROM triage_cache`).run().changes;
+    const sast = this.db.prepare(`DELETE FROM sast_cache`).run().changes;
+    return { entries: triage + sast };
+  }
+
   addCost(scanId: string, usd: number): void {
     this.db.prepare(`UPDATE scans SET cost_usd = cost_usd + ? WHERE id = ?`).run(usd, scanId);
   }

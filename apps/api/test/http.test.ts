@@ -70,6 +70,18 @@ describe('HTTP API', () => {
     expect(res.statusCode).toBe(409);
   });
 
+  it('DELETE /api/repos/:id removes a finished repo history (404 after, 404 unknown)', async () => {
+    await start();
+    const { scanId, scan } = (await createScan()).json();
+    await c.runner.whenIdle();
+    const res = await app.inject({ method: 'DELETE', url: `/api/repos/${scan.repo.id}?purgeAiCache=1` });
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toMatchObject({ deletedScans: 1 });
+    expect((await app.inject({ method: 'GET', url: `/api/scans/${scanId}` })).statusCode).toBe(404);
+    expect((await app.inject({ method: 'GET', url: '/api/repos' })).json().items).toEqual([]);
+    expect((await app.inject({ method: 'DELETE', url: `/api/repos/${scan.repo.id}` })).statusCode).toBe(404);
+  });
+
   it('replays SSE for a finished scan and honors Last-Event-ID', async () => {
     await start();
     const { scanId } = (await createScan()).json();

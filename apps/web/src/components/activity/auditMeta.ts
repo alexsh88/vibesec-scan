@@ -11,6 +11,7 @@ import {
   Settings2,
   ShieldCheck,
   ShieldOff,
+  Trash2,
   type LucideIcon,
 } from 'lucide-react';
 import type { AuditAction, AuditEntry } from '@/lib/api';
@@ -34,6 +35,7 @@ export const ACTION_META: Record<AuditAction, { label: string; icon: LucideIcon;
   'scan.failed': { label: 'Scan failed', icon: CircleX, tone: 'bad', group: 'scan' },
   'scan.cancelled': { label: 'Scan cancelled', icon: Ban, tone: 'muted', group: 'scan' },
   'repo.private_access': { label: 'Private repository accessed', icon: Lock, tone: 'warn', group: 'access' },
+  'repo.deleted': { label: 'Scan history deleted', icon: Trash2, tone: 'warn', group: 'access' },
   'secret.verification_attempted': { label: 'Credential liveness check', icon: KeyRound, tone: 'warn', group: 'secrets' },
   'finding.triaged': { label: 'Finding triaged', icon: ShieldCheck, tone: 'info', group: 'triage' },
   'finding.untriaged': { label: 'Triage removed', icon: ShieldOff, tone: 'muted', group: 'triage' },
