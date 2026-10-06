@@ -354,6 +354,22 @@ describe('createDependenciesAnalyzer', () => {
     expect(saved[0]!.actions.length).toBeGreaterThan(0);
   });
 
+  it('maxRegistryLookups caps the fix plan\'s registry lookups and says so in DEPENDENCY_FIX_PLAN_PARTIAL', async () => {
+    const files = await baseRepo();
+    const capped = setup({ maxRegistryLookups: 1 });
+    const c1 = makeCtx(files);
+    await capped.analyzer.run(c1.ctx);
+    const partial = c1.warnings.filter((w) => w[0] === 'DEPENDENCY_FIX_PLAN_PARTIAL');
+    expect(partial).toHaveLength(1);
+    expect(partial[0]![1]).toContain('Registry lookup cap (1) reached');
+    expect(capped.saved[0]!.actions.length).toBeGreaterThan(0); // still a plan, from advisory versions/overrides
+
+    const uncapped = setup();
+    const c2 = makeCtx(files);
+    await uncapped.analyzer.run(c2.ctx);
+    expect(c2.warnings.map((w) => w[0])).not.toContain('DEPENDENCY_FIX_PLAN_PARTIAL');
+  });
+
   it('uses sandbox usages when available: symbol-level evidence proves reachability without the judge; sweeps', async () => {
     const files = await baseRepo();
     const sandbox = fakeSandbox({

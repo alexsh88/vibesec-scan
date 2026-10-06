@@ -146,7 +146,7 @@ export function createContainer(config: Config, overrides: ContainerOverrides = 
   const sastCache = new SastCacheRepo(db);
   const analyzers = [
     createCredentialsAnalyzer({ llm, git, verifier }),
-    createDependenciesAnalyzer({ osv, registry, sandbox, indexRepo, llm, fixPlans, sandboxEnabled: sandbox !== null, sandboxInstall: config.sandbox.install }),
+    createDependenciesAnalyzer({ osv, registry, sandbox, indexRepo, llm, fixPlans, sandboxEnabled: sandbox !== null, sandboxInstall: config.sandbox.install, maxRegistryLookups: config.fixPlanMaxRegistryLookups }),
     createSastAnalyzer({ llm, triage, indexRepo, lanes, cache: { store: sastCache, model: (pass) => config.models[pass] } }),
     createTaintAnalyzer({ llm, triage, indexRepo, lanes }),
     createQualityAnalyzer({ llm }),

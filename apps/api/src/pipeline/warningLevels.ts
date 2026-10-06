@@ -15,10 +15,11 @@
 //             in normal operation (no Docker available in dev/mock/CI, no source files in this repo) or
 //             a fallback that costs time, not completeness (a cache miss re-running the full scan, an
 //             incremental rescan with no usable base analyzing every file, a sandbox/lockfile version
-//             note where the lockfile is authoritative anyway).
+//             note where the lockfile is authoritative anyway, an unverifiable AI claim rejected by the
+//             location verifier — that is verification working, not lost coverage).
 // 'warning' — real degradation: an analyzer failed outright, the dollar budget cut a review short, an
 //             AI call was unavailable, an external service (OSV, the package registry) could not be
-//             reached, or a result had to be dropped/left unverified.
+//             reached or was capped, or part of the work was skipped or left unverified.
 //
 // A code absent from this table defaults to 'warning' (fail safe: an unrecognised condition is never
 // silently treated as clean).
@@ -40,6 +41,13 @@ export const WARNING_LEVELS: Readonly<Record<string, WarningLevel>> = {
   /** ANALYZING (dependencies): sandbox-resolved versions differ from the lockfile; findings still use
    *  the lockfile version (the authoritative source), so nothing about the result is actually degraded. */
   SANDBOX_VERSION_MISMATCH: 'info',
+  /** ANALYZING (sast): AI-reported issues were dropped because the cited code could not be re-found in the
+   *  file. That is the location verifier doing its job (a hallucinated or prompt-injected claim never becomes
+   *  a finding); every file was still reviewed and every kept finding is verified, so coverage is intact. */
+  SAST_UNVERIFIED_DROPPED: 'info',
+  /** ANALYZING (taint): same as SAST_UNVERIFIED_DROPPED for data-flow traces whose source or sink could not
+   *  be verified against the real code. */
+  TAINT_UNVERIFIED_DROPPED: 'info',
 
   // --- warning: real degradation --------------------------------------------------------------
   /** ANALYZING: one analyzer threw and produced no findings. */
@@ -76,16 +84,12 @@ export const WARNING_LEVELS: Readonly<Record<string, WarningLevel>> = {
   SANDBOX_PARTIAL: 'warning',
   /** ANALYZING (sast): AI code review failed for one or more files. */
   SAST_PARTIAL: 'warning',
-  /** ANALYZING (sast): an AI-reported issue was dropped because the cited code could not be verified. */
-  SAST_UNVERIFIED_DROPPED: 'warning',
   /** SYNTHESIZING: the AI scan summary could not be generated; a deterministic one was used instead. */
   SYNTHESIS_FALLBACK: 'warning',
   /** ANALYZING (taint): taint tracing failed for one or more entrypoints. */
   TAINT_ENTRYPOINT_FAILED: 'warning',
   /** ANALYZING (taint): taint tracing of a file stopped early (max turns / timeout / budget). */
   TAINT_PARTIAL: 'warning',
-  /** ANALYZING (taint): a reported taint flow was dropped because its source or sink could not be verified. */
-  TAINT_UNVERIFIED_DROPPED: 'warning',
   /** ANALYZING (triage): the repo exceeds the file-count safety limit for AI triage. */
   TRIAGE_FILE_LIMIT: 'warning',
   /** ANALYZING (triage): AI triage failed for one or more file batches. */

@@ -64,6 +64,8 @@ export type DependenciesAnalyzerDeps = {
   maxSandboxConcurrency?: number;
   /** Max vulnerable packages sent to the reachability judge (default 30). */
   maxJudgeItems?: number;
+  /** Registry lookup budget for the fix plan (FIX_PLAN_MAX_REGISTRY_LOOKUPS; buildFixPlan's default when unset). */
+  maxRegistryLookups?: number;
 };
 
 type Confidence = 'high' | 'medium' | 'low';
@@ -652,7 +654,10 @@ export function createDependenciesAnalyzer(deps: DependenciesAnalyzerDeps): Anal
       // 6. fix plan
       let plan: FixPlan = { scanId: ctx.scanId, actions: [], unfixable: [] };
       try {
-        const built = await buildFixPlan({ scanId: ctx.scanId, vulnerable: vulnerablePackages, registry: deps.registry, signal });
+        const built = await buildFixPlan({
+          scanId: ctx.scanId, vulnerable: vulnerablePackages, registry: deps.registry, signal,
+          ...(deps.maxRegistryLookups !== undefined ? { maxRegistryLookups: deps.maxRegistryLookups } : {}),
+        });
         plan = built.plan;
         if (built.warnings.length > 0) {
           ctx.warn('DEPENDENCY_FIX_PLAN_PARTIAL', truncate(`Fix plan is partial: ${built.warnings.join('; ')}`, 1000));

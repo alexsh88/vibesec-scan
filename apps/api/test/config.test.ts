@@ -27,6 +27,13 @@ describe('loadConfig', () => {
   it('rejects invalid numbers', () => {
     expect(() => loadConfig({ PORT: 'abc' })).toThrow();
   });
+
+  it('FIX_PLAN_MAX_REGISTRY_LOOKUPS defaults to 200, can be raised, and must be a positive integer', () => {
+    expect(loadConfig({}).fixPlanMaxRegistryLookups).toBe(200);
+    expect(loadConfig({ FIX_PLAN_MAX_REGISTRY_LOOKUPS: '1000' }).fixPlanMaxRegistryLookups).toBe(1000);
+    expect(() => loadConfig({ FIX_PLAN_MAX_REGISTRY_LOOKUPS: '0' })).toThrow();
+    expect(() => loadConfig({ FIX_PLAN_MAX_REGISTRY_LOOKUPS: '2.5' })).toThrow();
+  });
 });
 
 describe('loadConfig timing invariants (#10)', () => {

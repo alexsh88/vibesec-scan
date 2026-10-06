@@ -58,6 +58,7 @@ GITHUB_TOKEN=github_pat_...    # recommended: raises GitHub API rate limits for 
 | `GITHUB_TOKEN` | — | Server token for public-repo API rate limits |
 | `SCAN_BUDGET_USD` | `10` | Default per-scan AI budget (per-scan override in the form: $0.50–$100) |
 | `FULL_CACHE_TTL_HOURS` | `24` | How long an identical scan (same commit + configuration) is served from cache |
+| `FIX_PLAN_MAX_REGISTRY_LOOKUPS` | `200` | npm/PyPI lookups the dependency fix planner may make per scan. Past it, suggestions fall back to advisory versions and overrides (`DEPENDENCY_FIX_PLAN_PARTIAL`) |
 | `LLM_MODEL_FAST` / `_DEEP` / `_SYNTHESIS` | `claude-haiku-4-5` / `claude-sonnet-5` / `claude-opus-5` | Model tiers |
 | `LLM_CONCURRENCY`, `LLM_REQUESTS_PER_MINUTE`, `LLM_INPUT_TOKENS_PER_MINUTE` | `8`, `50`, `200000` | Client-side throttling to the account's limits |
 | `LLM_TIMEOUT_MS` | `600000` | Per-request cap (streamed) |

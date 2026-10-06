@@ -67,6 +67,12 @@ const EnvSchema = z.object({
    * so an old result must be recomputed rather than frozen forever.
    */
   FULL_CACHE_TTL_HOURS: z.coerce.number().positive().default(24),
+  /**
+   * Per-scan cap on npm/PyPI registry lookups the dependency fix planner may make. Past it, the remaining
+   * suggestions fall back to advisory fixed versions and overrides (DEPENDENCY_FIX_PLAN_PARTIAL). Raise it
+   * for repos with many vulnerable packages; it bounds registry load and fix-planning time.
+   */
+  FIX_PLAN_MAX_REGISTRY_LOOKUPS: z.coerce.number().int().positive().default(200),
 });
 
 export type Config = {
@@ -82,6 +88,8 @@ export type Config = {
   sandbox: { enabled: boolean; install: boolean; imagePrefix: string; installTimeoutMs: number; analyzeTimeoutMs: number; maxDepsBytes: number };
   /** FULL_CACHE_TTL_HOURS in ms: the full-scan cache only serves results younger than this. */
   fullCacheTtlMs: number;
+  /** FIX_PLAN_MAX_REGISTRY_LOOKUPS: registry lookup budget for one scan's dependency fix plan. */
+  fixPlanMaxRegistryLookups: number;
 };
 
 export function loadConfig(env: Record<string, string | undefined> = process.env): Config {
@@ -128,5 +136,6 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
       maxDepsBytes: e.SANDBOX_MAX_DEPS_MB * 1024 * 1024,
     },
     fullCacheTtlMs: Math.round(e.FULL_CACHE_TTL_HOURS * 3_600_000),
+    fixPlanMaxRegistryLookups: e.FIX_PLAN_MAX_REGISTRY_LOOKUPS,
   };
 }
