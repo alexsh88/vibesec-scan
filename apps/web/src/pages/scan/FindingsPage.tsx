@@ -60,6 +60,18 @@ export default function FindingsPage() {
     (patch: Partial<ListState>) => setSp((prev) => writeListState(prev, patch), { replace: !('tab' in patch) }),
     [setSp],
   );
+  // A visit without ?tab/?category lands on Code. When Code is empty but another tab is not (a clean
+  // library with only quality findings), open the first non-empty tab rather than "No code findings".
+  // Decided once, on the first counts, so choosing Code afterwards still shows Code.
+  const tabPicked = useRef(false);
+  useEffect(() => {
+    if (tabPicked.current || !counts) return;
+    tabPicked.current = true;
+    if (sp.has('tab') || sp.has('category') || tabCount(counts, FINDING_TABS[0]!.categories) !== 0) return;
+    const first = FINDING_TABS.find((t) => (tabCount(counts, t.categories) ?? 0) > 0);
+    if (first) setSp((prev) => writeListState(prev, { tab: first.id }), { replace: true });
+  }, [counts, sp, setSp]);
+
   const reset = () =>
     setSp((prev) => writeListState(prev, { category: null, severities: [], status: 'current', triage: 'open', file: '', q: '' }), { replace: true });
 
