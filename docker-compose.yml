@@ -1,0 +1,65 @@
+# Run VibeSec with Docker: `docker compose up -d --build`, then open http://localhost:5181
+# Secrets (ANTHROPIC_API_KEY, GITHUB_TOKEN) come from ./.env at run time; nothing is baked into images.
+name: vibesec
+
+services:
+  api:
+    build:
+      context: .
+      dockerfile: docker/api.Dockerfile
+    image: vibesec-api
+    init: true
+    restart: unless-stopped
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      HOST: 0.0.0.0
+      PORT: "4000"
+      DB_PATH: /data/vibesec.db
+      WORK_DIR: /data/work
+      # The browser talks to nginx (same origin), so CORS only matters for direct API calls.
+      CORS_ORIGIN: http://localhost:${VIBESEC_WEB_PORT:-5181}
+      # The dependency sandbox shells out to `docker run`. Enabling it inside this container requires
+      # mounting the host Docker socket, which gives the container root on the host, so it is opt-in
+      # (see the commented block at the end of this file). Without it, dependency reachability falls back
+      # to the static import index and the scan reports an info note.
+      SANDBOX_ENABLED: "false"
+    volumes:
+      - data:/data
+    # No host port: the web container reaches the API over the compose network.
+    # For direct access, uncomment (loopback only):
+    # ports:
+    #   - "127.0.0.1:4010:4000"
+
+  web:
+    build:
+      context: .
+      dockerfile: docker/web.Dockerfile
+    image: vibesec-web
+    restart: unless-stopped
+    depends_on:
+      api:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:${VIBESEC_WEB_PORT:-5181}:80"
+
+volumes:
+  data:
+
+# --- Opt-in: dependency sandbox (gives the api container host-root via the Docker socket) ---
+# Save as docker-compose.sandbox.yml and run:
+#   npm run sandbox:build        # on the host: builds vibesec/sandbox-{node,python,proxy}
+#   docker compose -f docker-compose.yml -f docker-compose.sandbox.yml up -d --build
+# The api image would also need the docker CLI (apt-get install docker.io or docker-ce-cli), and because
+# the sandbox bind-mounts paths under WORK_DIR, the daemon resolves them on the HOST: WORK_DIR must be a
+# bind mount at the same absolute path on host and in the container (a named volume will not work).
+#
+# services:
+#   api:
+#     environment:
+#       SANDBOX_ENABLED: "true"
+#       WORK_DIR: /var/lib/vibesec-work
+#     volumes:
+#       - /var/run/docker.sock:/var/run/docker.sock
+#       - /var/lib/vibesec-work:/var/lib/vibesec-work

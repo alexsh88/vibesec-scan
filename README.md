@@ -16,14 +16,26 @@ Built for the ox.security senior-engineer home assignment *"AI Scan Review Exper
 
 ## Quick start
 
+### Fastest: Docker (only Docker needed)
+
+```bash
+git clone https://github.com/alexsh88/vibesec-scan.git && cd vibesec-scan
+echo "ANTHROPIC_API_KEY=sk-ant-..." >> .env  # optional: skip it to run free in mock mode
+docker compose up -d --build                 # first build takes a few minutes
+```
+
+Open **http://localhost:5181**, paste `https://github.com/<owner>/<repo>`, and start a scan. Stop with `docker compose down`; scan history stays on the `vibesec_data` volume. Details, ports and the sandbox note: [Run with Docker](#run-with-docker).
+
+### From source
+
 **Requirements:** Node.js 24, git. Docker ≥ 26 is optional and only needed for the dependency sandbox.
 
 ```bash
 npm install
-npm run dev          # API on http://127.0.0.1:4000, web on http://localhost:5173
+npm run dev          # API on http://127.0.0.1:4000, web on http://localhost:5180
 ```
 
-Open **http://localhost:5173**, paste `https://github.com/<owner>/<repo>`, and start a scan.
+Open **http://localhost:5180**, paste `https://github.com/<owner>/<repo>`, and start a scan.
 
 Optionally, create `.env` at the repo root (it is gitignored and loaded by the API and scripts):
 
@@ -49,6 +61,22 @@ GITHUB_TOKEN=github_pat_...    # recommended: raises GitHub API rate limits for 
 | `npm run llm:smoke` | One tiny call per model tier, to check the key and model ids |
 | `npm run sandbox:build` | Build the Docker sandbox images |
 
+### Run with Docker
+
+```bash
+docker compose up -d --build     # build vibesec-api + vibesec-web and start both
+docker compose logs -f api
+docker compose down              # stop and remove containers; the data volume is kept
+```
+
+Open **http://localhost:5181**. It is bound to 127.0.0.1, and you can change it with `VIBESEC_WEB_PORT=<port>`. The Vite dev server uses a different port (5180), so both can run at once.
+
+- **web** (`docker/web.Dockerfile`) is a multi-stage build: `npm run build -w @vibesec/web`, then nginx serves `dist/` with an SPA fallback and proxies `/api` to the API, with the SSE stream unbuffered. This is the only published port.
+- **api** (`docker/api.Dockerfile`) is Node 24 on Debian slim with git, run from source with `tsx`. It has no host port and is reachable only on the compose network.
+- **Secrets** are read at run time from `.env`, which is optional (`env_file`). Nothing is baked into the images, and `.dockerignore` excludes `.env`. Set `SCAN_MODE=mock` in `.env` to force mock mode even when a key is present.
+- **Data**: the SQLite DB (`/data/vibesec.db`) and scan checkouts (`/data/work`) live on the named volume `vibesec_data`. `docker compose down -v` deletes it.
+- **The dependency sandbox is off** (`SANDBOX_ENABLED=false`). Enabling it means mounting the host Docker socket into the API container, which effectively gives the container root on the host, so it is opt-in. The commented block at the end of `docker-compose.yml` shows how and lists the caveats. Without the sandbox, reachability uses the static import index.
+
 ### Configuration (env vars, `apps/api/src/config.ts`)
 
 | Variable | Default | Purpose |
@@ -72,7 +100,7 @@ GITHUB_TOKEN=github_pat_...    # recommended: raises GitHub API rate limits for 
 | `MAX_REPO_MB` / `MAX_FILES` / `MAX_FILE_KB` | `500` / `20000` / `1024` | Safety limits on hostile repos (not coverage caps) |
 | `CLONE_TIMEOUT_MS` / `GIT_STALL_MS` | `120000` / `30000` | Clone deadline / no-progress abort |
 | `HEARTBEAT_MS`, `STALE_HEARTBEAT_MS`, `STUCK_AFTER_MS` | 10 s, 60 s, 5 min | Watchdog and crash recovery |
-| `CORS_ORIGIN` | `http://localhost:5173` | |
+| `CORS_ORIGIN` | `http://localhost:5180` | |
 | `ALLOW_LOCAL_REPOS` | `false` | `file://` clones, for tests and the eval harness only |
 
 ---

@@ -9,7 +9,7 @@ export default defineConfig({
   plugins: [react(), tailwindcss()],
   resolve: { alias: { '@': fileURLToPath(new URL('./src', import.meta.url)) } },
   server: {
-    port: 5173,
+    port: 5180,
     strictPort: true,
     // Same-origin in dev: the browser talks to Vite, Vite forwards /api (incl. the SSE stream) to Fastify.
     proxy: { '/api': { target: API_TARGET, changeOrigin: true } },

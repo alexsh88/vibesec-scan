@@ -34,7 +34,7 @@ const EnvSchema = z.object({
   HEARTBEAT_MS: z.coerce.number().int().positive().default(10_000),
   STALE_HEARTBEAT_MS: z.coerce.number().int().positive().default(60_000),
   STUCK_AFTER_MS: z.coerce.number().int().positive().default(5 * 60_000),
-  CORS_ORIGIN: z.string().default('http://localhost:5173'),
+  CORS_ORIGIN: z.string().default('http://localhost:5180'),
   ALLOW_LOCAL_REPOS: z.enum(['true', 'false']).default('false'),
   GITHUB_TOKEN: z.string().min(1).optional(),
   GITHUB_API_URL: z.string().url().default('https://api.github.com'),

@@ -1,4 +1,6 @@
 node_modules/
+# ...except the vendored-dir fixture the lockfile-discovery test must skip
+!apps/api/test/fixtures/lockfiles/monorepo/node_modules/
 dist/
 *.db
 *.db-*
@@ -8,3 +10,6 @@ test_output.txt
 
 # Planning docs are kept local only
 docs/superpowers/plans/
+
+# Demo recordings (large media, kept local)
+script/
