@@ -10,6 +10,7 @@ test_output.txt
 
 # Planning docs are kept local only
 docs/superpowers/plans/
+docs/superpowers/specs/
 
 # Demo recordings (large media, kept local)
 script/

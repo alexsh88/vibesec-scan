@@ -10,7 +10,7 @@ Built for the ox.security senior-engineer home assignment *"AI Scan Review Exper
 
 *Screenshots are captured by the author from real scans and live in `docs/screenshots/`.*
 
-**Detailed docs:** [Architecture](docs/architecture.md) · [Security model](docs/security-model.md) · [Evaluation](docs/evaluation.md) · [Design spec](docs/superpowers/specs/2026-10-04-vibesec-ai-scan-review-design.md) (the original design. Some numbers there are stale, and the code and these docs win.)
+**Detailed docs:** [Architecture](docs/architecture.md) · [Security model](docs/security-model.md) · [Evaluation](docs/evaluation.md)
 
 ---
 
@@ -237,7 +237,7 @@ Two of the changes between runs were not to the scanner. Run 2's single "false p
 
 The whole project was built with **Claude Code as orchestrator**, using subagent-driven development.
 
-1. **Spec first.** A written design spec ([here](docs/superpowers/specs/2026-10-04-vibesec-ai-scan-review-design.md)) fixed product goals, architecture, failure policy and the audit model before any code.
+1. **Spec first.** A written design spec fixed product goals, architecture, failure policy and the audit model before any code.
 2. **Milestone plans P1–P9** (foundation → git and indexing → LLM layer → credentials → dependencies and sandbox → Claude code analyzers → verification, scoring and synthesis → UI → docs). The plans were kept local and are not in the repo.
 3. **Parallel implementer subagents on disjoint files**, test-driven (Vitest; ~100 test files), so agents never edited the same file concurrently.
 4. **Independent code-review subagents after every milestone.** They found real issues, including:

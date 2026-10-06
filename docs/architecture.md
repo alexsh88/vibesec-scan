@@ -1,6 +1,6 @@
 # Architecture
 
-This document is the technical companion to the [README](../README.md). File references point at the code, which is the source of truth. The [design spec](superpowers/specs/2026-10-04-vibesec-ai-scan-review-design.md) records the original intent, and some of its numbers are stale.
+This document is the technical companion to the [README](../README.md). File references point at the code, which is the source of truth.
 
 ## Workspaces
 
