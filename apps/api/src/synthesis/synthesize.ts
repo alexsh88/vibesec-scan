@@ -15,7 +15,7 @@ export type SynthesisResult = {
   fallbackReason?: string;
 };
 
-export type SynthesizeDeps = { llm: Pick<LlmClient, 'structured'> };
+export type SynthesizeDeps = { llm: Pick<LlmClient, 'structured'> & Partial<Pick<LlmClient, 'mode'>> };
 export type SynthesizeOpts = { signal: AbortSignal; onActivity?: () => void };
 
 const SEVERITY_ORDER: Record<Severity, number> = { critical: 0, high: 1, medium: 2, low: 3, info: 4 };
@@ -202,7 +202,8 @@ export async function synthesizeSummary(deps: SynthesizeDeps, rawInput: Synthesi
       schema: SynthesisOutputSchema, signal: opts.signal, ...(opts.onActivity ? { onActivity: opts.onActivity } : {}),
     });
     output = res.output;
-    model = res.model;
+    // The mock transport echoes the requested model id; showing it would claim Opus wrote a canned summary.
+    model = deps.llm.mode === 'mock' ? 'mock LLM' : res.model;
   } catch (raw) {
     const err = toAppError(raw);
     if (err.kind === 'cancelled' || opts.signal.aborted) throw err;

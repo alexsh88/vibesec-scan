@@ -4,12 +4,11 @@ import type { FixPlanRepo } from '../../db/fixPlanRepo';
 import type { ScanRepo } from '../../db/scanRepo';
 import type { SummaryRepo } from '../../db/summaryRepo';
 import { AppError } from '../../errors/AppError';
-import type { LlmClient } from '../../llm/LlmClient';
-import { synthesizeSummary } from '../../synthesis/synthesize';
+import { synthesizeSummary, type SynthesizeDeps } from '../../synthesis/synthesize';
 import type { StageSpec } from '../types';
 
 export type SynthesizeStageDeps = {
-  llm: Pick<LlmClient, 'structured'>;
+  llm: SynthesizeDeps['llm'];
   findings: Pick<FindingRepo, 'all'>;
   fixPlans: Pick<FixPlanRepo, 'get'>;
   summaries: Pick<SummaryRepo, 'save'>;

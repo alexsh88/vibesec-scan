@@ -301,7 +301,8 @@ export const synthesisMockResponder: MockResponder = (req: LlmRequest) => {
         title: `Upgrade ${a.package}`.slice(0, 160), detail: `Run ${a.command}`.slice(0, 400), effort: 'minutes' as const,
         fixActionId: a.id, findingIds: [],
       })),
-      ...top.map((e) => ({ title: `Fix ${e.ruleId}`.slice(0, 160), detail: `Address the finding in ${e.file}.`.slice(0, 400), effort: 'hours' as const, findingIds: [e.id] })),
+      // From the title: long slug rule ids are token-shaped to the digest scrubber and arrive as "[redacted]".
+      ...top.map((e) => ({ title: `Fix: ${e.title || e.ruleId}`.slice(0, 160), detail: `Address the finding in ${e.file}.`.slice(0, 400), effort: 'hours' as const, findingIds: [e.id] })),
     ].slice(0, 8),
     positiveObservations: [],
   };

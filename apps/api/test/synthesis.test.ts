@@ -273,6 +273,22 @@ describe('synthesisMockResponder', () => {
     expect(summary.nextActions.some((a) => a.fixActionId === 'fx_1')).toBe(true);
   });
 
+  it('labels mock summaries as mock and titles actions from finding titles, not scrubbed rule ids', async () => {
+    const { llm, scanId } = realClient();
+    // A long slug rule id is token-shaped to the digest scrubber, so a title built from it read "Fix [redacted]".
+    const f = finding({ scanId, category: 'quality', ruleId: 'vibesec/quality-long-function', title: "Long function 'isOdd'", severity: 'medium', riskScore: 47 });
+    const { summary } = await synthesizeSummary({ llm }, { scanId, findings: [f] }, { signal });
+    expect(summary.model).toBe('mock LLM');
+    expect(summary.nextActions.map((a) => a.title)).toContain("Fix: Long function 'isOdd'");
+    for (const a of summary.nextActions) expect(a.title).not.toContain('[redacted]');
+  });
+
+  it('keeps the real model id for live summaries', async () => {
+    const { llm } = stubLlm(() => okOutput());
+    const { summary } = await synthesizeSummary({ llm }, { scanId: 's1', findings: [finding()] }, { signal });
+    expect(summary.model).toBe('claude-opus-5');
+  });
+
   it('ignores requests without the task marker', () => {
     expect(synthesisMockResponder({ system: [{ type: 'text', text: 'other' }], messages: [] } as never)).toBeUndefined();
   });
