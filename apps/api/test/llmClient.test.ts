@@ -227,6 +227,21 @@ describe('LlmClient.structured', () => {
     }
   });
 
+  it('forget() cancels a pending trailing cost event of a finished scan (it never fires after the scan ended)', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    try {
+      const { client, call, onUsage, db, scanId } = setup([], { now: () => 1_000_000 });
+      for (let i = 0; i < 3; i++) await client.structured(call());
+      expect(onUsage).toHaveBeenCalledTimes(1); // the trailing emit is pending
+      client.forget(scanId);
+      db.close(); // as on shutdown: a late emit would query a closed database
+      vi.advanceTimersByTime(5_000);
+      expect(onUsage).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('does not emit cost events for zero-cost (failed) attempts', async () => {
     const { client, call, onUsage, calls, scanId } = setup([{ error: new AppError('LLM_UNAVAILABLE', 'permanent', 'x') }]);
     await expect(client.structured(call())).rejects.toMatchObject({ kind: 'permanent' });

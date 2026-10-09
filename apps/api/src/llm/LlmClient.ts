@@ -418,6 +418,18 @@ export class LlmClient {
     return { message: message as Anthropic.Message, model, callId, usage, costUsd: cost };
   }
 
+  /**
+   * Drops a finished scan's usage-event state: cancels a pending throttled emit (it would otherwise fire
+   * after the scan ended, even after the database closed) and forgets its last-emit time. No final emit:
+   * the scan's own cost is final, and a cost event after its 'done' event would arrive out of order.
+   */
+  forget(scanId: string): void {
+    const timer = this.pendingUsageEmit.get(scanId);
+    if (timer) clearTimeout(timer);
+    this.pendingUsageEmit.delete(scanId);
+    this.lastUsageEmit.delete(scanId);
+  }
+
   /** Leading emit, then at most one trailing emit (with the then-latest totals) per interval per scan. */
   private emitUsage(scanId: string): void {
     const onUsage = this.deps.onUsage;

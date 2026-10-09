@@ -171,6 +171,7 @@ export function createContainer(config: Config, overrides: ContainerOverrides = 
     atomically: (fn) => lifecycle.atomically(fn),
     onFinished: (scanId) => {
       budget.forget(scanId);
+      llm.forget(scanId);
       triage.forget(scanId);
       verifier.forget(scanId);
       // Best-effort: the analyzer already sweeps in its own finally; this covers cancelled/crashed scans.
