@@ -5,9 +5,12 @@
 //   commit or one of its ancestors (`git merge-base --is-ancestor`, best-effort). A candidate whose
 //   ancestry cannot be established is skipped; with no baseline every finding is 'new' and nothing is
 //   'fixed' — "unknown" never produces a false "fixed".
-//   present in both  → 'existing'
+//   present in both  → 'existing'. "Present" = same fingerprint, or for AI-written findings the same issue
+//     re-worded (shared isSameIssue: same file and category, nearby lines, same rule family or title);
 //   only in this one → 'new'
-//   only in the baseline → copied into THIS scan as a `fixed` row (severity unchanged). Fixed rows are
+//   only in the baseline → copied into THIS scan as a `fixed` row (severity unchanged) — unless the
+//     baseline is the SAME commit: identical code can't have fixed anything, so those are counted as
+//     `notReproduced` (AI run-to-run variation) and surfaced as an info note instead. Fixed rows are
 //     left out of FindingRepo.all/list/counts by default (so of the grade, synthesis and exports too);
 //     GET /api/scans/:id/findings?scanStatus=fixed lists them.
 // A baseline finding only counts as fixed when this scan could have found it again:
@@ -17,7 +20,7 @@
 //     from cache or judged not relevant (a budget-skipped or failed file never reads as fixed).
 // Idempotent: statuses are recomputed and the fixed rows replaced on every run.
 
-import type { Finding } from '@vibesec/shared';
+import { findingKeys, matchFindings, type Finding } from '@vibesec/shared';
 import type { CoverageStatus } from '../../analyzers/types';
 import type { CoverageRepo } from '../../db/coverageRepo';
 import type { FindingRepo, FindingRow } from '../../db/findingRepo';
@@ -35,14 +38,15 @@ export type ScanStatusDeps = {
   git?: Pick<GitService, 'isAncestor' | 'repoDir'>;
 };
 
-export type ScanStatusCounts = { previousScanId: string | null; new: number; existing: number; fixed: number };
+/** `notReproduced`: baseline findings of the SAME commit this scan didn't report again (never counted as fixed). */
+export type ScanStatusCounts = { previousScanId: string | null; new: number; existing: number; fixed: number; notReproduced: number };
 
 const COVERED: ReadonlySet<CoverageStatus> = new Set(['reviewed', 'reviewed-fast', 'cached', 'not-relevant']);
 const REPO_LEVEL: ReadonlySet<Finding['category']> = new Set(['dependency', 'config']);
 
-/** Every fingerprint a finding stands for: its own plus those of findings merged into it (crossDedupe). */
+/** Every fingerprint a finding stands for: its own plus those merged into it (crossDedupe, or a matched baseline). */
 export function fingerprintsOf(f: Pick<Finding, 'fingerprint' | 'mergedFingerprints'>): string[] {
-  return [f.fingerprint, ...(f.mergedFingerprints ?? [])];
+  return findingKeys(f);
 }
 
 async function findBaseline(deps: ScanStatusDeps, row: ScanRow, call: GitCallOptions): Promise<ScanRow | undefined> {
@@ -61,30 +65,43 @@ export async function applyScanStatus(
 ): Promise<ScanStatusCounts> {
   const row = deps.scans.getRow(scanId);
   const categories = new Set(deps.scans.getDto(scanId)?.options.categories ?? []);
-  if (!row) return { previousScanId: null, new: 0, existing: 0, fixed: 0 };
+  if (!row) return { previousScanId: null, new: 0, existing: 0, fixed: 0, notReproduced: 0 };
   const previous = await findBaseline(deps, row, { ...(call.signal ? { signal: call.signal } : {}), ...(call.touch ? { onActivity: call.touch } : {}) });
   const previousRows = previous ? deps.findings.all(previous.id) : [];
-  const previousFps = new Set(previousRows.flatMap((r) => fingerprintsOf(r.finding)));
 
   const current = deps.findings.all(scanId);
+  const match = matchFindings(previousRows, current, (r) => r.finding);
   const changed: Finding[] = [];
-  let existing = 0;
-  for (const { finding } of current) {
-    const status = fingerprintsOf(finding).some((fp) => previousFps.has(fp)) ? 'existing' : 'new';
-    if (status === 'existing') existing++;
-    if (finding.scanStatus !== status) changed.push({ ...finding, scanStatus: status });
+  for (const row of current) {
+    const base = match.pairs.get(row);
+    const status = base ? 'existing' : 'new';
+    // A finding matched as the same issue under another fingerprint (a model re-worded its rule id or
+    // re-cut its snippet) inherits the baseline's keys, so triage decisions and later scans follow it.
+    const inherited = base ? findingKeys(base.finding).filter((k) => !findingKeys(row.finding).includes(k)) : [];
+    if (row.finding.scanStatus !== status || inherited.length > 0) {
+      changed.push({
+        ...row.finding, scanStatus: status,
+        ...(inherited.length > 0 ? { mergedFingerprints: [...(row.finding.mergedFingerprints ?? []), ...inherited] } : {}),
+      });
+    }
   }
   if (changed.length > 0) deps.findings.update(scanId, changed);
+  const existing = match.pairs.size;
 
-  const currentFps = new Set(current.flatMap((r) => fingerprintsOf(r.finding)));
   const ran = deps.findings.analyzersWithResults(scanId);
   const looked = lookedAt(deps, scanId);
-  const fixed: FindingRow[] = previousRows
-    .filter((r) => !fingerprintsOf(r.finding).some((fp) => currentFps.has(fp))
-      && categories.has(r.finding.category) && ran.has(r.analyzer) && looked(r.analyzer, r.finding))
+  const missing = match.unmatchedBase
+    .filter((r) => categories.has(r.finding.category) && ran.has(r.analyzer) && looked(r.analyzer, r.finding));
+  // Same commit: the code is identical, so nothing can have been fixed. A baseline finding that wasn't
+  // reported again is run-to-run variation of the AI review, reported as "not reproduced" instead.
+  const sameCommit = !!previous && previous.commit_sha === row.commit_sha;
+  const fixed: FindingRow[] = sameCommit ? [] : missing
     .map((r) => ({ analyzer: r.analyzer, finding: { ...r.finding, id: copiedFindingId(scanId, r.finding.id), scanId, scanStatus: 'fixed' } }));
   deps.findings.replaceFixed(scanId, fixed);
-  return { previousScanId: previous?.id ?? null, new: current.length - existing, existing, fixed: fixed.length };
+  return {
+    previousScanId: previous?.id ?? null, new: current.length - existing, existing, fixed: fixed.length,
+    notReproduced: sameCommit ? missing.length : 0,
+  };
 }
 
 /** Whether this scan really looked at where `f` was (see the header). */

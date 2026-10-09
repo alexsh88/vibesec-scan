@@ -140,10 +140,11 @@ export function withFullScanCache(resolve: StageSpec, deps: FullCacheDeps): Stag
       // Per-scan state, recomputed as SCORING would (the copied rows carry no triage and no fixed rows).
       let summary = copied.summary;
       try {
-        deps.suppressions.applySuppressions(ctx.scanId);
+        // Same order as SCORING: statuses (which may add inherited fingerprints) before suppressions.
         await applyScanStatus({
           scans: deps.scans, findings: deps.findings, coverage: deps.coverage, indexRepo: deps.indexRepo, ...(deps.git ? { git: deps.git } : {}),
         }, ctx.scanId, { signal: ctx.signal, touch: ctx.touch });
+        deps.suppressions.applySuppressions(ctx.scanId);
         if (summary) {
           summary = refreshSummary(summary, deps.findings.all(ctx.scanId).map((r) => r.finding));
           deps.summaries.save(summary);

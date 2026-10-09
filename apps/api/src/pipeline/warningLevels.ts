@@ -33,6 +33,9 @@ export const WARNING_LEVELS: Readonly<Record<string, WarningLevel>> = {
   INCREMENTAL_BASE_UNAVAILABLE: 'info',
   /** ANALYZING (pipeline/incremental.ts): the diff was too large to bother; every file was analyzed. */
   INCREMENTAL_DIFF_TOO_LARGE: 'info',
+  /** SCORING: findings of a previous scan of the SAME commit weren't reported again (AI run-to-run
+   *  variation). Not a degradation, and never counted as fixed. */
+  FINDINGS_NOT_REPRODUCED: 'info',
   /** INDEXING: no JS/TS/Python source in this repo — not a failure, just nothing for code analyzers to do. */
   NO_SOURCE_FILES: 'info',
   /** ANALYZING (dependencies): Docker unavailable / sandbox images not built — expected outside a full

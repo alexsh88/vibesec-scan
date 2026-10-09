@@ -5,7 +5,7 @@ import type { FindingRepo } from '../db/findingRepo';
 import type { FixPlanRepo } from '../db/fixPlanRepo';
 import type { IndexRepo } from '../db/indexRepo';
 import type { LlmCallRepo } from '../db/llmCallRepo';
-import type { ScanCacheKeys, ScanRepo } from '../db/scanRepo';
+import type { ScanCacheKeys, ScanRepo, ScanWarning } from '../db/scanRepo';
 import type { SummaryRepo } from '../db/summaryRepo';
 import { AppError, toAppError } from '../errors/AppError';
 import type { GitService } from '../git/GitService';
@@ -53,6 +53,15 @@ export type ScanPipelineDeps = Omit<ResolveDeps, 'git' | 'scans'> & Omit<IndexDe
  * previous scan. Each step is idempotent and runs even if an earlier one failed (findings then keep
  * their pre-scoring values); the first failure is re-thrown afterwards so it surfaces as a warning.
  */
+/** Info note for findings of a previous scan of the same commit that this run didn't report again. */
+export function notReproducedWarning(n: number): ScanWarning {
+  return {
+    code: 'FINDINGS_NOT_REPRODUCED', stage: 'SCORING',
+    message: `${n} finding${n === 1 ? '' : 's'} from the previous scan of this same commit ${n === 1 ? 'was' : 'were'} not reported again. `
+      + 'The code is unchanged, so they are not counted as fixed: AI review results vary slightly between runs.',
+  };
+}
+
 function scoringStage(deps: ScanPipelineDeps): StageSpec {
   const score = scoreStage({ findings: deps.findings, indexRepo: deps.indexRepo });
   return {
@@ -70,11 +79,16 @@ function scoringStage(deps: ScanPipelineDeps): StageSpec {
         }
       };
       await step(() => score.run(ctx));
+      // Status before suppressions: a finding matched to a re-worded baseline finding inherits its
+      // fingerprints there, and the repo's triage decisions are keyed by fingerprint.
+      await step(async () => {
+        const counts = await applyScanStatus(
+          { scans: deps.scans, findings: deps.findings, coverage: deps.coverage, indexRepo: deps.indexRepo, git: deps.git },
+          ctx.scanId, { signal: ctx.signal, touch: ctx.touch },
+        );
+        if (counts.notReproduced > 0) ctx.warn(notReproducedWarning(counts.notReproduced));
+      });
       await step(() => deps.suppressions.applySuppressions(ctx.scanId));
-      await step(() => applyScanStatus(
-        { scans: deps.scans, findings: deps.findings, coverage: deps.coverage, indexRepo: deps.indexRepo, git: deps.git },
-        ctx.scanId, { signal: ctx.signal, touch: ctx.touch },
-      ));
       if (failure) throw failure;
     },
   };

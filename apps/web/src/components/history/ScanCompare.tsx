@@ -1,5 +1,5 @@
 import type { Finding, RiskGrade, ScanDto, Severity } from '@vibesec/shared';
-import { ArrowRight, CircleCheck, CircleDot, Equal, TriangleAlert, X } from 'lucide-react';
+import { ArrowRight, CircleCheck, CircleDashed, CircleDot, Equal, TriangleAlert, X } from 'lucide-react';
 import { useMemo, useState } from 'react';
 import { Link } from 'react-router';
 import { EmptyState } from '@/components/feedback/EmptyState';
@@ -106,7 +106,7 @@ function DiffList({ items, scanId, emptyText }: { items: Finding[]; scanId: stri
 
 /**
  * Side-by-side grade/counts of two scans plus a fingerprint diff of their findings:
- * new in B, fixed in B (present in A, gone in B) and unchanged.
+ * new in B, fixed in B (present in A, gone in B; "not reproduced" when both are the same commit) and unchanged.
  */
 export function ScanCompare({
   a,
@@ -182,7 +182,8 @@ export function ScanCompare({
                   <CircleDot className="text-status-new" /> New in B <span className="font-mono tabular">{diff.added.length}</span>
                 </TabsTrigger>
                 <TabsTrigger value="fixed">
-                  <CircleCheck className="text-status-fixed" /> Fixed in B <span className="font-mono tabular">{diff.fixed.length}</span>
+                  {sameCommit ? <CircleDashed /> : <CircleCheck className="text-status-fixed" />}
+                  {sameCommit ? 'Not reproduced in B' : 'Fixed in B'} <span className="font-mono tabular">{diff.fixed.length}</span>
                 </TabsTrigger>
                 <TabsTrigger value="unchanged">
                   <Equal /> Unchanged <span className="font-mono tabular">{diff.unchanged.length}</span>
@@ -193,7 +194,17 @@ export function ScanCompare({
               <DiffList items={diff.added} scanId={b.id} emptyText="Nothing new in B." />
             </TabsContent>
             <TabsContent value="fixed" className="border-t">
-              <DiffList items={diff.fixed} scanId={a.id} emptyText="Nothing from A was fixed in B." />
+              {sameCommit && diff.fixed.length > 0 && (
+                <p className="border-b bg-muted/40 px-4 py-2 text-xs text-muted-foreground">
+                  Same commit, so the code didn’t change: these weren’t reported again because AI review varies slightly
+                  between runs. They are not counted as fixed.
+                </p>
+              )}
+              <DiffList
+                items={diff.fixed}
+                scanId={a.id}
+                emptyText={sameCommit ? 'Everything in A was reported again in B.' : 'Nothing from A was fixed in B.'}
+              />
             </TabsContent>
             <TabsContent value="unchanged" className="border-t">
               <DiffList items={diff.unchanged} scanId={b.id} emptyText="No findings in common." />

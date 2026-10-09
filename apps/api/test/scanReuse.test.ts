@@ -54,7 +54,7 @@ describe('cache keys', () => {
 
 describe('applyScanStatus (new / existing / fixed)', () => {
   const finding = (scanId: string, fp: string, over: Partial<Finding> = {}): Finding => ({
-    id: `${scanId.slice(0, 8)}-${fp}`, scanId, fingerprint: fp, category: 'sast', ruleId: 'sast/x', title: `issue ${fp}`,
+    id: `${scanId.slice(0, 8)}-${fp}`, scanId, fingerprint: fp, category: 'sast', ruleId: `sast/rule-${fp}`, title: `issue ${fp}`,
     baseSeverity: 'high', riskScore: 70, severity: 'high', riskFactors: [], confidence: 'high',
     location: { file: 'a.ts', startLine: 1, endLine: 1, snippet: 'x', permalink: '' },
     explanation: 'e', impact: 'i', remediation: { summary: 'r' }, scanStatus: 'new', ...over,
@@ -95,8 +95,8 @@ describe('applyScanStatus (new / existing / fixed)', () => {
     const cur = scan();
     findings.replaceForAnalyzer(cur, 'sast', [finding(cur, 'keep'), finding(cur, 'fresh')]);
     findings.saveAnalyzerResult(cur, 'sast', []);
-    expect(await applyScanStatus(deps, cur)).toEqual({ previousScanId: prev, new: 1, existing: 1, fixed: 1 });
-    expect(await applyScanStatus(deps, cur)).toEqual({ previousScanId: prev, new: 1, existing: 1, fixed: 1 }); // idempotent
+    expect(await applyScanStatus(deps, cur)).toEqual({ previousScanId: prev, new: 1, existing: 1, fixed: 1 , notReproduced: 0 });
+    expect(await applyScanStatus(deps, cur)).toEqual({ previousScanId: prev, new: 1, existing: 1, fixed: 1 , notReproduced: 0 }); // idempotent
 
     const byFp = new Map(findings.all(cur, { includeFixed: true }).map((r) => [r.finding.fingerprint, r.finding]));
     expect(byFp.get('keep')?.scanStatus).toBe('existing');
@@ -127,7 +127,70 @@ describe('applyScanStatus (new / existing / fixed)', () => {
     const cur = scan();
     findings.replaceForAnalyzer(cur, 'sast', [finding(cur, 'sast-fp'), finding(cur, 'other-fp', { mergedFingerprints: ['plain-fp'] })]);
     findings.saveAnalyzerResult(cur, 'sast', []);
-    expect(await applyScanStatus(deps, cur)).toEqual({ previousScanId: prev, new: 0, existing: 2, fixed: 0 });
+    expect(await applyScanStatus(deps, cur)).toEqual({ previousScanId: prev, new: 0, existing: 2, fixed: 0 , notReproduced: 0 });
+  });
+
+  describe('AI run-to-run variation (same issue re-worded; same commit)', () => {
+    const rls = (scanId: string, fp: string, ruleId: string): Finding => finding(scanId, fp, {
+      category: 'config', ruleId, title: 'Row level security explicitly disabled on invoices table',
+      location: { file: 'supabase/migrations/001_init.sql', startLine: 16, endLine: 16, snippet: 'x', permalink: '' },
+    });
+    const traversal = (scanId: string, fp: string, line: number, title: string): Finding => finding(scanId, fp, {
+      category: 'taint', ruleId: 'taint/path-traversal', title,
+      location: { file: 'api/src/routes/logs.ts', startLine: line, endLine: line, snippet: 'x', permalink: '' },
+    });
+    const cats: Finding['category'][] = ['sast', 'taint', 'config', 'secret'];
+
+    it('same commit: a finding not reported again is "not reproduced", never a fixed row', async () => {
+      const { findings, scan, complete, deps } = setup();
+      const prev = scan({ categories: cats });
+      findings.replaceForAnalyzer(prev, 'sast', [finding(prev, 'keep'), finding(prev, 'gone')]);
+      findings.saveAnalyzerResult(prev, 'sast', []);
+      complete(prev);
+      const cur = scan({ categories: cats }); // same commit as prev (SHA2)
+      findings.replaceForAnalyzer(cur, 'sast', [finding(cur, 'keep')]);
+      findings.saveAnalyzerResult(cur, 'sast', []);
+      expect(await applyScanStatus(deps, cur)).toEqual({ previousScanId: prev, new: 0, existing: 1, fixed: 0, notReproduced: 1 });
+      expect(findings.list(cur, { scanStatus: 'fixed' }).items).toEqual([]);
+    });
+
+    it('a re-worded AI finding at the same place is existing (not new + fixed) and inherits the baseline fingerprint', async () => {
+      const { findings, scan, complete, deps } = setup();
+      const prev = scan({ sha: SHA1, categories: cats });
+      findings.replaceForAnalyzer(prev, 'config', [rls(prev, 'rls-a', 'config/supabase-table-rls-disabled')]);
+      findings.replaceForAnalyzer(prev, 'taint', [traversal(prev, 'pt-a', 10, 'Path traversal in GET /logs via req.query.name')]);
+      findings.saveAnalyzerResult(prev, 'config', []);
+      findings.saveAnalyzerResult(prev, 'taint', []);
+      complete(prev);
+      const cur = scan({ categories: cats }); // another commit: re-wording must still not read as fixed
+      findings.replaceForAnalyzer(cur, 'config', [rls(cur, 'rls-b', 'config/supabase-table-without-rls')]); // other rule id, same title
+      findings.replaceForAnalyzer(cur, 'taint', [traversal(cur, 'pt-b', 11, 'Unsanitized file name reaches readFile')]); // same family, line drift
+      findings.saveAnalyzerResult(cur, 'config', []);
+      findings.saveAnalyzerResult(cur, 'taint', []);
+      expect(await applyScanStatus(deps, cur)).toEqual({ previousScanId: prev, new: 0, existing: 2, fixed: 0, notReproduced: 0 });
+      const byFp = new Map(findings.all(cur).map((r) => [r.finding.fingerprint, r.finding]));
+      expect(byFp.get('rls-b')).toMatchObject({ scanStatus: 'existing', mergedFingerprints: ['rls-a'] });
+      expect(byFp.get('pt-b')).toMatchObject({ scanStatus: 'existing', mergedFingerprints: ['pt-a'] });
+      // Idempotent: a second run doesn't append the inherited fingerprint again.
+      await applyScanStatus(deps, cur);
+      expect(findings.all(cur).find((r) => r.finding.fingerprint === 'rls-b')?.finding.mergedFingerprints).toEqual(['rls-a']);
+    });
+
+    it('keeps exact matching for deterministic categories and for unrelated AI findings', async () => {
+      const { findings, scan, complete, deps } = setup();
+      const prev = scan({ sha: SHA1, categories: cats });
+      findings.replaceForAnalyzer(prev, 'credentials', [finding(prev, 'key-a', { category: 'secret', ruleId: 'secret/aws' })]);
+      findings.replaceForAnalyzer(prev, 'sast', [finding(prev, 'sqli', { ruleId: 'sast/sql-injection', title: 'SQL injection in user lookup' })]);
+      findings.saveAnalyzerResult(prev, 'credentials', []);
+      findings.saveAnalyzerResult(prev, 'sast', []);
+      complete(prev);
+      const cur = scan({ categories: cats });
+      findings.replaceForAnalyzer(cur, 'credentials', [finding(cur, 'key-b', { category: 'secret', ruleId: 'secret/aws' })]);
+      findings.replaceForAnalyzer(cur, 'sast', [finding(cur, 'xss', { ruleId: 'sast/xss', title: 'Reflected XSS in search page' })]);
+      findings.saveAnalyzerResult(cur, 'credentials', []);
+      findings.saveAnalyzerResult(cur, 'sast', []);
+      expect(await applyScanStatus(deps, cur)).toEqual({ previousScanId: prev, new: 2, existing: 0, fixed: 2, notReproduced: 0 });
+    });
   });
 
   describe('baseline selection (no false "fixed")', () => {
@@ -145,7 +208,7 @@ describe('applyScanStatus (new / existing / fixed)', () => {
 
     it('ignores a previous scan run with other result options', async () => {
       const { deps, cur } = withPrevious({ optionsHash: 'other' });
-      expect(await applyScanStatus(deps, cur)).toEqual({ previousScanId: null, new: 1, existing: 0, fixed: 0 });
+      expect(await applyScanStatus(deps, cur)).toEqual({ previousScanId: null, new: 1, existing: 0, fixed: 0 , notReproduced: 0 });
     });
 
     it('ignores a previous scan of another ref', async () => {

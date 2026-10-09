@@ -5,3 +5,4 @@ export * from './finding';
 export * from './events';
 export * from './fixPlan';
 export * from './summary';
+export * from './findingMatch';
