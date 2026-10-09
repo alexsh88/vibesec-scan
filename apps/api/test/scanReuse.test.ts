@@ -95,8 +95,8 @@ describe('applyScanStatus (new / existing / fixed)', () => {
     const cur = scan();
     findings.replaceForAnalyzer(cur, 'sast', [finding(cur, 'keep'), finding(cur, 'fresh')]);
     findings.saveAnalyzerResult(cur, 'sast', []);
-    expect(await applyScanStatus(deps, cur)).toEqual({ previousScanId: prev, new: 1, existing: 1, fixed: 1 , notReproduced: 0 });
-    expect(await applyScanStatus(deps, cur)).toEqual({ previousScanId: prev, new: 1, existing: 1, fixed: 1 , notReproduced: 0 }); // idempotent
+    expect(await applyScanStatus(deps, cur)).toEqual({ previousScanId: prev, new: 1, existing: 1, fixed: 1 , notReproduced: 0, onlyThisRun: 0 });
+    expect(await applyScanStatus(deps, cur)).toEqual({ previousScanId: prev, new: 1, existing: 1, fixed: 1 , notReproduced: 0, onlyThisRun: 0 }); // idempotent
 
     const byFp = new Map(findings.all(cur, { includeFixed: true }).map((r) => [r.finding.fingerprint, r.finding]));
     expect(byFp.get('keep')?.scanStatus).toBe('existing');
@@ -127,7 +127,7 @@ describe('applyScanStatus (new / existing / fixed)', () => {
     const cur = scan();
     findings.replaceForAnalyzer(cur, 'sast', [finding(cur, 'sast-fp'), finding(cur, 'other-fp', { mergedFingerprints: ['plain-fp'] })]);
     findings.saveAnalyzerResult(cur, 'sast', []);
-    expect(await applyScanStatus(deps, cur)).toEqual({ previousScanId: prev, new: 0, existing: 2, fixed: 0 , notReproduced: 0 });
+    expect(await applyScanStatus(deps, cur)).toEqual({ previousScanId: prev, new: 0, existing: 2, fixed: 0 , notReproduced: 0, onlyThisRun: 0 });
   });
 
   describe('AI run-to-run variation (same issue re-worded; same commit)', () => {
@@ -150,8 +150,36 @@ describe('applyScanStatus (new / existing / fixed)', () => {
       const cur = scan({ categories: cats }); // same commit as prev (SHA2)
       findings.replaceForAnalyzer(cur, 'sast', [finding(cur, 'keep')]);
       findings.saveAnalyzerResult(cur, 'sast', []);
-      expect(await applyScanStatus(deps, cur)).toEqual({ previousScanId: prev, new: 0, existing: 1, fixed: 0, notReproduced: 1 });
+      expect(await applyScanStatus(deps, cur)).toEqual({ previousScanId: prev, new: 0, existing: 1, fixed: 0, notReproduced: 1, onlyThisRun: 0 });
       expect(findings.list(cur, { scanStatus: 'fixed' }).items).toEqual([]);
+    });
+
+    it('same commit: a finding only this run reported is existing (already in the code), never new', async () => {
+      const { findings, scan, complete, deps } = setup();
+      const prev = scan({ categories: cats });
+      findings.replaceForAnalyzer(prev, 'sast', [finding(prev, 'keep')]);
+      findings.saveAnalyzerResult(prev, 'sast', []);
+      complete(prev);
+      const cur = scan({ categories: cats });
+      findings.replaceForAnalyzer(cur, 'sast', [finding(cur, 'keep'), finding(cur, 'extra')]);
+      findings.saveAnalyzerResult(cur, 'sast', []);
+      expect(await applyScanStatus(deps, cur)).toEqual({ previousScanId: prev, new: 0, existing: 2, fixed: 0, notReproduced: 0, onlyThisRun: 1 });
+      expect(findings.all(cur).find((r) => r.finding.fingerprint === 'extra')?.finding.scanStatus).toBe('existing');
+    });
+
+    it('incremental base: prefers a completed scan of the same commit, else the latest other commit', () => {
+      const { scans, scan, complete } = setup();
+      const keys = { resultOptionsHash: 'opts', analyzerVersionsHash: 'v' };
+      const older = scan({ sha: SHA1 });
+      complete(older);
+      const cur = scan({ sha: SHA2 });
+      const repoId = scans.getRow(cur)!.repo_id;
+      expect(scans.findIncrementalBase(repoId, SHA2, keys, cur)?.id).toBe(older);
+      const same = scan({ sha: SHA2 });
+      complete(same);
+      const newerOther = scan({ sha: SHA1 });
+      complete(newerOther);
+      expect(scans.findIncrementalBase(repoId, SHA2, keys, cur)?.id).toBe(same);
     });
 
     it('a re-worded AI finding at the same place is existing (not new + fixed) and inherits the baseline fingerprint', async () => {
@@ -167,7 +195,7 @@ describe('applyScanStatus (new / existing / fixed)', () => {
       findings.replaceForAnalyzer(cur, 'taint', [traversal(cur, 'pt-b', 11, 'Unsanitized file name reaches readFile')]); // same family, line drift
       findings.saveAnalyzerResult(cur, 'config', []);
       findings.saveAnalyzerResult(cur, 'taint', []);
-      expect(await applyScanStatus(deps, cur)).toEqual({ previousScanId: prev, new: 0, existing: 2, fixed: 0, notReproduced: 0 });
+      expect(await applyScanStatus(deps, cur)).toEqual({ previousScanId: prev, new: 0, existing: 2, fixed: 0, notReproduced: 0, onlyThisRun: 0 });
       const byFp = new Map(findings.all(cur).map((r) => [r.finding.fingerprint, r.finding]));
       expect(byFp.get('rls-b')).toMatchObject({ scanStatus: 'existing', mergedFingerprints: ['rls-a'] });
       expect(byFp.get('pt-b')).toMatchObject({ scanStatus: 'existing', mergedFingerprints: ['pt-a'] });
@@ -189,7 +217,7 @@ describe('applyScanStatus (new / existing / fixed)', () => {
       findings.replaceForAnalyzer(cur, 'sast', [finding(cur, 'xss', { ruleId: 'sast/xss', title: 'Reflected XSS in search page' })]);
       findings.saveAnalyzerResult(cur, 'credentials', []);
       findings.saveAnalyzerResult(cur, 'sast', []);
-      expect(await applyScanStatus(deps, cur)).toEqual({ previousScanId: prev, new: 2, existing: 0, fixed: 2, notReproduced: 0 });
+      expect(await applyScanStatus(deps, cur)).toEqual({ previousScanId: prev, new: 2, existing: 0, fixed: 2, notReproduced: 0, onlyThisRun: 0 });
     });
   });
 
@@ -208,7 +236,7 @@ describe('applyScanStatus (new / existing / fixed)', () => {
 
     it('ignores a previous scan run with other result options', async () => {
       const { deps, cur } = withPrevious({ optionsHash: 'other' });
-      expect(await applyScanStatus(deps, cur)).toEqual({ previousScanId: null, new: 1, existing: 0, fixed: 0 , notReproduced: 0 });
+      expect(await applyScanStatus(deps, cur)).toEqual({ previousScanId: null, new: 1, existing: 0, fixed: 0 , notReproduced: 0, onlyThisRun: 0 });
     });
 
     it('ignores a previous scan of another ref', async () => {

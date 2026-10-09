@@ -1,6 +1,9 @@
 // Incremental rescans (spec §11). Before ANALYZING, a scan looks for its base: the latest completed scan
-// of the same repo with the same result configuration (ScanOptions + analyzerVersionsHash) at a
-// different commit. With a base, `git diff --name-status base..head` scopes the analysis:
+// of the same repo with the same result configuration (ScanOptions + analyzerVersionsHash), preferring
+// one at the same commit (when the full-scan cache didn't apply: older than its TTL, or not clean). With
+// a same-commit base the diff is empty, so every per-file AI result is reused while the deterministic
+// checks (dependency advisories, credential rules) still run fresh. `git diff --name-status base..head`
+// scopes the analysis:
 //
 //   changed  C = added ∪ modified ∪ renamed/copied (new path) ∪ type-changed files
 //   deleted    = deleted files ∪ the old path of renamed ones

@@ -179,7 +179,7 @@ export function ScanCompare({
             <div className="overflow-x-auto px-4 pt-3 pb-3">
               <TabsList>
                 <TabsTrigger value="added">
-                  <CircleDot className="text-status-new" /> New in B <span className="font-mono tabular">{diff.added.length}</span>
+                  <CircleDot className="text-status-new" /> {sameCommit ? 'Only reported in B' : 'New in B'} <span className="font-mono tabular">{diff.added.length}</span>
                 </TabsTrigger>
                 <TabsTrigger value="fixed">
                   {sameCommit ? <CircleDashed /> : <CircleCheck className="text-status-fixed" />}
@@ -191,7 +191,17 @@ export function ScanCompare({
               </TabsList>
             </div>
             <TabsContent value="added" className="border-t">
-              <DiffList items={diff.added} scanId={b.id} emptyText="Nothing new in B." />
+              {sameCommit && diff.added.length > 0 && (
+                <p className="border-b bg-muted/40 px-4 py-2 text-xs text-muted-foreground">
+                  Same commit, so the code didn’t change: these issues were already there, A’s AI review just didn’t
+                  report them. They are not counted as new.
+                </p>
+              )}
+              <DiffList
+                items={diff.added}
+                scanId={b.id}
+                emptyText={sameCommit ? 'B reported nothing that A didn’t.' : 'Nothing new in B.'}
+              />
             </TabsContent>
             <TabsContent value="fixed" className="border-t">
               {sameCommit && diff.fixed.length > 0 && (

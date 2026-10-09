@@ -53,12 +53,18 @@ export type ScanPipelineDeps = Omit<ResolveDeps, 'git' | 'scans'> & Omit<IndexDe
  * previous scan. Each step is idempotent and runs even if an earlier one failed (findings then keep
  * their pre-scoring values); the first failure is re-thrown afterwards so it surfaces as a warning.
  */
-/** Info note for findings of a previous scan of the same commit that this run didn't report again. */
-export function notReproducedWarning(n: number): ScanWarning {
+const findingsText = (n: number) => `${n} finding${n === 1 ? '' : 's'}`;
+
+/** Info note when this run's results differ from a previous scan of the SAME commit (AI run-to-run variation). */
+export function sameCommitVariationWarning(counts: { notReproduced: number; onlyThisRun: number }): ScanWarning {
+  const parts = [
+    ...(counts.notReproduced > 0 ? [`${findingsText(counts.notReproduced)} from the previous scan ${counts.notReproduced === 1 ? 'was' : 'were'} not reported again`] : []),
+    ...(counts.onlyThisRun > 0 ? [`${findingsText(counts.onlyThisRun)} ${counts.onlyThisRun === 1 ? 'was' : 'were'} reported only by this run`] : []),
+  ];
   return {
-    code: 'FINDINGS_NOT_REPRODUCED', stage: 'SCORING',
-    message: `${n} finding${n === 1 ? '' : 's'} from the previous scan of this same commit ${n === 1 ? 'was' : 'were'} not reported again. `
-      + 'The code is unchanged, so they are not counted as fixed: AI review results vary slightly between runs.',
+    code: 'SAME_COMMIT_RESULTS_VARIED', stage: 'SCORING',
+    message: `Same commit as the previous scan: ${parts.join(', and ')}. `
+      + 'The code is unchanged, so none of them is counted as fixed or new: AI review results vary slightly between runs.',
   };
 }
 
@@ -86,7 +92,7 @@ function scoringStage(deps: ScanPipelineDeps): StageSpec {
           { scans: deps.scans, findings: deps.findings, coverage: deps.coverage, indexRepo: deps.indexRepo, git: deps.git },
           ctx.scanId, { signal: ctx.signal, touch: ctx.touch },
         );
-        if (counts.notReproduced > 0) ctx.warn(notReproducedWarning(counts.notReproduced));
+        if (counts.notReproduced + counts.onlyThisRun > 0) ctx.warn(sameCommitVariationWarning(counts));
       });
       await step(() => deps.suppressions.applySuppressions(ctx.scanId));
       if (failure) throw failure;

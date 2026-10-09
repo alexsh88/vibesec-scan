@@ -7,7 +7,7 @@
 //   'fixed' — "unknown" never produces a false "fixed".
 //   present in both  → 'existing'. "Present" = same fingerprint, or for AI-written findings the same issue
 //     re-worded (shared isSameIssue: same file and category, nearby lines, same rule family or title);
-//   only in this one → 'new'
+//   only in this one → 'new' (same-commit baseline: 'existing', counted as `onlyThisRun`)
 //   only in the baseline → copied into THIS scan as a `fixed` row (severity unchanged) — unless the
 //     baseline is the SAME commit: identical code can't have fixed anything, so those are counted as
 //     `notReproduced` (AI run-to-run variation) and surfaced as an info note instead. Fixed rows are
@@ -38,8 +38,13 @@ export type ScanStatusDeps = {
   git?: Pick<GitService, 'isAncestor' | 'repoDir'>;
 };
 
-/** `notReproduced`: baseline findings of the SAME commit this scan didn't report again (never counted as fixed). */
-export type ScanStatusCounts = { previousScanId: string | null; new: number; existing: number; fixed: number; notReproduced: number };
+/**
+ * Against a baseline of the SAME commit: `notReproduced` = its findings this run didn't report again (not
+ * counted as fixed), `onlyThisRun` = findings only this run reported (counted as existing, not new).
+ */
+export type ScanStatusCounts = {
+  previousScanId: string | null; new: number; existing: number; fixed: number; notReproduced: number; onlyThisRun: number;
+};
 
 const COVERED: ReadonlySet<CoverageStatus> = new Set(['reviewed', 'reviewed-fast', 'cached', 'not-relevant']);
 const REPO_LEVEL: ReadonlySet<Finding['category']> = new Set(['dependency', 'config']);
@@ -65,16 +70,19 @@ export async function applyScanStatus(
 ): Promise<ScanStatusCounts> {
   const row = deps.scans.getRow(scanId);
   const categories = new Set(deps.scans.getDto(scanId)?.options.categories ?? []);
-  if (!row) return { previousScanId: null, new: 0, existing: 0, fixed: 0, notReproduced: 0 };
+  if (!row) return { previousScanId: null, new: 0, existing: 0, fixed: 0, notReproduced: 0, onlyThisRun: 0 };
   const previous = await findBaseline(deps, row, { ...(call.signal ? { signal: call.signal } : {}), ...(call.touch ? { onActivity: call.touch } : {}) });
   const previousRows = previous ? deps.findings.all(previous.id) : [];
 
   const current = deps.findings.all(scanId);
   const match = matchFindings(previousRows, current, (r) => r.finding);
+  // Same commit: the code is identical, so nothing can have been introduced or fixed. A finding only this
+  // run reported is a pre-existing issue the previous run didn't mention (AI review varies between runs).
+  const sameCommit = !!previous && previous.commit_sha === row.commit_sha;
   const changed: Finding[] = [];
   for (const row of current) {
     const base = match.pairs.get(row);
-    const status = base ? 'existing' : 'new';
+    const status = base || sameCommit ? 'existing' : 'new';
     // A finding matched as the same issue under another fingerprint (a model re-worded its rule id or
     // re-cut its snippet) inherits the baseline's keys, so triage decisions and later scans follow it.
     const inherited = base ? findingKeys(base.finding).filter((k) => !findingKeys(row.finding).includes(k)) : [];
@@ -86,21 +94,20 @@ export async function applyScanStatus(
     }
   }
   if (changed.length > 0) deps.findings.update(scanId, changed);
-  const existing = match.pairs.size;
+  const onlyThisRun = sameCommit ? match.unmatchedHead.length : 0;
+  const existing = match.pairs.size + onlyThisRun;
 
   const ran = deps.findings.analyzersWithResults(scanId);
   const looked = lookedAt(deps, scanId);
   const missing = match.unmatchedBase
     .filter((r) => categories.has(r.finding.category) && ran.has(r.analyzer) && looked(r.analyzer, r.finding));
-  // Same commit: the code is identical, so nothing can have been fixed. A baseline finding that wasn't
-  // reported again is run-to-run variation of the AI review, reported as "not reproduced" instead.
-  const sameCommit = !!previous && previous.commit_sha === row.commit_sha;
+  // Same commit: a baseline finding that wasn't reported again is run-to-run variation, not a fix.
   const fixed: FindingRow[] = sameCommit ? [] : missing
     .map((r) => ({ analyzer: r.analyzer, finding: { ...r.finding, id: copiedFindingId(scanId, r.finding.id), scanId, scanStatus: 'fixed' } }));
   deps.findings.replaceFixed(scanId, fixed);
   return {
     previousScanId: previous?.id ?? null, new: current.length - existing, existing, fixed: fixed.length,
-    notReproduced: sameCommit ? missing.length : 0,
+    notReproduced: sameCommit ? missing.length : 0, onlyThisRun,
   };
 }
 

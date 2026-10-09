@@ -151,10 +151,12 @@ export class ScanRepo {
   /** Incremental rescans: the latest completed scan of the same repo + configuration at a DIFFERENT commit. */
   findIncrementalBase(repoId: string, commitSha: string, keys: ScanCacheKeys, excludeId: string): ScanRow | undefined {
     return this.db.prepare(
-      `SELECT * FROM scans WHERE repo_id = ? AND commit_sha IS NOT NULL AND commit_sha <> ? AND result_options_hash = ?
+      // A scan of the same commit is preferred: an empty diff reuses every per-file AI result. (A fresh,
+      // clean same-commit result never gets here: the full-scan cache answers it in RESOLVING.)
+      `SELECT * FROM scans WHERE repo_id = ? AND commit_sha IS NOT NULL AND result_options_hash = ?
          AND analyzer_versions_hash = ? AND state IN ${COMPLETED_SQL} AND id <> ?
-       ORDER BY finished_at DESC, rowid DESC LIMIT 1`,
-    ).get(repoId, commitSha, keys.resultOptionsHash, keys.analyzerVersionsHash, excludeId) as ScanRow | undefined;
+       ORDER BY (commit_sha = ?) DESC, finished_at DESC, rowid DESC LIMIT 1`,
+    ).get(repoId, keys.resultOptionsHash, keys.analyzerVersionsHash, excludeId, commitSha) as ScanRow | undefined;
   }
 
   /**
